@@ -104,10 +104,10 @@ The upgrade script will:
 
 ## 🔐 Access After Install
 
-- Portal: https://<domain>/portal
-- Server: https://<domain>/server
-- Portal Admin: https://<domain>:7443/arcgis/portaladmin
-- Server Admin: https://<domain>:6443/arcgis/admin
+- Portal: https://YOUR_DOMAIN/portal
+- Server: https://YOUR_DOMAIN/server
+- Portal Admin: https://YOUR_DOMAIN:7443/arcgis/portaladmin
+- Server Admin: https://YOUR_DOMAIN:6443/arcgis/admin
 
 ---
 
