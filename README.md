@@ -51,7 +51,18 @@ This repository is designed for:
    - ArcGIS_DataStore_Linux_*.tar.gz
    - Web_Adaptor_Java_Linux_*.tar.gz
 
-3. **Cloudflare**
+3. **ArcGIS License Files**
+   Download from My Esri and place in:
+
+   ```
+   /opt/esri/licenses
+   ```
+
+   Required files:
+   - `portal.prvc` — Portal for ArcGIS authorization file
+   - `server.prvc` — ArcGIS Server authorization file
+
+4. **Cloudflare**
    - Domain managed by Cloudflare
    - API Token with:
      - Zone → DNS → Edit
