@@ -532,7 +532,9 @@ wait_for_service() {
 }
 
 # || true prevents set -e from aborting — services may need extra time
-wait_for_service "https://localhost:6443/arcgis/admin/healthCheck?f=json" "ArcGIS Server" 300 || true
+# Use /arcgis/rest/info for Server — /admin/healthCheck requires an existing site (Step 11)
+# Use /portaladmin/healthCheck for Portal — reliable JSON response
+wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 120 || true
 wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 || true
 
 # ==============================================================================
