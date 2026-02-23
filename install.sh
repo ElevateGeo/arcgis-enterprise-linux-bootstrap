@@ -38,9 +38,23 @@ fi
 
 # ---------- Load .env ----------
 if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  source "$ENV_FILE"
-  set +a
+  # Read .env line-by-line to handle unquoted values with spaces safely.
+  # Lines like KEY=value with spaces would fail with `source` if unquoted.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # Strip inline comments (only outside quotes)
+    line="${line%%#*}"
+    # Trim trailing whitespace
+    line="${line%"${line##*[![:space:]]}"}"
+    # Extract key and value
+    key="${line%%=*}"
+    val="${line#*=}"
+    # Strip surrounding quotes (single or double) if present
+    val="${val#[\"\']}"
+    val="${val%[\"\']}"
+    export "$key=$val"
+  done < "$ENV_FILE"
   echo "Loaded configuration from $ENV_FILE"
 fi
 
@@ -91,19 +105,33 @@ prompt_if_empty ADMIN_LAST_NAME "Admin last name" "" "Admin"
 prompt_if_empty ADMIN_SECURITY_QUESTION "Security question" "" "What is your favorite color?"
 prompt_if_empty ADMIN_SECURITY_ANSWER "Security answer" "" "Blue"
 
-# License files (auto-detected from /opt/esri/licenses if not specified)
+# License files — auto-detect from /opt/esri/licenses before prompting.
 # Portal 12.0+: JSON file for user types and apps
 # Server: .prvc provisioning file
+ESRI_BASE="/opt/esri"
+mkdir -p "$ESRI_BASE/licenses"
+if [[ -z "${PORTAL_LICENSE_FILE:-}" || ! -f "${PORTAL_LICENSE_FILE:-}" ]]; then
+  FOUND_PORTAL_LIC=$(find "$ESRI_BASE/licenses" -name "ArcGIS_Enterprise_Portal*.json" 2>/dev/null | head -1)
+  if [[ -n "${FOUND_PORTAL_LIC:-}" ]]; then
+    PORTAL_LICENSE_FILE="$FOUND_PORTAL_LIC"
+    echo "Auto-detected Portal license: $PORTAL_LICENSE_FILE"
+  fi
+fi
+if [[ -z "${SERVER_LICENSE_FILE:-}" || ! -f "${SERVER_LICENSE_FILE:-}" ]]; then
+  FOUND_SERVER_LIC=$(find "$ESRI_BASE/licenses" -name "*.prvc" 2>/dev/null | head -1)
+  if [[ -n "${FOUND_SERVER_LIC:-}" ]]; then
+    SERVER_LICENSE_FILE="$FOUND_SERVER_LIC"
+    echo "Auto-detected Server license: $SERVER_LICENSE_FILE"
+  fi
+fi
+
+# Only prompt if auto-detection didn't find them
 prompt_if_empty PORTAL_LICENSE_FILE "Portal license file path (JSON format)" "" "/opt/esri/licenses/ArcGIS_Enterprise_Portal.json"
 prompt_if_empty SERVER_LICENSE_FILE "Server license file path (.prvc)" "" "/opt/esri/licenses/server.prvc"
 
 # ---------- Paths ----------
-ESRI_BASE="/opt/esri"
 INSTALLERS="$ESRI_BASE/installers"
 ARCGIS_USER="arcgis"
-
-# Ensure license directory exists for auto-detection
-mkdir -p "$ESRI_BASE/licenses"
 
 echo ""
 echo ">>> Configuration Summary"
@@ -114,35 +142,6 @@ echo "  Admin User:    $ADMIN_USER"
 echo "  Portal Lic:    $PORTAL_LICENSE_FILE"
 echo "  Server Lic:    $SERVER_LICENSE_FILE"
 echo ""
-
-# ---------- Auto-detect license files ----------
-# Portal 12.0+ uses a JSON file for user types and apps (downloaded from My Esri)
-if [[ ! -f "$PORTAL_LICENSE_FILE" ]]; then
-  FOUND_PORTAL_LIC=$(find "$ESRI_BASE/licenses" -name "ArcGIS_Enterprise_Portal*.json" 2>/dev/null | head -1)
-  if [[ -n "$FOUND_PORTAL_LIC" ]]; then
-    echo "Found Portal license file: $FOUND_PORTAL_LIC"
-    PORTAL_LICENSE_FILE="$FOUND_PORTAL_LIC"
-  else
-    echo "WARNING: Portal license file not found: $PORTAL_LICENSE_FILE"
-    echo "For Portal 12.0+, download the JSON authorization file from My Esri"
-    echo "(e.g., ArcGIS_Enterprise_Portal_120_551327_20260122.json)"
-    echo "You will need to import the license file manually after install."
-  fi
-fi
-
-# Server uses .prvc provisioning files
-if [[ ! -f "$SERVER_LICENSE_FILE" ]]; then
-  FOUND_SERVER_LIC=$(find "$ESRI_BASE/licenses" -name "*.prvc" 2>/dev/null | head -1)
-  if [[ -n "$FOUND_SERVER_LIC" ]]; then
-    echo "Found Server license file: $FOUND_SERVER_LIC"
-    SERVER_LICENSE_FILE="$FOUND_SERVER_LIC"
-  else
-    echo "WARNING: Server license file not found: $SERVER_LICENSE_FILE"
-    echo "Download the .prvc authorization file from My Esri"
-    echo "(e.g., ArcGISGISServerAdvanced_DeveloperArcGISServer_*.prvc)"
-    echo "You will need to authorize Server manually after install."
-  fi
-fi
 
 # Verify installers exist
 if [[ ! -d "$INSTALLERS" ]]; then

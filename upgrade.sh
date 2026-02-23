@@ -29,9 +29,16 @@ fi
 
 # ---------- Load .env ----------
 if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  source "$ENV_FILE"
-  set +a
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    key="${line%%=*}"
+    val="${line#*=}"
+    val="${val#[\"\']}"
+    val="${val%[\"\']}"
+    export "$key=$val"
+  done < "$ENV_FILE"
   echo "Loaded configuration from $ENV_FILE"
 else
   echo "WARNING: No .env file found. Some post-upgrade steps may be skipped."

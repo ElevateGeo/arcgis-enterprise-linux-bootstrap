@@ -85,23 +85,23 @@ Create a `.env` file (or the script will prompt for values and save them):
 
 ```env
 # Domain and SSL
-DOMAIN=gis.example.com
-EMAIL=admin@example.com
-CF_API_TOKEN=your_cloudflare_api_token
+DOMAIN='gis.example.com'
+EMAIL='admin@example.com'
+CF_API_TOKEN='your_cloudflare_api_token'
 
 # Admin credentials (used for Portal and Server)
-ADMIN_USER=siteadmin
-ADMIN_PASS=YourSecurePassword123!
-ADMIN_FIRST_NAME=Site
-ADMIN_LAST_NAME=Admin
-ADMIN_SECURITY_QUESTION=What is your favorite color?
-ADMIN_SECURITY_ANSWER=Blue
+ADMIN_USER='siteadmin'
+ADMIN_PASS='YourSecurePassword123!'
+ADMIN_FIRST_NAME='Site'
+ADMIN_LAST_NAME='Admin'
+ADMIN_SECURITY_QUESTION='What is your favorite color?'
+ADMIN_SECURITY_ANSWER='Blue'
 
 # License files (auto-detected from /opt/esri/licenses if not specified)
 # Portal: JSON file from My Esri (user types and apps)
 # Server: .prvc provisioning file
-PORTAL_LICENSE_FILE=/opt/esri/licenses/ArcGIS_Enterprise_Portal.json
-SERVER_LICENSE_FILE=/opt/esri/licenses/server.prvc
+PORTAL_LICENSE_FILE='/opt/esri/licenses/ArcGIS_Enterprise_Portal.json'
+SERVER_LICENSE_FILE='/opt/esri/licenses/server.prvc'
 ```
 
 If any value is missing, the script will prompt you and save it automatically.
