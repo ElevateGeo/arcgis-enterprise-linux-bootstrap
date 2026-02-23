@@ -237,6 +237,17 @@ else
   echo "WARNING: Portal for ArcGIS installer not found in $INSTALLERS"
 fi
 
+# Upgrade Portal Web Styles (companion to Portal)
+WS_SETUP=$(find "$INSTALLERS" -maxdepth 2 -name "Setup" -path "*Web_Styles*" -o -name "Setup" -path "*WebStyles*" 2>/dev/null | head -1)
+if [[ -n "${WS_SETUP:-}" ]]; then
+  WS_DIR=$(dirname "$WS_SETUP")
+  echo "Upgrading Portal Web Styles from: $WS_DIR"
+  cd "$WS_DIR"
+  sudo -u "$ARCGIS_USER" ./Setup -m silent -l yes
+else
+  echo "Portal Web Styles installer not found — skipping."
+fi
+
 # ==============================================================================
 # Step 7: Upgrade ArcGIS Data Store
 # Ref: https://enterprise.arcgis.com/en/data-store/12.0/install/linux/install-arcgis-data-store.htm

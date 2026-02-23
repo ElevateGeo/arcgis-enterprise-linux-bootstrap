@@ -54,6 +54,9 @@ This repository is designed for:
    - `ArcGIS_DataStore_Linux_*.tar.gz`
    - `Web_Adaptor_Java_Linux_*.tar.gz`
 
+   Optional:
+   - `Portal_for_ArcGIS_Web_Styles_Linux_*.tar.gz` (3D symbols for Scene Viewer — not required)
+
 3. **ArcGIS License Files**
    Download from [My Esri](https://my.esri.com/) and place in:
 
@@ -162,7 +165,7 @@ The `install.sh` script follows [Esri's documented deployment order](https://ent
 | 4 | Create `arcgis` user, set ulimits and sysctl kernel parameters | [Server system requirements](https://enterprise.arcgis.com/en/server/12.0/install/linux/arcgis-server-system-requirements.htm) |
 | 5 | Extract installer tar.gz archives | |
 | 6 | Install **and authorize** ArcGIS Server (via `-a` flag during install) | [Install ArcGIS Server silently](https://enterprise.arcgis.com/en/server/12.0/install/linux/silently-install-arcgis-server.htm) |
-| 7 | Install Portal for ArcGIS | [Install Portal for ArcGIS](https://enterprise.arcgis.com/en/portal/12.0/install/linux/install-portal-for-arcgis.htm) |
+| 7 | Install Portal for ArcGIS (+ Web Styles if present) | [Install Portal for ArcGIS](https://enterprise.arcgis.com/en/portal/12.0/install/linux/install-portal-for-arcgis.htm) |
 | 8 | Install ArcGIS Data Store | [Install ArcGIS Data Store](https://enterprise.arcgis.com/en/data-store/12.0/install/linux/install-arcgis-data-store.htm) |
 | 9 | Install Web Adaptor + deploy WARs to Tomcat | [Install Web Adaptor (Java)](https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/install-arcgis-web-adaptor-java-linux.htm) |
 | 10 | Start all ArcGIS services | |

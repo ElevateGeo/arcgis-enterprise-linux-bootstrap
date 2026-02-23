@@ -14,7 +14,7 @@ set -euo pipefail
 #   4. Create arcgis user + system tuning (ulimits, sysctl)
 #   5. Extract installers
 #   6. Install & authorize ArcGIS Server (authorization during install via -a flag)
-#   7. Install Portal for ArcGIS
+#   7. Install Portal for ArcGIS (+ Web Styles if present)
 #   8. Install ArcGIS Data Store
 #   9. Install Web Adaptor + deploy WARs to Tomcat
 #  10. Start services
@@ -355,6 +355,19 @@ elif [[ -d "$ESRI_BASE/arcgis/portal" ]]; then
   echo "Portal for ArcGIS already installed, skipping..."
 else
   echo "WARNING: Portal for ArcGIS installer not found in $INSTALLERS"
+fi
+
+# Install Portal Web Styles (3D symbols and styles for Scene Viewer)
+# Must be installed after Portal for ArcGIS, into the same directory.
+# Ref: https://enterprise.arcgis.com/en/portal/12.0/install/linux/install-portal-for-arcgis.htm
+WS_SETUP=$(find "$INSTALLERS" -maxdepth 2 -name "Setup" -path "*Web_Styles*" -o -name "Setup" -path "*WebStyles*" 2>/dev/null | head -1)
+if [[ -n "${WS_SETUP:-}" ]]; then
+  WS_DIR=$(dirname "$WS_SETUP")
+  echo "Installing Portal Web Styles from: $WS_DIR"
+  cd "$WS_DIR"
+  sudo -u "$ARCGIS_USER" ./Setup -m silent -l yes -d "$ESRI_BASE"
+else
+  echo "Portal Web Styles installer not found — skipping (optional)."
 fi
 
 # ==============================================================================
