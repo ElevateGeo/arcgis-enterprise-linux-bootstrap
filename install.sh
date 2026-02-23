@@ -171,25 +171,77 @@ echo ""
 
 apt-get update
 
-# Detect available Tomcat version (Ubuntu 24.04+ ships tomcat10, 22.04 ships tomcat9)
-if apt-cache show tomcat10 &>/dev/null; then
-  TOMCAT_PKG="tomcat10"
-elif apt-cache show tomcat9 &>/dev/null; then
-  TOMCAT_PKG="tomcat9"
-else
-  echo "ERROR: Neither tomcat10 nor tomcat9 is available. Install Tomcat manually."
-  exit 1
-fi
-echo "Using Tomcat package: $TOMCAT_PKG"
-TOMCAT_WEBAPPS="/var/lib/$TOMCAT_PKG/webapps"
-# Tomcat's system user varies by distro (often 'tomcat' regardless of package version)
-TOMCAT_USER=$(stat -c '%U' "/var/lib/$TOMCAT_PKG" 2>/dev/null || echo "tomcat")
-
 apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk \
-  tar unzip "$TOMCAT_PKG" curl jq
+  tar unzip curl jq
 
-# Configure Tomcat to start on boot
-systemctl enable "$TOMCAT_PKG"
+# ---------------------------------------------------------------------------
+# Tomcat 9 (required — Esri Web Adaptor uses javax.servlet, NOT jakarta).
+# Tomcat 10+ uses jakarta.servlet and is INCOMPATIBLE with the Web Adaptor WAR.
+# Ubuntu 24.04 only ships Tomcat 10, so we install Tomcat 9 from Apache directly.
+# ---------------------------------------------------------------------------
+TOMCAT_VER="9.0.102"
+TOMCAT_HOME="/opt/tomcat9"
+TOMCAT_USER="tomcat"
+TOMCAT_WEBAPPS="$TOMCAT_HOME/webapps"
+TOMCAT_SERVICE="tomcat9"
+
+if [[ -d "$TOMCAT_HOME" && -f "$TOMCAT_HOME/bin/catalina.sh" ]]; then
+  echo "Tomcat 9 already installed at $TOMCAT_HOME, skipping..."
+else
+  echo "Installing Apache Tomcat $TOMCAT_VER (Tomcat 10 is incompatible with Esri Web Adaptor)..."
+
+  # Remove Ubuntu's Tomcat 10 if present to avoid port conflicts
+  if dpkg -l tomcat10 2>/dev/null | grep -q '^ii'; then
+    echo "Removing incompatible Tomcat 10 package..."
+    systemctl stop tomcat10 2>/dev/null || true
+    systemctl disable tomcat10 2>/dev/null || true
+    apt-get remove -y tomcat10 2>/dev/null || true
+  fi
+
+  # Create tomcat user
+  id "$TOMCAT_USER" &>/dev/null || useradd -r -m -d "$TOMCAT_HOME" -s /bin/false "$TOMCAT_USER"
+
+  # Download and extract
+  TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz"
+  echo "Downloading from: $TOMCAT_URL"
+  curl -fsSL "$TOMCAT_URL" -o /tmp/tomcat9.tar.gz
+  mkdir -p "$TOMCAT_HOME"
+  tar -xzf /tmp/tomcat9.tar.gz -C "$TOMCAT_HOME" --strip-components=1
+  rm -f /tmp/tomcat9.tar.gz
+
+  # Set ownership
+  chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_HOME"
+  chmod +x "$TOMCAT_HOME"/bin/*.sh
+
+  # Create systemd service
+  cat > /etc/systemd/system/tomcat9.service <<EOF
+[Unit]
+Description=Apache Tomcat 9
+After=network.target
+
+[Service]
+Type=forking
+User=$TOMCAT_USER
+Group=$TOMCAT_USER
+Environment="JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))"
+Environment="CATALINA_HOME=$TOMCAT_HOME"
+Environment="CATALINA_BASE=$TOMCAT_HOME"
+Environment="CATALINA_PID=$TOMCAT_HOME/temp/tomcat.pid"
+ExecStart=$TOMCAT_HOME/bin/startup.sh
+ExecStop=$TOMCAT_HOME/bin/shutdown.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable tomcat9
+  systemctl start tomcat9
+  echo "Tomcat 9 installed and started."
+fi
+
+echo "Using Tomcat 9 at: $TOMCAT_HOME"
 
 # Ensure the VM can resolve its own FQDN to localhost.
 # Azure/cloud VMs often cannot hairpin through the public IP, so
@@ -459,18 +511,20 @@ else
   echo "WARNING: Web Adaptor installer not found in $INSTALLERS"
 fi
 
-# Deploy Web Adaptor WARs to Tomcat (two instances: portal and server)
+# Deploy Web Adaptor WARs to Tomcat 9 (two instances: portal and server)
 WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
 if [[ -n "$WA_WAR" && -f "$TOMCAT_WEBAPPS/portal.war" && -f "$TOMCAT_WEBAPPS/server.war" ]]; then
   echo "Web Adaptor WARs already deployed, skipping..."
 elif [[ -n "$WA_WAR" ]]; then
-  echo "Deploying Web Adaptor WARs to Tomcat ($TOMCAT_PKG) from: $WA_WAR"
+  echo "Deploying Web Adaptor WARs to Tomcat 9 from: $WA_WAR"
+  # Remove old Tomcat 10 WARs if they exist
+  rm -rf /var/lib/tomcat10/webapps/portal* /var/lib/tomcat10/webapps/server* 2>/dev/null || true
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
   chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/portal.war"
   chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/server.war"
-  systemctl restart "$TOMCAT_PKG"
-  sleep 10
+  systemctl restart "$TOMCAT_SERVICE"
+  sleep 15
 fi
 
 # ==============================================================================
@@ -641,8 +695,8 @@ TOMCAT_SERVER_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "http://localhost:8
 echo "HTTP $TOMCAT_SERVER_TEST"
 
 if [[ "$TOMCAT_PORTAL_TEST" == "000" || "$TOMCAT_SERVER_TEST" == "000" ]]; then
-  echo "Tomcat doesn't seem to be responding. Restarting $TOMCAT_PKG..."
-  systemctl restart "$TOMCAT_PKG"
+  echo "Tomcat doesn't seem to be responding. Restarting $TOMCAT_SERVICE..."
+  systemctl restart "$TOMCAT_SERVICE"
   sleep 20
 fi
 
@@ -659,7 +713,7 @@ if [[ "$NGINX_PORTAL_TEST" == "000" ]]; then
   echo "Diagnostics:"
   echo "  - /etc/hosts: $(grep "$DOMAIN" /etc/hosts 2>/dev/null || echo 'NOT FOUND')"
   echo "  - NGINX status: $(systemctl is-active nginx)"
-  echo "  - Tomcat status: $(systemctl is-active $TOMCAT_PKG)"
+  echo "  - Tomcat status: $(systemctl is-active $TOMCAT_SERVICE)"
   echo "  - Tomcat webapps: $(ls -la $TOMCAT_WEBAPPS/*.war 2>/dev/null || echo 'NO WARS')"
   echo ""
 fi

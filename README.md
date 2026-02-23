@@ -26,7 +26,7 @@
 | 🌐 **Portal for ArcGIS** | Web GIS hub |
 | 🖥️ **ArcGIS GIS Server** | Map/feature services |
 | 💾 **ArcGIS Data Store** | Relational + object stores |
-| 🔌 **Web Adaptor** | Java / Tomcat (auto-detected: 9 or 10) |
+| 🔌 **Web Adaptor** | Java / Tomcat 9 (auto-installed; Tomcat 10 is incompatible) |
 | 🔒 **HTTPS** | Let's Encrypt via Cloudflare DNS |
 | ⚡ **NGINX** | Reverse proxy with WebSocket support |
 | 📄 **Config** | `.env`-based (no secrets in scripts) |

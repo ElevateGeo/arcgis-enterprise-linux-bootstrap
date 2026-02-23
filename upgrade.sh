@@ -49,19 +49,22 @@ ESRI_BASE="/opt/esri"
 INSTALLERS="$ESRI_BASE/installers"
 ARCGIS_USER="arcgis"
 
-# ---------- Detect Tomcat version ----------
-if systemctl list-unit-files tomcat10.service &>/dev/null && systemctl list-unit-files tomcat10.service | grep -q tomcat10; then
-  TOMCAT_PKG="tomcat10"
-elif systemctl list-unit-files tomcat9.service &>/dev/null && systemctl list-unit-files tomcat9.service | grep -q tomcat9; then
-  TOMCAT_PKG="tomcat9"
+# ---------- Detect Tomcat 9 ----------
+# Esri Web Adaptor requires Tomcat 9 (javax.servlet); Tomcat 10+ is incompatible.
+TOMCAT_HOME="/opt/tomcat9"
+TOMCAT_SERVICE="tomcat9"
+TOMCAT_USER="tomcat"
+if [[ -d "$TOMCAT_HOME" && -f "$TOMCAT_HOME/bin/catalina.sh" ]]; then
+  TOMCAT_WEBAPPS="$TOMCAT_HOME/webapps"
+  echo "Detected Tomcat 9 at: $TOMCAT_HOME (user: $TOMCAT_USER)"
+elif systemctl list-unit-files tomcat9.service 2>/dev/null | grep -q tomcat9; then
+  # Fallback: system-packaged Tomcat 9 (e.g., Ubuntu 22.04)
+  TOMCAT_WEBAPPS="/var/lib/tomcat9/webapps"
+  TOMCAT_USER=$(stat -c '%U' "/var/lib/tomcat9" 2>/dev/null || echo "tomcat")
+  echo "Detected system Tomcat 9 (user: $TOMCAT_USER)"
 else
-  TOMCAT_PKG=""
-  echo "WARNING: No Tomcat service detected. WAR re-deployment will be skipped."
-fi
-if [[ -n "$TOMCAT_PKG" ]]; then
-  TOMCAT_WEBAPPS="/var/lib/$TOMCAT_PKG/webapps"
-  TOMCAT_USER=$(stat -c '%U' "/var/lib/$TOMCAT_PKG" 2>/dev/null || echo "tomcat")
-  echo "Detected Tomcat: $TOMCAT_PKG (user: $TOMCAT_USER)"
+  TOMCAT_WEBAPPS=""
+  echo "WARNING: Tomcat 9 not found. WAR re-deployment will be skipped."
 fi
 
 # ---------- Verify prerequisites ----------
@@ -305,13 +308,13 @@ if [[ -n "${WA_SETUP:-}" ]]; then
 
   # Re-deploy WARs to Tomcat (find WAR dynamically — versioned install path)
   WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
-  if [[ -n "${WA_WAR:-}" && -n "${TOMCAT_PKG:-}" ]]; then
-    echo "Re-deploying Web Adaptor WARs to Tomcat ($TOMCAT_PKG) from: $WA_WAR"
+  if [[ -n "${WA_WAR:-}" && -n "${TOMCAT_WEBAPPS:-}" ]]; then
+    echo "Re-deploying Web Adaptor WARs to Tomcat 9 from: $WA_WAR"
     cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
     cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
     chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/portal.war"
     chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/server.war"
-    systemctl restart "$TOMCAT_PKG"
+    systemctl restart "$TOMCAT_SERVICE"
     sleep 10
   fi
 else
