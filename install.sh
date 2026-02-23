@@ -336,6 +336,11 @@ else
     fi
   done
   chown -R "$ARCGIS_USER:$ARCGIS_USER" "$INSTALLERS"
+
+  # Delete archives after successful extraction to reclaim disk space
+  # (Portal + Server + DataStore + WA archives can total 20+ GB)
+  echo "Removing .tar.gz archives to free disk space..."
+  rm -f "$INSTALLERS"/*.tar.gz
   touch "$EXTRACT_MARKER"
 fi
 
