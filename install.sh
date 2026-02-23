@@ -631,6 +631,52 @@ echo ""
 echo ">>> Step 13: Configuring Web Adaptors"
 echo ""
 
+# --- Pre-flight: verify Tomcat is serving the Web Adaptor WARs ---
+echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
+echo -n "  http://localhost:8080/portal/webadaptor → "
+TOMCAT_PORTAL_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "http://localhost:8080/portal/webadaptor" 2>/dev/null || echo "000")
+echo "HTTP $TOMCAT_PORTAL_TEST"
+echo -n "  http://localhost:8080/server/webadaptor → "
+TOMCAT_SERVER_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "http://localhost:8080/server/webadaptor" 2>/dev/null || echo "000")
+echo "HTTP $TOMCAT_SERVER_TEST"
+
+if [[ "$TOMCAT_PORTAL_TEST" == "000" || "$TOMCAT_SERVER_TEST" == "000" ]]; then
+  echo "Tomcat doesn't seem to be responding. Restarting $TOMCAT_PKG..."
+  systemctl restart "$TOMCAT_PKG"
+  sleep 20
+fi
+
+echo -n "  https://$DOMAIN/portal/webadaptor (via NGINX) → "
+NGINX_PORTAL_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "https://$DOMAIN/portal/webadaptor" 2>/dev/null || echo "000")
+echo "HTTP $NGINX_PORTAL_TEST"
+echo -n "  https://$DOMAIN/server/webadaptor (via NGINX) → "
+NGINX_SERVER_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "https://$DOMAIN/server/webadaptor" 2>/dev/null || echo "000")
+echo "HTTP $NGINX_SERVER_TEST"
+
+if [[ "$NGINX_PORTAL_TEST" == "000" ]]; then
+  echo ""
+  echo "ERROR: Cannot reach https://$DOMAIN/portal/webadaptor from this machine."
+  echo "Diagnostics:"
+  echo "  - /etc/hosts: $(grep "$DOMAIN" /etc/hosts 2>/dev/null || echo 'NOT FOUND')"
+  echo "  - NGINX status: $(systemctl is-active nginx)"
+  echo "  - Tomcat status: $(systemctl is-active $TOMCAT_PKG)"
+  echo "  - Tomcat webapps: $(ls -la $TOMCAT_WEBAPPS/*.war 2>/dev/null || echo 'NO WARS')"
+  echo ""
+fi
+
+# Import the Let's Encrypt cert into Java's truststore so configurewebadaptor.sh
+# (a Java tool) trusts the NGINX HTTPS endpoint.
+LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+JAVA_HOME_DIR=$(dirname $(dirname $(readlink -f $(which java))))
+JAVA_CACERTS="$JAVA_HOME_DIR/lib/security/cacerts"
+if [[ -f "$LE_CERT" && -f "$JAVA_CACERTS" ]]; then
+  if ! keytool -list -cacerts -storepass changeit -alias "letsencrypt-$DOMAIN" > /dev/null 2>&1; then
+    echo "Importing Let's Encrypt certificate into Java truststore..."
+    keytool -importcert -trustcacerts -cacerts -storepass changeit \
+      -alias "letsencrypt-$DOMAIN" -file "$LE_CERT" -noprompt 2>/dev/null || true
+  fi
+fi
+
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
 if [[ -z "$WA_TOOLS" || ! -d "$WA_TOOLS" ]]; then
@@ -640,12 +686,10 @@ else
   cd "$WA_TOOLS"
 
   # --- Portal Web Adaptor ---
-  # Check if already configured by testing the Portal Web Adaptor health endpoint
   PORTAL_WA_STATUS=$(curl -sk "https://$DOMAIN/portal/sharing/rest?f=json" 2>/dev/null || echo "")
   if echo "$PORTAL_WA_STATUS" | grep -q "currentVersion"; then
     echo "Portal Web Adaptor already configured, skipping..."
   else
-    # Wait for Portal to be healthy before configuring
     wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
     echo "Configuring Web Adaptor for Portal..."
@@ -677,8 +721,8 @@ else
   if echo "$SERVER_WA_STATUS" | grep -q "currentVersion"; then
     echo "Server Web Adaptor already configured, skipping..."
   else
-    # Wait for Server to be healthy before configuring
-    wait_for_service "https://localhost:6443/arcgis/admin/healthCheck?f=json" "Server" 300 || true
+    # Server site exists by now (Step 11), so healthCheck works
+    wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
 
     echo "Configuring Web Adaptor for Server..."
     WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
