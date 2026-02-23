@@ -602,32 +602,99 @@ echo ""
 echo ">>> Step 13: Configuring Web Adaptors"
 echo ""
 
+# Helper: wait until a service health-check responds
+wait_for_service() {
+  local url="$1"
+  local name="$2"
+  local max_wait="${3:-300}"  # default 5 minutes
+  local elapsed=0
+  echo "Waiting for $name to be ready at $url ..."
+  while (( elapsed < max_wait )); do
+    if curl -sk "$url" 2>/dev/null | grep -q "status.*success\|currentVersion"; then
+      echo "$name is ready."
+      return 0
+    fi
+    sleep 10
+    elapsed=$((elapsed + 10))
+    echo "  ... still waiting ($elapsed s)"
+  done
+  echo "WARNING: $name did not respond within ${max_wait}s"
+  return 1
+}
+
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
-# Wait for Tomcat to fully deploy WARs
-sleep 20
-
-if [[ -n "$WA_TOOLS" && -d "$WA_TOOLS" ]]; then
+if [[ -z "$WA_TOOLS" || ! -d "$WA_TOOLS" ]]; then
+  echo "ERROR: Web Adaptor tools directory not found — skipping Web Adaptor config."
+else
   echo "Found Web Adaptor tools at: $WA_TOOLS"
-  echo "Configuring Web Adaptor for Portal..."
   cd "$WA_TOOLS"
-  sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
-    -m portal \
-    -w "https://$DOMAIN/portal/webadaptor" \
-    -g "https://localhost:7443" \
-    -u "$ADMIN_USER" \
-    -p "$ADMIN_PASS" || true
 
-  sleep 10
+  # --- Portal Web Adaptor ---
+  # Check if already configured by testing the Portal Web Adaptor health endpoint
+  PORTAL_WA_STATUS=$(curl -sk "https://$DOMAIN/portal/sharing/rest?f=json" 2>/dev/null || echo "")
+  if echo "$PORTAL_WA_STATUS" | grep -q "currentVersion"; then
+    echo "Portal Web Adaptor already configured, skipping..."
+  else
+    # Wait for Portal to be healthy before configuring
+    wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
-  echo "Configuring Web Adaptor for Server..."
-  sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
-    -m server \
-    -w "https://$DOMAIN/server/webadaptor" \
-    -g "https://localhost:6443" \
-    -u "$ADMIN_USER" \
-    -p "$ADMIN_PASS" \
-    -a true || true
+    echo "Configuring Web Adaptor for Portal..."
+    WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+      -m portal \
+      -w "https://$DOMAIN/portal/webadaptor" \
+      -g "https://$DOMAIN:7443" \
+      -u "$ADMIN_USER" \
+      -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
+    echo "$WA_PORTAL_OUTPUT"
+    if [[ $WA_PORTAL_RC -ne 0 ]]; then
+      echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
+      echo "Trying once more with localhost gateway..."
+      sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+        -m portal \
+        -w "https://$DOMAIN/portal/webadaptor" \
+        -g "https://localhost:7443" \
+        -u "$ADMIN_USER" \
+        -p "$ADMIN_PASS" 2>&1 || {
+          echo "ERROR: Portal Web Adaptor configuration failed on retry too."
+          echo "You can configure it manually later — see README."
+        }
+    fi
+    sleep 10
+  fi
+
+  # --- Server Web Adaptor ---
+  SERVER_WA_STATUS=$(curl -sk "https://$DOMAIN/server/rest/info?f=json" 2>/dev/null || echo "")
+  if echo "$SERVER_WA_STATUS" | grep -q "currentVersion"; then
+    echo "Server Web Adaptor already configured, skipping..."
+  else
+    # Wait for Server to be healthy before configuring
+    wait_for_service "https://localhost:6443/arcgis/admin/healthCheck?f=json" "Server" 300 || true
+
+    echo "Configuring Web Adaptor for Server..."
+    WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+      -m server \
+      -w "https://$DOMAIN/server/webadaptor" \
+      -g "https://$DOMAIN:6443" \
+      -u "$ADMIN_USER" \
+      -p "$ADMIN_PASS" \
+      -a true 2>&1) && WA_SERVER_RC=0 || WA_SERVER_RC=$?
+    echo "$WA_SERVER_OUTPUT"
+    if [[ $WA_SERVER_RC -ne 0 ]]; then
+      echo "ERROR: Server Web Adaptor configuration failed (exit code $WA_SERVER_RC)."
+      echo "Trying once more with localhost gateway..."
+      sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+        -m server \
+        -w "https://$DOMAIN/server/webadaptor" \
+        -g "https://localhost:6443" \
+        -u "$ADMIN_USER" \
+        -p "$ADMIN_PASS" \
+        -a true 2>&1 || {
+          echo "ERROR: Server Web Adaptor configuration failed on retry too."
+          echo "You can configure it manually later — see README."
+        }
+    fi
+  fi
 fi
 
 # ==============================================================================
@@ -644,24 +711,39 @@ echo ""
 if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   cd "$ESRI_BASE/arcgis/datastore/tools"
 
-  echo "Registering relational data store with Server..."
-  sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-    "https://localhost:6443/arcgis/admin" \
-    "$ADMIN_USER" \
-    "$ADMIN_PASS" \
-    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-    --stores relational || true
-
-  sleep 10
+  # Check if relational data store is already registered
+  DS_STATUS=$(sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || echo "")
+  if echo "$DS_STATUS" | grep -qi "relational"; then
+    echo "Relational data store already registered, skipping..."
+  else
+    echo "Registering relational data store with Server..."
+    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+      "https://localhost:6443/arcgis/admin" \
+      "$ADMIN_USER" \
+      "$ADMIN_PASS" \
+      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+      --stores relational 2>&1 || {
+        echo "ERROR: Relational data store registration failed."
+      }
+    sleep 10
+  fi
 
   # Object store is required for the base deployment in 12.0
-  echo "Registering object store with Server..."
-  sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-    "https://localhost:6443/arcgis/admin" \
-    "$ADMIN_USER" \
-    "$ADMIN_PASS" \
-    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-    --stores object || true
+  if echo "$DS_STATUS" | grep -qi "object"; then
+    echo "Object store already registered, skipping..."
+  else
+    echo "Registering object store with Server..."
+    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+      "https://localhost:6443/arcgis/admin" \
+      "$ADMIN_USER" \
+      "$ADMIN_PASS" \
+      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+      --stores object 2>&1 || {
+        echo "ERROR: Object store registration failed."
+      }
+  fi
+else
+  echo "ERROR: Data Store tools directory not found."
 fi
 
 # ==============================================================================
@@ -681,43 +763,61 @@ get_portal_token() {
     -d "f=json" | jq -r '.token'
 }
 
-TOKEN=$(get_portal_token) || true
+# Check if already federated
+PREV_TOKEN=$(get_portal_token 2>/dev/null) || true
+EXISTING_FEDERATION=""
+if [[ -n "${PREV_TOKEN:-}" && "$PREV_TOKEN" != "null" ]]; then
+  EXISTING_FEDERATION=$(curl -sk \
+    "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PREV_TOKEN" \
+    2>/dev/null || echo "")
+fi
 
-if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
-  echo "Federating ArcGIS Server with Portal..."
-
-  FEDERATE_RESULT=$(curl -sk -X POST \
-    "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
-    -d "url=https://$DOMAIN/server" \
-    -d "adminUrl=https://localhost:6443/arcgis" \
-    -d "username=$ADMIN_USER" \
-    -d "password=$ADMIN_PASS" \
-    -d "token=$TOKEN" \
-    -d "f=json" 2>/dev/null) || true
-  echo "Federation result: $FEDERATE_RESULT"
-
-  sleep 10
-
-  # Set as hosting server
-  echo "Setting Server as hosting server..."
-  SERVERS=$(curl -sk \
-    "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
-    2>/dev/null) || true
-  FEDERATED_SERVER_ID=$(echo "$SERVERS" | jq -r '.servers[0].id // empty')
-
-  if [[ -n "$FEDERATED_SERVER_ID" ]]; then
-    curl -sk -X POST \
-      "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
-      -d "serverRole=HOSTING_SERVER" \
-      -d "token=$TOKEN" \
-      -d "f=json" || true
-    echo "Server set as hosting server."
-  else
-    echo "WARNING: Could not find federated server to set as hosting."
-  fi
+if echo "$EXISTING_FEDERATION" | grep -q '"id"'; then
+  echo "Server is already federated with Portal, skipping..."
 else
-  echo "WARNING: Could not get Portal token. Federation may need to be done manually."
-  echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
+  TOKEN=$(get_portal_token) || true
+
+  if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
+    echo "Federating ArcGIS Server with Portal..."
+
+    FEDERATE_RESULT=$(curl -sk -X POST \
+      "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
+      -d "url=https://$DOMAIN/server" \
+      -d "adminUrl=https://$DOMAIN:6443/arcgis" \
+      -d "username=$ADMIN_USER" \
+      -d "password=$ADMIN_PASS" \
+      -d "token=$TOKEN" \
+      -d "f=json" 2>/dev/null) || true
+    echo "Federation result: $FEDERATE_RESULT"
+
+    if echo "$FEDERATE_RESULT" | grep -q '"error"'; then
+      echo "ERROR: Federation failed. See output above."
+      echo "You can federate manually via Portal Admin."
+    else
+      sleep 10
+
+      # Set as hosting server
+      echo "Setting Server as hosting server..."
+      SERVERS=$(curl -sk \
+        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
+        2>/dev/null) || true
+      FEDERATED_SERVER_ID=$(echo "$SERVERS" | jq -r '.servers[0].id // empty')
+
+      if [[ -n "$FEDERATED_SERVER_ID" ]]; then
+        HOSTING_RESULT=$(curl -sk -X POST \
+          "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+          -d "serverRole=HOSTING_SERVER" \
+          -d "token=$TOKEN" \
+          -d "f=json" 2>/dev/null) || true
+        echo "Hosting server result: $HOSTING_RESULT"
+      else
+        echo "WARNING: Could not find federated server to set as hosting."
+      fi
+    fi
+  else
+    echo "WARNING: Could not get Portal token. Federation may need to be done manually."
+    echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
+  fi
 fi
 
 # ==============================================================================
