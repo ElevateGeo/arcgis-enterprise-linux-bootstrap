@@ -461,7 +461,9 @@ fi
 
 # Deploy Web Adaptor WARs to Tomcat (two instances: portal and server)
 WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
-if [[ -n "$WA_WAR" ]]; then
+if [[ -n "$WA_WAR" && -f "$TOMCAT_WEBAPPS/portal.war" && -f "$TOMCAT_WEBAPPS/server.war" ]]; then
+  echo "Web Adaptor WARs already deployed, skipping..."
+elif [[ -n "$WA_WAR" ]]; then
   echo "Deploying Web Adaptor WARs to Tomcat ($TOMCAT_PKG) from: $WA_WAR"
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
@@ -478,22 +480,35 @@ echo ""
 echo ">>> Step 10: Starting ArcGIS Services"
 echo ""
 
+# Only start services that are not already running
 if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
-  echo "Starting ArcGIS Server..."
-  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" || true
-  sleep 30
+  if pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; then
+    echo "ArcGIS Server already running, skipping start."
+  else
+    echo "Starting ArcGIS Server..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" || true
+    sleep 30
+  fi
 fi
 
 if [[ -f "$ESRI_BASE/arcgis/portal/startportal.sh" ]]; then
-  echo "Starting Portal for ArcGIS..."
-  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/portal/startportal.sh" || true
-  sleep 60
+  if pgrep -u "$ARCGIS_USER" -f "arcgis/portal" > /dev/null 2>&1; then
+    echo "Portal for ArcGIS already running, skipping start."
+  else
+    echo "Starting Portal for ArcGIS..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/portal/startportal.sh" || true
+    sleep 60
+  fi
 fi
 
 if [[ -f "$ESRI_BASE/arcgis/datastore/startdatastore.sh" ]]; then
-  echo "Starting ArcGIS Data Store..."
-  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/datastore/startdatastore.sh" || true
-  sleep 30
+  if pgrep -u "$ARCGIS_USER" -f "arcgis/datastore" > /dev/null 2>&1; then
+    echo "ArcGIS Data Store already running, skipping start."
+  else
+    echo "Starting ArcGIS Data Store..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/datastore/startdatastore.sh" || true
+    sleep 30
+  fi
 fi
 
 # Helper: wait until a service health-check responds
@@ -517,8 +532,8 @@ wait_for_service() {
 }
 
 # || true prevents set -e from aborting — services may need extra time
-wait_for_service "https://localhost:6443/arcgis/rest/info" "ArcGIS Server" 300 || true
-wait_for_service "https://localhost:7443/arcgis/home" "Portal for ArcGIS" 300 || true
+wait_for_service "https://localhost:6443/arcgis/admin/healthCheck?f=json" "ArcGIS Server" 300 || true
+wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 || true
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
