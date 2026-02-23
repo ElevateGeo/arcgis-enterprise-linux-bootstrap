@@ -191,6 +191,14 @@ apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk \
 # Configure Tomcat to start on boot
 systemctl enable "$TOMCAT_PKG"
 
+# Ensure the VM can resolve its own FQDN to localhost.
+# Azure/cloud VMs often cannot hairpin through the public IP, so
+# configurewebadaptor.sh (and other tools) fail to reach https://$DOMAIN.
+if ! grep -q "$DOMAIN" /etc/hosts 2>/dev/null; then
+  echo "Adding $DOMAIN to /etc/hosts for local resolution..."
+  echo "127.0.0.1  $DOMAIN" >> /etc/hosts
+fi
+
 # ==============================================================================
 # Step 2: SSL Certificates (Cloudflare DNS validation)
 # ==============================================================================
@@ -488,30 +496,29 @@ if [[ -f "$ESRI_BASE/arcgis/datastore/startdatastore.sh" ]]; then
   sleep 30
 fi
 
-# Wait for services to be ready
+# Helper: wait until a service health-check responds
 wait_for_service() {
   local url="$1"
   local name="$2"
-  local max_attempts=30
-  local attempt=1
-
-  echo "Waiting for $name to be ready..."
-  while [[ $attempt -le $max_attempts ]]; do
-    if curl -sk "$url" > /dev/null 2>&1; then
-      echo "$name is ready!"
+  local max_wait="${3:-300}"  # default 5 minutes
+  local elapsed=0
+  echo "Waiting for $name to be ready at $url ..."
+  while (( elapsed < max_wait )); do
+    if curl -sk "$url" 2>/dev/null | grep -q "status.*success\|currentVersion\|html\|arcgis"; then
+      echo "$name is ready."
       return 0
     fi
-    echo "  Attempt $attempt/$max_attempts - waiting..."
     sleep 10
-    ((attempt++))
+    elapsed=$((elapsed + 10))
+    echo "  ... still waiting ($elapsed s)"
   done
-  echo "WARNING: $name did not respond within $(( max_attempts * 10 )) seconds"
+  echo "WARNING: $name did not respond within ${max_wait}s"
   return 1
 }
 
 # || true prevents set -e from aborting — services may need extra time
-wait_for_service "https://localhost:6443/arcgis/rest/info" "ArcGIS Server" || true
-wait_for_service "https://localhost:7443/arcgis/home" "Portal for ArcGIS" || true
+wait_for_service "https://localhost:6443/arcgis/rest/info" "ArcGIS Server" 300 || true
+wait_for_service "https://localhost:7443/arcgis/home" "Portal for ArcGIS" 300 || true
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
@@ -606,26 +613,6 @@ fi
 echo ""
 echo ">>> Step 13: Configuring Web Adaptors"
 echo ""
-
-# Helper: wait until a service health-check responds
-wait_for_service() {
-  local url="$1"
-  local name="$2"
-  local max_wait="${3:-300}"  # default 5 minutes
-  local elapsed=0
-  echo "Waiting for $name to be ready at $url ..."
-  while (( elapsed < max_wait )); do
-    if curl -sk "$url" 2>/dev/null | grep -q "status.*success\|currentVersion"; then
-      echo "$name is ready."
-      return 0
-    fi
-    sleep 10
-    elapsed=$((elapsed + 10))
-    echo "  ... still waiting ($elapsed s)"
-  done
-  echo "WARNING: $name did not respond within ${max_wait}s"
-  return 1
-}
 
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
