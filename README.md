@@ -33,15 +33,15 @@
 
 ### 🎯 Designed For
 
-- 🧑‍💻 ArcGIS **Developer Bundle** (dev/test, non-production)
 - ☁️ Azure, AWS, or on-prem Linux VMs
+- 🧑‍💻 Any ArcGIS Enterprise license (Developer, Standard, Advanced)
 - 💰 Lowest-cost, repeatable deployments
 
 ### 🚫 What This Is *Not*
 
 - ❌ Production-ready
 - ❌ High-availability
-- ❌ Docker / Kubernetes (not supported by Esri)
+- ❌ Docker (not supported by Esri)
 
 ---
 
