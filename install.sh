@@ -102,7 +102,7 @@ prompt_if_empty ADMIN_USER "Portal/Server admin username" "" "siteadmin"
 prompt_if_empty ADMIN_PASS "Portal/Server admin password" secret
 prompt_if_empty ADMIN_FIRST_NAME "Admin first name" "" "Site"
 prompt_if_empty ADMIN_LAST_NAME "Admin last name" "" "Admin"
-prompt_if_empty ADMIN_SECURITY_QUESTION "Security question" "" "What is your favorite color?"
+prompt_if_empty ADMIN_SECURITY_QUESTION "Security question index (1-14, see Esri docs)" "" "1"
 prompt_if_empty ADMIN_SECURITY_ANSWER "Security answer" "" "Blue"
 
 # License files — auto-detect from /opt/esri/licenses before prompting.

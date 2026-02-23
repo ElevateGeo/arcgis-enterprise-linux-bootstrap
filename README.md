@@ -101,8 +101,23 @@ ADMIN_USER='siteadmin'
 ADMIN_PASS='YourSecurePassword123!'
 ADMIN_FIRST_NAME='Site'
 ADMIN_LAST_NAME='Admin'
-ADMIN_SECURITY_QUESTION='What is your favorite color?'
-ADMIN_SECURITY_ANSWER='Blue'
+# Security question index (1-14):
+#   1  What city were you born in?
+#   2  What was your high school mascot?
+#   3  What is your mother's maiden name?
+#   4  What was the make of your first car?
+#   5  What high school did you go to?
+#   6  What is the last name of your best friend?
+#   7  What is the middle name of your youngest sibling?
+#   8  What is the name of the street on which you grew up?
+#   9  What is the name of your favorite fictional character?
+#  10  What is the name of your favorite pet?
+#  11  What is the name of your favorite restaurant?
+#  12  What is the title of your favorite book?
+#  13  What is your dream job?
+#  14  Where did you go on your honeymoon?
+ADMIN_SECURITY_QUESTION='1'
+ADMIN_SECURITY_ANSWER='Springfield'
 
 # 🔑 License files (auto-detected if not specified)
 PORTAL_LICENSE_FILE='/opt/esri/licenses/ArcGIS_Enterprise_Portal.json'
@@ -230,7 +245,7 @@ sudo -u arcgis ./createportal.sh \
   -fn "Admin" -ln "User" \
   -u siteadmin -p "YourSecurePassword123!" \
   -e admin@example.com \
-  -qi "What is your favorite color?" -qa "Blue" \
+  -qi 1 -qa "Springfield" \
   -d /opt/esri/arcgis/portal/usr/arcgisportal \
   -lf /opt/esri/licenses/ArcGIS_Enterprise_Portal_120_551327_20260122.json
 ```
