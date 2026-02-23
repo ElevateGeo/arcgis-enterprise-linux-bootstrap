@@ -664,17 +664,29 @@ if [[ "$NGINX_PORTAL_TEST" == "000" ]]; then
   echo ""
 fi
 
-# Import the Let's Encrypt cert into Java's truststore so configurewebadaptor.sh
-# (a Java tool) trusts the NGINX HTTPS endpoint.
+# Import the Let's Encrypt cert into ALL Java truststores on the system.
+# configurewebadaptor.sh is a Java tool that validates the HTTPS connection.
+# Esri ships its own JRE (under /opt/esri), so the system JRE alone isn't enough.
 LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-JAVA_HOME_DIR=$(dirname $(dirname $(readlink -f $(which java))))
-JAVA_CACERTS="$JAVA_HOME_DIR/lib/security/cacerts"
-if [[ -f "$LE_CERT" && -f "$JAVA_CACERTS" ]]; then
-  if ! keytool -list -cacerts -storepass changeit -alias "letsencrypt-$DOMAIN" > /dev/null 2>&1; then
-    echo "Importing Let's Encrypt certificate into Java truststore..."
-    keytool -importcert -trustcacerts -cacerts -storepass changeit \
-      -alias "letsencrypt-$DOMAIN" -file "$LE_CERT" -noprompt 2>/dev/null || true
-  fi
+if [[ -f "$LE_CERT" ]]; then
+  echo "Importing Let's Encrypt certificate into all Java truststores..."
+  # Find every cacerts file: system JRE, Esri-shipped JREs, Tomcat, etc.
+  while IFS= read -r CACERTS_FILE; do
+    # Try to import; skip if alias already exists or file is read-only
+    KEYTOOL_BIN=$(dirname "$CACERTS_FILE")/../bin/keytool
+    if [[ ! -x "$KEYTOOL_BIN" ]]; then
+      KEYTOOL_BIN="keytool"  # fall back to system keytool
+    fi
+    if ! "$KEYTOOL_BIN" -list -keystore "$CACERTS_FILE" -storepass changeit \
+        -alias "letsencrypt-$DOMAIN" > /dev/null 2>&1; then
+      echo "  Importing into: $CACERTS_FILE"
+      "$KEYTOOL_BIN" -importcert -trustcacerts -keystore "$CACERTS_FILE" \
+        -storepass changeit -alias "letsencrypt-$DOMAIN" \
+        -file "$LE_CERT" -noprompt 2>/dev/null || true
+    else
+      echo "  Already imported: $CACERTS_FILE"
+    fi
+  done < <(find /opt/esri /usr/lib/jvm /etc/ssl -name "cacerts" -type f 2>/dev/null | sort -u)
 fi
 
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
