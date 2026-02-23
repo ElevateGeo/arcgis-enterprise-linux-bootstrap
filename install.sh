@@ -324,14 +324,20 @@ echo ""
 echo ">>> Step 5: Extracting Installers"
 echo ""
 
-cd "$INSTALLERS"
-for f in *.tar.gz; do
-  if [[ -f "$f" ]]; then
-    echo "Extracting $f..."
-    tar -xzf "$f"
-  fi
-done
-chown -R "$ARCGIS_USER:$ARCGIS_USER" "$INSTALLERS"
+EXTRACT_MARKER="$INSTALLERS/.extracted"
+if [[ -f "$EXTRACT_MARKER" ]]; then
+  echo "Installers already extracted (marker found), skipping..."
+else
+  cd "$INSTALLERS"
+  for f in *.tar.gz; do
+    if [[ -f "$f" ]]; then
+      echo "Extracting $f..."
+      tar -xzf "$f"
+    fi
+  done
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$INSTALLERS"
+  touch "$EXTRACT_MARKER"
+fi
 
 # ==============================================================================
 # Step 6: Install ArcGIS Server
