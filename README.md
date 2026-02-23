@@ -14,12 +14,12 @@ This repository is designed for:
 
 ## What This Sets Up
 
-- Ubuntu 22.04 LTS
+- Ubuntu 22.04 LTS or 24.04 LTS
 - ArcGIS Enterprise 12.0 (single machine):
   - Portal for ArcGIS
   - ArcGIS GIS Server
   - ArcGIS Data Store (relational + object)
-  - Web Adaptor (Java / Tomcat 9)
+  - Web Adaptor (Java / Tomcat — auto-detected: tomcat9 on 22.04, tomcat10 on 24.04)
 - NGINX reverse proxy with WebSocket support
 - Automatic HTTPS (Let's Encrypt via Cloudflare DNS)
 - `.env`‑based configuration (no secrets in scripts)
@@ -37,9 +37,9 @@ This repository is designed for:
 ## Prerequisites
 
 1. **Linux VM**
-   - Ubuntu 22.04 LTS (22.04.5 or later)
+   - Ubuntu 22.04 LTS or 24.04 LTS
    - 4 vCPU / 16 GB RAM minimum ([system requirements](https://enterprise.arcgis.com/en/system-requirements/12.0/linux/arcgis-enterprise-overall-system-requirements.htm))
-   - 20 GB+ free disk space
+   - 100 GB+ free disk space (Portal extraction alone requires ~15 GB; full deployment needs 50+ GB)
 
 2. **ArcGIS Installers (Linux)**
    Download from [My Esri](https://my.esri.com/) and place in:
@@ -159,7 +159,7 @@ The `install.sh` script follows [Esri's documented deployment order](https://ent
 
 | Step | Action | Esri Reference |
 |------|--------|----------------|
-| 1 | Install system dependencies (NGINX, Tomcat 9, OpenJDK 11, Certbot) | |
+| 1 | Install system dependencies (NGINX, Tomcat, OpenJDK 11, Certbot) — auto-detects Tomcat version | |
 | 2 | Configure SSL certificates via Cloudflare DNS | |
 | 3 | Configure NGINX reverse proxy (with WebSocket support) | |
 | 4 | Create `arcgis` user, set ulimits and sysctl kernel parameters | [Server system requirements](https://enterprise.arcgis.com/en/server/12.0/install/linux/arcgis-server-system-requirements.htm) |

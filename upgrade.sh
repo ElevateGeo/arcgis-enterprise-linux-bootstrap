@@ -49,6 +49,21 @@ ESRI_BASE="/opt/esri"
 INSTALLERS="$ESRI_BASE/installers"
 ARCGIS_USER="arcgis"
 
+# ---------- Detect Tomcat version ----------
+if systemctl list-unit-files tomcat10.service &>/dev/null && systemctl list-unit-files tomcat10.service | grep -q tomcat10; then
+  TOMCAT_PKG="tomcat10"
+elif systemctl list-unit-files tomcat9.service &>/dev/null && systemctl list-unit-files tomcat9.service | grep -q tomcat9; then
+  TOMCAT_PKG="tomcat9"
+else
+  TOMCAT_PKG=""
+  echo "WARNING: No Tomcat service detected. WAR re-deployment will be skipped."
+fi
+if [[ -n "$TOMCAT_PKG" ]]; then
+  TOMCAT_WEBAPPS="/var/lib/$TOMCAT_PKG/webapps"
+  TOMCAT_USER=$(stat -c '%U' "/var/lib/$TOMCAT_PKG" 2>/dev/null || echo "tomcat")
+  echo "Detected Tomcat: $TOMCAT_PKG (user: $TOMCAT_USER)"
+fi
+
 # ---------- Verify prerequisites ----------
 if ! id "$ARCGIS_USER" &>/dev/null; then
   echo "ERROR: User '$ARCGIS_USER' not found. Is ArcGIS Enterprise installed?"
@@ -288,14 +303,15 @@ if [[ -n "${WA_SETUP:-}" ]]; then
   cd "$WA_DIR"
   sudo -u "$ARCGIS_USER" ./Setup -m silent -l yes
 
-  # Re-deploy WARs to Tomcat
-  echo "Re-deploying Web Adaptor WARs to Tomcat..."
-  if [[ -f "$ESRI_BASE/webadaptor/java/arcgis.war" ]]; then
-    cp "$ESRI_BASE/webadaptor/java/arcgis.war" /var/lib/tomcat9/webapps/portal.war
-    cp "$ESRI_BASE/webadaptor/java/arcgis.war" /var/lib/tomcat9/webapps/server.war
-    chown tomcat:tomcat /var/lib/tomcat9/webapps/portal.war
-    chown tomcat:tomcat /var/lib/tomcat9/webapps/server.war
-    systemctl restart tomcat9
+  # Re-deploy WARs to Tomcat (find WAR dynamically — versioned install path)
+  WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
+  if [[ -n "${WA_WAR:-}" && -n "${TOMCAT_PKG:-}" ]]; then
+    echo "Re-deploying Web Adaptor WARs to Tomcat ($TOMCAT_PKG) from: $WA_WAR"
+    cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
+    cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
+    chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/portal.war"
+    chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/server.war"
+    systemctl restart "$TOMCAT_PKG"
     sleep 10
   fi
 else
@@ -370,8 +386,8 @@ else
 fi
 
 # Re-configure Web Adaptors after upgrade (required by Esri)
-WA_TOOLS="$ESRI_BASE/webadaptor/java/tools"
-if [[ -d "$WA_TOOLS" && -n "${ADMIN_USER:-}" && -n "${ADMIN_PASS:-}" && -n "${DOMAIN:-}" ]]; then
+WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
+if [[ -n "${WA_TOOLS:-}" && -d "${WA_TOOLS:-}" && -n "${ADMIN_USER:-}" && -n "${ADMIN_PASS:-}" && -n "${DOMAIN:-}" ]]; then
   sleep 20  # Allow Tomcat to finish deploying WARs
 
   echo "Re-configuring Web Adaptor for Portal..."

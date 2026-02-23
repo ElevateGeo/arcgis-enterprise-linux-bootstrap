@@ -150,6 +150,18 @@ if [[ ! -d "$INSTALLERS" ]]; then
   exit 1
 fi
 
+# Check available disk space (Portal alone needs ~15 GB to extract;
+# total extracted + installed typically requires 50+ GB)
+AVAIL_KB=$(df --output=avail "$ESRI_BASE" 2>/dev/null | tail -1 | tr -d ' ')
+AVAIL_GB=$(( AVAIL_KB / 1048576 ))
+echo "Available disk space on $ESRI_BASE: ${AVAIL_GB} GB"
+if [[ $AVAIL_GB -lt 50 ]]; then
+  echo "ERROR: At least 50 GB of free space is required on $ESRI_BASE."
+  echo "       Currently available: ${AVAIL_GB} GB"
+  echo "       Expand the disk or mount additional storage before running this script."
+  exit 1
+fi
+
 # ==============================================================================
 # Step 1: System Dependencies
 # ==============================================================================
@@ -158,11 +170,26 @@ echo ">>> Step 1: Installing System Dependencies"
 echo ""
 
 apt-get update
+
+# Detect available Tomcat version (Ubuntu 24.04+ ships tomcat10, 22.04 ships tomcat9)
+if apt-cache show tomcat10 &>/dev/null; then
+  TOMCAT_PKG="tomcat10"
+elif apt-cache show tomcat9 &>/dev/null; then
+  TOMCAT_PKG="tomcat9"
+else
+  echo "ERROR: Neither tomcat10 nor tomcat9 is available. Install Tomcat manually."
+  exit 1
+fi
+echo "Using Tomcat package: $TOMCAT_PKG"
+TOMCAT_WEBAPPS="/var/lib/$TOMCAT_PKG/webapps"
+# Tomcat's system user varies by distro (often 'tomcat' regardless of package version)
+TOMCAT_USER=$(stat -c '%U' "/var/lib/$TOMCAT_PKG" 2>/dev/null || echo "tomcat")
+
 apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk \
-  tar unzip tomcat9 curl jq
+  tar unzip "$TOMCAT_PKG" curl jq
 
 # Configure Tomcat to start on boot
-systemctl enable tomcat9
+systemctl enable "$TOMCAT_PKG"
 
 # ==============================================================================
 # Step 2: SSL Certificates (Cloudflare DNS validation)
@@ -398,25 +425,30 @@ echo ">>> Step 9: Installing Web Adaptor"
 echo ""
 
 WA_SETUP=$(find "$INSTALLERS" -maxdepth 2 -name "Setup" -path "*WebAdaptor*" -type f 2>/dev/null | head -1)
-if [[ -n "$WA_SETUP" && ! -d "$ESRI_BASE/webadaptor" ]]; then
+# Detect existing Web Adaptor install (versioned path, e.g., webadaptor12.0)
+WA_HOME=$(find "$ESRI_BASE/arcgis" -maxdepth 1 -type d -name "webadaptor*" 2>/dev/null | head -1)
+if [[ -n "$WA_SETUP" && -z "$WA_HOME" ]]; then
   WA_DIR=$(dirname "$WA_SETUP")
   echo "Found Web Adaptor installer: $WA_DIR"
   cd "$WA_DIR"
   sudo -u "$ARCGIS_USER" ./Setup -m silent -l yes -d "$ESRI_BASE"
-elif [[ -d "$ESRI_BASE/webadaptor" ]]; then
-  echo "Web Adaptor already installed, skipping..."
+  # Re-detect after install
+  WA_HOME=$(find "$ESRI_BASE/arcgis" -maxdepth 1 -type d -name "webadaptor*" 2>/dev/null | head -1)
+elif [[ -n "$WA_HOME" ]]; then
+  echo "Web Adaptor already installed at $WA_HOME, skipping..."
 else
   echo "WARNING: Web Adaptor installer not found in $INSTALLERS"
 fi
 
 # Deploy Web Adaptor WARs to Tomcat (two instances: portal and server)
-echo "Deploying Web Adaptor WARs to Tomcat..."
-if [[ -f "$ESRI_BASE/webadaptor/java/arcgis.war" ]]; then
-  cp "$ESRI_BASE/webadaptor/java/arcgis.war" /var/lib/tomcat9/webapps/portal.war
-  cp "$ESRI_BASE/webadaptor/java/arcgis.war" /var/lib/tomcat9/webapps/server.war
-  chown tomcat:tomcat /var/lib/tomcat9/webapps/portal.war
-  chown tomcat:tomcat /var/lib/tomcat9/webapps/server.war
-  systemctl restart tomcat9
+WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
+if [[ -n "$WA_WAR" ]]; then
+  echo "Deploying Web Adaptor WARs to Tomcat ($TOMCAT_PKG) from: $WA_WAR"
+  cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
+  cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
+  chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/portal.war"
+  chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/server.war"
+  systemctl restart "$TOMCAT_PKG"
   sleep 10
 fi
 
@@ -564,12 +596,13 @@ echo ""
 echo ">>> Step 13: Configuring Web Adaptors"
 echo ""
 
-WA_TOOLS="$ESRI_BASE/webadaptor/java/tools"
+WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
 # Wait for Tomcat to fully deploy WARs
 sleep 20
 
-if [[ -d "$WA_TOOLS" ]]; then
+if [[ -n "$WA_TOOLS" && -d "$WA_TOOLS" ]]; then
+  echo "Found Web Adaptor tools at: $WA_TOOLS"
   echo "Configuring Web Adaptor for Portal..."
   cd "$WA_TOOLS"
   sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
