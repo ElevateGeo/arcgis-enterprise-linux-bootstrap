@@ -744,36 +744,12 @@ for WA_CTX in portal server; do
   fi
 done
 
-# Test endpoints (capture 500 response bodies inline for diagnosis)
+# Test key endpoints
 echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
 for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/"; do
   HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$TEST_URL" 2>/dev/null || echo "000")
   echo "  $TEST_URL → HTTP $HTTP_CODE"
-  if [[ "$HTTP_CODE" == "500" ]]; then
-    echo "    --- 500 Response Body (first 30 lines) ---"
-    curl -sk "$TEST_URL" 2>/dev/null | head -30 | sed 's/^/    /'
-  fi
 done
-
-# Show last 15 lines of Tomcat log for deployment diagnosis
-CATALINA_LOG="$TOMCAT_HOME/logs/catalina.out"
-if [[ -f "$CATALINA_LOG" ]]; then
-  echo ""
-  echo "  Last 15 lines of catalina.out:"
-  tail -15 "$CATALINA_LOG" 2>/dev/null | sed 's/^/    /'
-  echo ""
-fi
-
-# Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 stack traces appear
-LOCALHOST_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
-if [[ -n "$LOCALHOST_LOG" && -f "$LOCALHOST_LOG" ]]; then
-  SEVERE_COUNT=$(grep -c "SEVERE" "$LOCALHOST_LOG" 2>/dev/null) || SEVERE_COUNT=0
-  if [[ "$SEVERE_COUNT" -gt 0 ]]; then
-    echo "  SEVERE errors found in $LOCALHOST_LOG ($SEVERE_COUNT occurrences):"
-    grep -A5 "SEVERE" "$LOCALHOST_LOG" 2>/dev/null | head -30 | sed 's/^/    /'
-    echo ""
-  fi
-fi
 
 # Import the Let's Encrypt cert into ALL Java truststores on the system.
 LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -813,85 +789,6 @@ else
   echo "Found Web Adaptor tools at: $WA_TOOLS"
   cd "$WA_TOOLS"
 
-  # Determine the WA install root (parent of tools/)
-  WA_JAVA_DIR=$(cd "$WA_TOOLS/.." && pwd)
-
-  # --- Diagnostics: WAR internals and config directory ---
-  echo ""
-  echo "Diagnostic: WAR and Web Adaptor configuration analysis..."
-
-  # 1. init_webadaptor.sh — might configure the WAR's config directory
-  WA_INIT="$WA_JAVA_DIR/init_webadaptor.sh"
-  if [[ -f "$WA_INIT" ]]; then
-    echo ""
-    echo "  ┌── init_webadaptor.sh ──────────────────"
-    cat "$WA_INIT" 2>/dev/null | sed 's/^/  │ /'
-    echo "  └────────────────────────────────────────"
-  else
-    echo "  init_webadaptor.sh: NOT FOUND"
-  fi
-
-  # 2. Exploded WAR's web.xml — look for context-param / init-param for config paths
-  for WA_CTX in portal server; do
-    WA_WEB_XML="$TOMCAT_WEBAPPS/$WA_CTX/WEB-INF/web.xml"
-    if [[ -f "$WA_WEB_XML" ]]; then
-      echo ""
-      echo "  ┌── $WA_CTX/WEB-INF/web.xml (full) ──────"
-      cat "$WA_WEB_XML" 2>/dev/null | sed 's/^/  │ /'
-      echo "  └────────────────────────────────────────"
-    fi
-
-    # META-INF/context.xml (Tomcat-specific config)
-    WA_CTX_XML="$TOMCAT_WEBAPPS/$WA_CTX/META-INF/context.xml"
-    if [[ -f "$WA_CTX_XML" ]]; then
-      echo ""
-      echo "  ┌── $WA_CTX/META-INF/context.xml ────────"
-      cat "$WA_CTX_XML" 2>/dev/null | sed 's/^/  │ /'
-      echo "  └────────────────────────────────────────"
-    fi
-  done
-
-  # 3. Find ALL properties files in WA install dir and exploded WARs
-  echo ""
-  echo "  Properties files in WA install dir:"
-  find "$WA_JAVA_DIR" -name "*.properties" -type f 2>/dev/null | sed 's/^/    /'
-  echo "  Properties files in Tomcat webapps:"
-  find "$TOMCAT_WEBAPPS/portal" "$TOMCAT_WEBAPPS/server" -name "*.properties" -type f 2>/dev/null | sed 's/^/    /'
-
-  # 4. Complete listing of WA install directory (non-lib)
-  echo ""
-  echo "  WA Java dir listing (excluding lib/ JARs):"
-  find "$WA_JAVA_DIR" -maxdepth 3 -not -path "*/lib/*" -not -path "*/.Setup/*" | sort | sed 's/^/    /'
-
-  # 5. Quick connectivity test
-  echo ""
-  echo "  Quick endpoint tests:"
-  for WA_PATH in portal server; do
-    HTTP_DIRECT=$(curl -sk -o /dev/null -w "%{http_code}" \
-      "http://localhost:8080/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
-    echo "  http://localhost:8080/${WA_PATH}/webadaptor → HTTP $HTTP_DIRECT"
-  done
-
-  # 6. Test with Java directly (same JRE the tool uses)
-  WA_JAVA=$(which java 2>/dev/null || echo "NOT FOUND")
-  echo "  Java binary: $WA_JAVA"
-  echo "  Java version: $($WA_JAVA -version 2>&1 | head -1)"
-  echo "  JAVA_HOME: ${JAVA_HOME:-not set}"
-
-  # 7. Test WAR connection via Java (same as arcgis-wareg.jar would)
-  echo ""
-  echo "  Testing Java HTTPS connectivity to https://$DOMAIN/portal/webadaptor ..."
-  sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" java -cp "" \
-    -Djava.net.useSystemProxies=false \
-    jdk.internal.net.http.HttpClientImpl 2>/dev/null || true
-  # Simple Java URL test via one-liner
-  sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" java -e \
-    "var c=java.net.URI.create(\"https://$DOMAIN/portal/webadaptor\").toURL().openConnection(); \
-     c.setRequestMethod(\"GET\"); \
-     System.out.println(\"HTTP \"+c.getResponseCode()+\" \"+c.getResponseMessage());" 2>&1 | \
-    tail -5 | sed 's/^/    /' || echo "    (Java URL test failed)"
-  echo ""
-
   # --- Portal Web Adaptor ---
   PORTAL_WA_STATUS=$(curl -sk "https://$DOMAIN/portal/sharing/rest?f=json" 2>/dev/null || echo "")
   if echo "$PORTAL_WA_STATUS" | grep -q "currentVersion"; then
@@ -900,35 +797,60 @@ else
     wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
     WA_PORTAL_RC=1
-    for PORTAL_GW in "https://$DOMAIN:7443" "https://localhost:7443"; do
+    # Per Esri docs: -g is the machine name (FQDN) or URL of the Portal machine.
+    for PORTAL_GW in "$DOMAIN" "https://localhost:7443"; do
       echo "Configuring Web Adaptor for Portal (gateway: $PORTAL_GW)..."
-      # Add SSL handshake debug on first attempt to diagnose "Unable to connect"
-      if [[ $WA_PORTAL_RC -eq 1 && "$PORTAL_GW" == "https://$DOMAIN:7443" ]]; then
-        JTO_THIS="$JTO -Djavax.net.debug=ssl,handshake"
-      else
-        JTO_THIS="$JTO"
-      fi
-      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO_THIS" \
+      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m portal \
         -w "https://$DOMAIN/portal/webadaptor" \
         -g "$PORTAL_GW" \
         -u "$ADMIN_USER" \
-        -p "$ADMIN_PASS" > /tmp/wa_portal_debug.log 2>&1 && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
-      # Show the tool's actual output (last lines, skip SSL debug noise)
-      echo "  Config tool output:"
-      grep -v "^javax.net.ssl\|^%% \|^*** \|^main, \|^Padded plaintext\|^Plaintext\|^Raw \|^Nonce\|^Produced\|^Consumed\|^READ:\|^WRITE:" \
-        /tmp/wa_portal_debug.log | tail -20 | sed 's/^/    /'
-      if [[ $WA_PORTAL_RC -ne 0 ]]; then
-        echo "  SSL/TLS debug (errors and key events):"
-        grep -iE "exception|FAILED|fatal|alert_|unable|trustStore|CertificateException|handshake|ServerHello|server_name" \
-          /tmp/wa_portal_debug.log 2>/dev/null | head -25 | sed 's/^/    /'
-        echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
-      else
-        echo "Portal Web Adaptor configured successfully."
+        -p "$ADMIN_PASS" 2>&1 && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
+      if [[ $WA_PORTAL_RC -eq 0 ]]; then
+        echo "Portal Web Adaptor configured successfully via configurewebadaptor.sh."
         break
       fi
     done
+
+    # Fallback: register the Web Adaptor via Portal Admin REST API.
+    # This bypasses the config tool which can fail when the WAR's /webadaptor
+    # endpoint returns HTTP 400 (expected for unconfigured first-time setup).
+    if [[ $WA_PORTAL_RC -ne 0 ]]; then
+      echo ""
+      echo "configurewebadaptor.sh failed — falling back to REST API registration..."
+      PORTAL_TOKEN=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+        -d "username=$ADMIN_USER" \
+        -d "password=$ADMIN_PASS" \
+        -d "client=referer" \
+        -d "referer=https://$DOMAIN" \
+        -d "f=json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || PORTAL_TOKEN=""
+      if [[ -n "$PORTAL_TOKEN" ]]; then
+        MACHINE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        MACHINE_FQDN=$(hostname -f 2>/dev/null || echo "$DOMAIN")
+        echo "Registering Portal Web Adaptor via REST API..."
+        REG_RESULT=$(curl -sk -X POST \
+          "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
+          -d "webAdaptorURL=https://$DOMAIN/portal" \
+          -d "machineName=$MACHINE_FQDN" \
+          -d "machineIP=$MACHINE_IP" \
+          -d "httpPort=80" \
+          -d "httpsPort=443" \
+          -d "isAdminEnabled=true" \
+          -d "token=$PORTAL_TOKEN" \
+          -d "f=json" 2>/dev/null) || REG_RESULT=""
+        echo "  Result: $REG_RESULT"
+        if echo "$REG_RESULT" | grep -q '"error"'; then
+          echo "  REST API registration failed. Manual configuration required."
+        else
+          echo "  Portal Web Adaptor registered via REST API."
+          WA_PORTAL_RC=0
+        fi
+      else
+        echo "  Could not get Portal token for REST API fallback."
+      fi
+    fi
+
     if [[ $WA_PORTAL_RC -ne 0 ]]; then
       echo "You can configure it manually later — see README."
     fi
@@ -943,24 +865,58 @@ else
     wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
 
     WA_SERVER_RC=1
-    for SERVER_GW in "https://$DOMAIN:6443" "https://localhost:6443"; do
+    # Per Esri docs: -g is the machine name (FQDN) or URL of the Server machine.
+    for SERVER_GW in "$DOMAIN" "https://localhost:6443"; do
       echo "Configuring Web Adaptor for Server (gateway: $SERVER_GW)..."
-      WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
+      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m server \
         -w "https://$DOMAIN/server/webadaptor" \
         -g "$SERVER_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" \
-        -a true 2>&1) && WA_SERVER_RC=0 || WA_SERVER_RC=$?
-      echo "$WA_SERVER_OUTPUT"
+        -a true 2>&1 && WA_SERVER_RC=0 || WA_SERVER_RC=$?
       if [[ $WA_SERVER_RC -eq 0 ]]; then
-        echo "Server Web Adaptor configured successfully."
+        echo "Server Web Adaptor configured successfully via configurewebadaptor.sh."
         break
-      else
-        echo "ERROR: Server Web Adaptor configuration failed (exit code $WA_SERVER_RC)."
       fi
     done
+
+    # Fallback: register the Web Adaptor via Server Admin REST API.
+    if [[ $WA_SERVER_RC -ne 0 ]]; then
+      echo ""
+      echo "configurewebadaptor.sh failed — falling back to REST API registration..."
+      SERVER_TOKEN=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
+        -d "username=$ADMIN_USER" \
+        -d "password=$ADMIN_PASS" \
+        -d "client=requestip" \
+        -d "f=json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || SERVER_TOKEN=""
+      if [[ -n "$SERVER_TOKEN" ]]; then
+        MACHINE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        MACHINE_FQDN=$(hostname -f 2>/dev/null || echo "$DOMAIN")
+        echo "Registering Server Web Adaptor via REST API..."
+        REG_RESULT=$(curl -sk -X POST \
+          "https://localhost:6443/arcgis/admin/system/webadaptors/register" \
+          -d "webAdaptorURL=https://$DOMAIN/server" \
+          -d "machineName=$MACHINE_FQDN" \
+          -d "machineIP=$MACHINE_IP" \
+          -d "httpPort=80" \
+          -d "httpsPort=443" \
+          -d "isAdminEnabled=true" \
+          -d "token=$SERVER_TOKEN" \
+          -d "f=json" 2>/dev/null) || REG_RESULT=""
+        echo "  Result: $REG_RESULT"
+        if echo "$REG_RESULT" | grep -q '"error"'; then
+          echo "  REST API registration failed. Manual configuration required."
+        else
+          echo "  Server Web Adaptor registered via REST API."
+          WA_SERVER_RC=0
+        fi
+      else
+        echo "  Could not get Server token for REST API fallback."
+      fi
+    fi
+
     if [[ $WA_SERVER_RC -ne 0 ]]; then
       echo "You can configure it manually later — see README."
     fi
@@ -1025,12 +981,19 @@ echo ">>> Step 15: Federating Server with Portal"
 echo ""
 
 get_portal_token() {
-  curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+  local _resp
+  _resp=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
     -d "username=$ADMIN_USER" \
     -d "password=$ADMIN_PASS" \
     -d "client=referer" \
     -d "referer=https://$DOMAIN" \
-    -d "f=json" | jq -r '.token'
+    -d "f=json" 2>/dev/null)
+  # Try jq first, fall back to python3
+  if command -v jq &>/dev/null; then
+    echo "$_resp" | jq -r '.token // empty'
+  else
+    echo "$_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null
+  fi
 }
 
 # Check if already federated
