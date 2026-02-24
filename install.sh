@@ -933,7 +933,67 @@ for m in data.get('machines',[]):
     echo "  Server machine name: $SERVER_MACHINE"
 
     # ------------------------------------------------------------------
-    # Step 14c: Federate.
+    # Step 14c: Reset Server's on-disk security config before federating.
+    #
+    # Every failed federation attempt partially writes state to Server's
+    # config-store/security/ directory. On future attempts, Server reads
+    # that corrupted state and chokes with:
+    #   "class JSONObject$a cannot be cast to class java.lang.String"
+    # The only reliable fix is to wipe the security directory so Server
+    # regenerates a clean default config, then federate fresh.
+    # ------------------------------------------------------------------
+    SERVER_CONFIG_STORE=""
+    # Try to find the config-store location from the connection file
+    _CS_XML="$ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml"
+    if [[ -f "$_CS_XML" ]]; then
+      SERVER_CONFIG_STORE=$(grep -oP '(?<=<connectionString>)[^<]+' "$_CS_XML" 2>/dev/null \
+        | head -1 | tr -d '[:space:]') || SERVER_CONFIG_STORE=""
+    fi
+    # Fall back to the default path
+    if [[ -z "$SERVER_CONFIG_STORE" ]]; then
+      SERVER_CONFIG_STORE="$ESRI_BASE/arcgis/server/usr/arcgisserver/config-store"
+    fi
+    SERVER_SEC_DIR="$SERVER_CONFIG_STORE/security"
+
+    echo "  Stopping ArcGIS Server to reset security config store..."
+    if [[ -f "$ESRI_BASE/arcgis/server/stopserver.sh" ]]; then
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+      _sw=0
+      while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+        (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
+        sleep 5; _sw=$((_sw+5))
+      done
+      echo "  Server stopped."
+    fi
+
+    if [[ -d "$SERVER_SEC_DIR" ]]; then
+      echo "  Resetting federation state in $SERVER_SEC_DIR ..."
+      # Delete ONLY direct config files in the security directory.
+      # Subdirectories (e.g. PrincipalStore/) hold user/role accounts and
+      # must be preserved or Server loses the primary site administrator.
+      _SEC_FILES=$(find "$SERVER_SEC_DIR" -maxdepth 1 -type f 2>/dev/null) || _SEC_FILES=""
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        echo "    Removing: $f"
+        cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
+        rm -f "$f" || true
+      done <<< "$_SEC_FILES"
+      echo "  Security config files removed. Server will regenerate defaults on startup."
+    else
+      echo "  Security config dir not found at $SERVER_SEC_DIR — skipping reset."
+    fi
+
+    echo "  Starting ArcGIS Server with clean security config..."
+    if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+      wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
+    fi
+
+    # Refresh Server token after restart
+    SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+
+    # ------------------------------------------------------------------
+    # Step 14d: Federate.
     # url     = PUBLIC services URL (through NGINX reverse proxy) — this
     #           is what external clients use to reach Server services.
     # adminUrl = INTERNAL Server URL — what Portal uses for admin calls.
