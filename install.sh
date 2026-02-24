@@ -919,12 +919,17 @@ else
     else
 
     # ------------------------------------------------------------------
-    # Step 14b: Discover Server's machine name from /admin/machines so
-    # the adminUrl matches the name in Server's SSL certificate.
+    # Step 14b: Discover Server's machine name and config-store path via
+    # the admin API, then wipe the security config so Server regenerates
+    # a clean default — the ClassCastException is caused by corrupted
+    # security state written by previous failed federation attempts.
     # ------------------------------------------------------------------
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
     SERVER_MACHINE=""
+    SERVER_CONFIGSTORE_PATH=""
+
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      # Get machine name
       SERVER_MACHINE=$(curl -sk \
         "https://localhost:6443/arcgis/admin/machines?f=json&token=$SERVER_TOKEN_FED" \
         2>/dev/null | python3 -c "
@@ -932,24 +937,69 @@ import sys,json
 data=json.load(sys.stdin)
 for m in data.get('machines',[]):
     print(m.get('machineName','')); break" 2>/dev/null) || SERVER_MACHINE=""
-    fi
-    if [[ -z "$SERVER_MACHINE" ]]; then
-      SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
-    fi
-    echo "  Server machine name: $SERVER_MACHINE"
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      SERVER_MACHINE=$(curl -sk \
-        "https://localhost:6443/arcgis/admin/machines?f=json&token=$SERVER_TOKEN_FED" \
+
+      # Get config-store path from the API — don't guess the path
+      SERVER_CONFIGSTORE_PATH=$(curl -sk \
+        "https://localhost:6443/arcgis/admin/system/configstore?f=json&token=$SERVER_TOKEN_FED" \
         2>/dev/null | python3 -c "
 import sys,json
 data=json.load(sys.stdin)
-for m in data.get('machines',[]):
-    print(m.get('machineName','')); break" 2>/dev/null) || SERVER_MACHINE=""
+# connectionString is the filesystem path to the config store root
+print(data.get('connectionString', data.get('configPersistenceType','')))" 2>/dev/null) || SERVER_CONFIGSTORE_PATH=""
+      echo "  Server config-store path: $SERVER_CONFIGSTORE_PATH"
+
+      # Print current security config so we can see what's corrupt
+      echo "  Server current security config:"
+      curl -sk \
+        "https://localhost:6443/arcgis/admin/security/config?f=json&token=$SERVER_TOKEN_FED" \
+        2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    for k,v in d.items(): print(f'    {k}: {repr(v)[:120]}')
+except: print('    (could not parse)')" 2>/dev/null || true
     fi
-    if [[ -z "$SERVER_MACHINE" ]]; then
-      SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
-    fi
+
+    [[ -z "$SERVER_MACHINE" ]] && SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
     echo "  Server machine name: $SERVER_MACHINE"
+
+    # Wipe security config directory using the path from the API
+    if [[ -n "$SERVER_CONFIGSTORE_PATH" ]]; then
+      SERVER_SEC_DIR="$SERVER_CONFIGSTORE_PATH/security"
+    else
+      # Fallback: try to read it from the XML connection file
+      _CS_XML="$ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml"
+      if [[ -f "$_CS_XML" ]]; then
+        SERVER_SEC_DIR=$(grep -oP '(?<=<connectionString>)[^<]+' "$_CS_XML" 2>/dev/null \
+          | head -1 | tr -d '[:space:]')/security || SERVER_SEC_DIR=""
+      fi
+    fi
+    echo "  Server security dir: ${SERVER_SEC_DIR:-not found}"
+
+    if [[ -n "$SERVER_SEC_DIR" && -d "$SERVER_SEC_DIR" ]]; then
+      echo "  Stopping Server to wipe corrupted security config..."
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+      _sw=0
+      while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+        (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
+        sleep 5; _sw=$((_sw+5))
+      done
+      # Wipe only top-level files; subdirs (PrincipalStore etc) hold accounts
+      _SEC_FILES=$(find "$SERVER_SEC_DIR" -maxdepth 1 -type f 2>/dev/null) || _SEC_FILES=""
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        echo "    Removing: $f"
+        cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
+        rm -f "$f" || true
+      done <<< "$_SEC_FILES"
+      echo "  Done. Restarting Server..."
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+      wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
+      SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+    else
+      echo "  WARNING: Could not locate security dir — skipping wipe."
+      echo "  To fix manually: find \$(sudo -u $ARCGIS_USER cat $ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml)/security -maxdepth 1 -type f -delete"
+    fi
 
     # ------------------------------------------------------------------
     # Step 14c: Federate.
