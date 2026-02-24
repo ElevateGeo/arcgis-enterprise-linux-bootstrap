@@ -21,8 +21,8 @@ set -euo pipefail
 #  11. Create ArcGIS Server site (requires prior authorization)
 #  12. Create Portal (with JSON license via -lf flag)
 #  13. Configure reverse proxy (import certs into truststores)
-#  14. Configure Data Store (relational + object)
-#  15. Federate Server with Portal & set as hosting server
+#  14. Federate Server with Portal & set as hosting server
+#  15. Configure Data Store (relational + object) — after federation per Esri order
 #  16. Configure reverse proxy URLs (WebContextURL, privatePortalURL, federation URL)
 
 ENV_FILE=".env"
@@ -833,60 +833,13 @@ wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" 
 echo "Portal is healthy. Reverse proxy properties deferred to post-federation."
 
 # ==============================================================================
-# Step 14: Configure Data Store
-# Per Esri docs: Base deployment requires BOTH a relational data store AND an
-# object store as of ArcGIS Enterprise 12.0.
-# Ref: https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm
-# Ref: https://enterprise.arcgis.com/en/data-store/12.0/install/linux/create-data-store.htm
-# ==============================================================================
-echo ""
-echo ">>> Step 14: Configuring Data Store"
-echo ""
-
-if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
-  cd "$ESRI_BASE/arcgis/datastore/tools"
-
-  # Check if relational data store is already registered
-  DS_STATUS=$(sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || echo "")
-  if echo "$DS_STATUS" | grep -qi "relational"; then
-    echo "Relational data store already registered, skipping..."
-  else
-    echo "Registering relational data store with Server..."
-    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-      "https://localhost:6443/arcgis/admin" \
-      "$ADMIN_USER" \
-      "$ADMIN_PASS" \
-      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-      --stores relational 2>&1 || {
-        echo "ERROR: Relational data store registration failed."
-      }
-    sleep 10
-  fi
-
-  # Object store is required for the base deployment in 12.0
-  if echo "$DS_STATUS" | grep -qi "object"; then
-    echo "Object store already registered, skipping..."
-  else
-    echo "Registering object store with Server..."
-    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-      "https://localhost:6443/arcgis/admin" \
-      "$ADMIN_USER" \
-      "$ADMIN_PASS" \
-      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-      --stores object 2>&1 || {
-        echo "ERROR: Object store registration failed."
-      }
-  fi
-else
-  echo "ERROR: Data Store tools directory not found."
-fi
-
-# ==============================================================================
-# Step 15: Federate Server with Portal
+# Step 14: Federate Server with Portal
+# Per Esri's documented deployment order, federation MUST happen before
+# DataStore registration.
 # Ref: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm
 # ==============================================================================
 echo ""
-echo ">>> Step 15: Federating Server with Portal"
+echo ">>> Step 14: Federating Server with Portal"
 echo ""
 
 # Reuse generate_portal_token() defined in Step 13
@@ -936,7 +889,19 @@ else
       echo "  Federation must be done manually."
     else
 
-    # 2. Discover Server's machine name (matches its SSL certificate)
+    # 2. Restart ArcGIS Server to clear any cached JVM state from
+    #    previous DataStore registration or failed federation attempts.
+    echo "  Restarting ArcGIS Server before federation..."
+    if [[ -f "$ESRI_BASE/arcgis/server/stopserver.sh" ]]; then
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+      sleep 10
+    fi
+    if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
+      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+      wait_for_service "https://localhost:6443/arcgis/admin?f=json" "Server" 180 || true
+    fi
+
+    # 3. Discover Server's machine name (matches its SSL certificate)
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
     SERVER_MACHINE=""
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
@@ -952,7 +917,7 @@ for m in data.get('machines',[]):
       SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
     fi
 
-    # 3. Clear Server system properties
+    # 4. Clear Server system properties
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
       echo "  Clearing Server system properties..."
       curl -sk -X POST "https://localhost:6443/arcgis/admin/system/properties/update" \
@@ -960,37 +925,7 @@ for m in data.get('machines',[]):
         -d "token=$SERVER_TOKEN_FED" -d "f=json" > /dev/null 2>&1 || true
     fi
 
-    # 4. Reset Server security config to clean GIS_SERVER defaults.
-    #    Clears any partial federation state from a previous failed attempt.
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      echo "  Resetting Server security config to defaults..."
-      RST_SEC=$(curl -sk -X POST \
-        "https://localhost:6443/arcgis/admin/security/config/update" \
-        --data-urlencode 'securityConfig={"authenticationTier":"GIS_SERVER","allowDirectAccess":true,"Protocol":"HTTP_AND_HTTPS","virtualDirsSecurityEnabled":false,"allowedAdminAccessIPs":""}' \
-        -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null) || RST_SEC=""
-      echo "  Security config reset: $RST_SEC"
-    fi
-
-    # 5. Diagnostic — dump current state
-    echo ""
-    echo "  --- Pre-federation diagnostics ---"
-    echo "  Portal properties:"
-    curl -sk "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$TOKEN" 2>/dev/null || true
-    echo ""
-    echo "  Server security config:"
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      curl -sk "https://localhost:6443/arcgis/admin/security/config?f=json&token=$SERVER_TOKEN_FED" 2>/dev/null || true
-      echo ""
-    fi
-    echo "  Server system properties:"
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      curl -sk "https://localhost:6443/arcgis/admin/system/properties?f=json&token=$SERVER_TOKEN_FED" 2>/dev/null || true
-      echo ""
-    fi
-    echo "  --- End diagnostics ---"
-    echo ""
-
-    # 6. Federate using INTERNAL URLs.
+    # 5. Federate using INTERNAL URLs.
     #    We update the services URL to the public reverse-proxy URL after
     #    federation succeeds (Step 16).
     echo "  Services URL (internal): https://$SERVER_MACHINE:6443/arcgis"
@@ -1041,10 +976,59 @@ for m in data.get('machines',[]):
 fi
 
 # ==============================================================================
+# Step 15: Configure Data Store
+# Per Esri docs: Base deployment requires BOTH a relational data store AND an
+# object store as of ArcGIS Enterprise 12.0.
+# DataStore is registered AFTER federation (Esri's documented order).
+# Ref: https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm
+# Ref: https://enterprise.arcgis.com/en/data-store/12.0/install/linux/create-data-store.htm
+# ==============================================================================
+echo ""
+echo ">>> Step 15: Configuring Data Store"
+echo ""
+
+if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
+  cd "$ESRI_BASE/arcgis/datastore/tools"
+
+  # Check if relational data store is already registered
+  DS_STATUS=$(sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || echo "")
+  if echo "$DS_STATUS" | grep -qi "relational"; then
+    echo "Relational data store already registered, skipping..."
+  else
+    echo "Registering relational data store with Server..."
+    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+      "https://localhost:6443/arcgis/admin" \
+      "$ADMIN_USER" \
+      "$ADMIN_PASS" \
+      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+      --stores relational 2>&1 || {
+        echo "ERROR: Relational data store registration failed."
+      }
+    sleep 10
+  fi
+
+  # Object store is required for the base deployment in 12.0
+  if echo "$DS_STATUS" | grep -qi "object"; then
+    echo "Object store already registered, skipping..."
+  else
+    echo "Registering object store with Server..."
+    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+      "https://localhost:6443/arcgis/admin" \
+      "$ADMIN_USER" \
+      "$ADMIN_PASS" \
+      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+      --stores object 2>&1 || {
+        echo "ERROR: Object store registration failed."
+      }
+  fi
+else
+  echo "ERROR: Data Store tools directory not found."
+fi
+
+# ==============================================================================
 # Step 16: Configure Reverse Proxy Properties (post-federation)
-# Must be done AFTER federation so Portal and Server communicate using their
-# native internal URLs during the federation handshake (avoids ClassCastException
-# in Server's security config update).
+# Must be done AFTER federation and DataStore registration so Portal and Server
+# communicate using their native internal URLs during the federation handshake.
 # ==============================================================================
 echo ""
 echo ">>> Step 16: Configuring Reverse Proxy Properties"
