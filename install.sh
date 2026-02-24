@@ -345,6 +345,23 @@ server {
         proxy_redirect ~*https?://[^/]+(:7443)?/arcgis/ https://$host/portal/;
     }
 
+    # /arcgis/ — Portal generates absolute URLs with /arcgis/ prefix in its
+    # OAuth pages and static assets even when WebContextURL is set to /portal/.
+    # Proxy these to Portal so sign-in assets (JS/CSS) load correctly.
+    location /arcgis/ {
+        proxy_pass https://localhost:7443/arcgis/;
+        proxy_ssl_verify off;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
+
+        proxy_redirect https://localhost:7443/arcgis/ https://$host/arcgis/;
+        proxy_redirect ~*https?://[^/]+(:7443)?/arcgis/ https://$host/arcgis/;
+    }
+
     # Server — direct reverse proxy to ArcGIS Server (port 6443)
     # Rewrites /server/* → /arcgis/* on the backend
     location = /server {
@@ -950,20 +967,30 @@ for m in data.get('machines',[]):
       DS_ITEMS=$(curl -sk \
         "https://localhost:6443/arcgis/admin/data/items?f=json&token=$SERVER_TOKEN_FED" \
         2>/dev/null) || DS_ITEMS=""
-      echo "$DS_ITEMS" | python3 -c "
+      # Store paths in a variable to avoid pipe + set -euo pipefail interaction
+      DS_PATHS=$(echo "$DS_ITEMS" | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
-for item in data.get('items', data.get('rootItems', [])):
-    p = item.get('path', item.get('id', ''))
-    if p:
-        print(p)
-" 2>/dev/null | while IFS= read -r item_path; do
-        echo "    Unregistering: $item_path"
-        curl -sk -X POST "https://localhost:6443/arcgis/admin/data/unregisterItem" \
-          --data-urlencode "itempath=$item_path" \
-          -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null | python3 -c \
-          "import sys,json; r=json.load(sys.stdin); print('    -> ' + r.get('status', str(r)))" 2>/dev/null || true
-      done
+try:
+    data = json.load(sys.stdin)
+    for item in data.get('items', data.get('rootItems', [])):
+        p = item.get('path', item.get('id', ''))
+        if p:
+            print(p)
+except Exception:
+    pass
+" 2>/dev/null) || DS_PATHS=""
+      if [[ -n "$DS_PATHS" ]]; then
+        while IFS= read -r item_path; do
+          [[ -z "$item_path" ]] && continue
+          echo "    Unregistering: $item_path"
+          curl -sk -X POST "https://localhost:6443/arcgis/admin/data/unregisterItem" \
+            --data-urlencode "itempath=$item_path" \
+            -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); print('    -> ' + r.get('status', str(r)))" 2>/dev/null || true
+        done <<< "$DS_PATHS"
+      else
+        echo "  No DataStore items registered (or could not retrieve list)."
+      fi
     fi
 
     # 6. Generate Portal admin token via portaladmin/generateToken
