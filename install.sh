@@ -840,6 +840,11 @@ else
     else
       echo "  Portal WebContextURL configured."
       PORTAL_CTX_OK=true
+      # Portal restarts internally after WebContextURL change.
+      # Wait for it to come back up before continuing.
+      echo "  Waiting for Portal to restart after WebContextURL change..."
+      sleep 30
+      wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
     fi
   fi
 fi
@@ -952,10 +957,17 @@ else
   if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
     echo "Federating ArcGIS Server with Portal..."
 
+    # adminUrl must use the internal FQDN — Server's SSL cert is issued for
+    # the internal hostname, not the public domain.  Portal connects to Server
+    # admin on this URL directly (not through NGINX).
+    INTERNAL_FQDN=$(hostname -f 2>/dev/null || echo "localhost")
+    echo "  Services URL: https://$DOMAIN/server"
+    echo "  Admin URL:    https://$INTERNAL_FQDN:6443/arcgis"
+
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://$DOMAIN:6443/arcgis" \
+      -d "adminUrl=https://$INTERNAL_FQDN:6443/arcgis" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
