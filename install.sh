@@ -851,18 +851,21 @@ echo "Portal is healthy. Reverse proxy properties deferred to post-federation."
 
 # ==============================================================================
 # Step 14: Federate Server with Portal
-# Per Esri's documented deployment order, federation MUST happen before
-# DataStore registration.
+# Per Esri's documented order (tutorial + Docker reference implementations):
+#   1. Set Portal's WebContextURL + privatePortalURL BEFORE federating so
+#      Portal includes correct string values in the security config it sends
+#      to Server during the handshake.
+#   2. Use the PUBLIC reverse-proxy URL (https://$DOMAIN/server) as the
+#      federation services URL — NOT the internal hostname:6443 URL.
+#      Reference: kAilshie/age-docker, knu2xs/vagrant-arcgis-enterprise
 # Ref: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm
 # ==============================================================================
 echo ""
 echo ">>> Step 14: Federating Server with Portal"
 echo ""
 
-# Reuse generate_portal_token() defined in Step 13
-
 # Check if already federated
-PREV_TOKEN=$(generate_portal_token 2>/dev/null) || true
+PREV_TOKEN=$(generate_portal_token 2>/dev/null) || PREV_TOKEN=""
 EXISTING_FEDERATION=""
 if [[ -n "${PREV_TOKEN:-}" && "$PREV_TOKEN" != "null" ]]; then
   EXISTING_FEDERATION=$(curl -sk \
@@ -873,67 +876,46 @@ fi
 if echo "$EXISTING_FEDERATION" | grep -q '"id"'; then
   echo "Server is already federated with Portal, skipping..."
 else
-  TOKEN=$(generate_portal_token 2>/dev/null) || true
+  TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
 
-  if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
-    echo "Federating ArcGIS Server with Portal..."
-
+  if [[ -z "${TOKEN:-}" || "$TOKEN" == "null" ]]; then
+    echo "WARNING: Could not get Portal token. Federation must be done manually."
+    echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
+  else
     # ------------------------------------------------------------------
-    # Pre-federation cleanup — critical for re-runs.
-    # Previous runs may have set Portal WebContextURL / privatePortalURL.
-    # Portal includes those properties in the security-config payload it
-    # sends to Server during federation; the nested JSON value triggers a
-    # ClassCastException in Server's security-config update handler.
+    # Step 14a: Set Portal WebContextURL + privatePortalURL BEFORE
+    # federation. Working reference implementations (Esri Docker, Vagrant)
+    # all configure these immediately after portal creation and before any
+    # federation call. Portal embeds its own URL in the security config it
+    # sends to Server — without WebContextURL set, Portal may use an
+    # internal/malformed value, causing Server to fail with a type error.
     # ------------------------------------------------------------------
-
-    # 1. Clear Portal system properties and wait for restart
-    echo "  Clearing Portal system properties (pre-federation)..."
-    CLEAR_P=$(curl -sk -X POST \
+    PORTAL_INTERNAL_HOST=$(hostname -f 2>/dev/null || echo "localhost")
+    echo "  Setting Portal WebContextURL = https://$DOMAIN/portal"
+    echo "  Setting Portal privatePortalURL = https://$PORTAL_INTERNAL_HOST:7443/arcgis"
+    PROP_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
-      --data-urlencode 'properties={}' \
-      -d "token=$TOKEN" -d "f=json" 2>/dev/null) || CLEAR_P=""
-    echo "  Portal properties cleared: $CLEAR_P"
-    if echo "$CLEAR_P" | grep -q '"recheckAfterSeconds"'; then
-      echo "  Waiting for Portal to restart..."
+      --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
+      -d "token=$TOKEN" \
+      -d "f=json" 2>/dev/null) || PROP_RESULT=""
+    echo "  Portal properties result: $PROP_RESULT"
+
+    if echo "$PROP_RESULT" | grep -q '"recheckAfterSeconds"'; then
+      echo "  Waiting for Portal to restart after property change..."
       sleep 30
       wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
     fi
 
-    # Generate a fresh Portal token (old one may be invalid after restart)
+    # Refresh token after possible restart
     TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
-    if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-      echo "ERROR: Cannot get Portal token after property reset."
-      echo "  Federation must be done manually."
+    if [[ -z "${TOKEN:-}" || "$TOKEN" == "null" ]]; then
+      echo "ERROR: Cannot get Portal token after setting properties. Federation must be done manually."
     else
 
-    # 2. Restart ArcGIS Server to clear any cached JVM state from
-    #    previous DataStore registration or failed federation attempts.
-    echo "  Restarting ArcGIS Server before federation..."
-    if [[ -f "$ESRI_BASE/arcgis/server/stopserver.sh" ]]; then
-      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
-      # Wait for the Server JVM process to actually die (up to 120s)
-      echo "  Waiting for Server process to stop..."
-      _stop_wait=0
-      while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
-        if (( _stop_wait >= 120 )); then
-          echo "  Server process did not stop cleanly; force-killing..."
-          pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true
-          sleep 5
-          break
-        fi
-        sleep 5
-        _stop_wait=$((_stop_wait + 5))
-      done
-      echo "  Server stopped. (waited ${_stop_wait}s)"
-      sleep 5
-    fi
-    if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
-      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-      # /arcgis/rest/info returns currentVersion only when fully initialised
-      wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
-    fi
-
-    # 3. Discover Server's machine name (matches its SSL certificate)
+    # ------------------------------------------------------------------
+    # Step 14b: Discover Server's machine name (used in adminUrl, must
+    # match the name in Server's SSL certificate).
+    # ------------------------------------------------------------------
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
     SERVER_MACHINE=""
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
@@ -948,92 +930,44 @@ for m in data.get('machines',[]):
     if [[ -z "$SERVER_MACHINE" ]]; then
       SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
     fi
+    echo "  Server machine name: $SERVER_MACHINE"
 
-    # 4. Clear Server system properties
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      echo "  Clearing Server system properties..."
-      curl -sk -X POST "https://localhost:6443/arcgis/admin/system/properties/update" \
-        --data-urlencode 'properties={}' \
-        -d "token=$SERVER_TOKEN_FED" -d "f=json" > /dev/null 2>&1 || true
-    fi
-
-    # 5. Unregister DataStore items from Server's config store.
-    #    DataStore registration persists in Server's on-disk config store and
-    #    survives JVM restarts. The complex JSON descriptors in those items
-    #    may cause a ClassCastException in the federation security handler.
-    #    DataStore will auto-reconnect after federation completes.
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      echo "  Unregistering DataStore items from Server config store..."
-      DS_ITEMS=$(curl -sk \
-        "https://localhost:6443/arcgis/admin/data/items?f=json&token=$SERVER_TOKEN_FED" \
-        2>/dev/null) || DS_ITEMS=""
-      # Store paths in a variable to avoid pipe + set -euo pipefail interaction
-      DS_PATHS=$(echo "$DS_ITEMS" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for item in data.get('items', data.get('rootItems', [])):
-        p = item.get('path', item.get('id', ''))
-        if p:
-            print(p)
-except Exception:
-    pass
-" 2>/dev/null) || DS_PATHS=""
-      if [[ -n "$DS_PATHS" ]]; then
-        while IFS= read -r item_path; do
-          [[ -z "$item_path" ]] && continue
-          echo "    Unregistering: $item_path"
-          curl -sk -X POST "https://localhost:6443/arcgis/admin/data/unregisterItem" \
-            --data-urlencode "itempath=$item_path" \
-            -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null \
-            | python3 -c "import sys,json; r=json.load(sys.stdin); print('    -> ' + r.get('status', str(r)))" 2>/dev/null || true
-        done <<< "$DS_PATHS"
-      else
-        echo "  No DataStore items registered (or could not retrieve list)."
-      fi
-    fi
-
-    # 6. Generate Portal admin token via portaladmin/generateToken
-    #    (matches what the Portal Admin UI uses — different from sharing/rest token)
-    PORTAL_FQDN=$(hostname -f 2>/dev/null || echo "localhost")
-    FED_TOKEN=$(curl -sk -X POST \
-      "https://$PORTAL_FQDN:7443/arcgis/portaladmin/generateToken" \
-      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null \
-      | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t)" 2>/dev/null) || FED_TOKEN=""
-    if [[ -z "$FED_TOKEN" || "$FED_TOKEN" == "None" ]]; then
-      echo "  portaladmin/generateToken failed, falling back to sharing token..."
-      FED_TOKEN="$TOKEN"
-    else
-      echo "  Portal admin token (portaladmin endpoint) acquired."
-    fi
-
-    # 7. Federate using INTERNAL URLs.
-    #    We update the services URL to the public reverse-proxy URL after
-    #    federation succeeds (Step 16).
-    echo "  Services URL (internal): https://$SERVER_MACHINE:6443/arcgis"
-    echo "  Admin URL:               https://$SERVER_MACHINE:6443/arcgis"
+    # ------------------------------------------------------------------
+    # Step 14c: Federate.
+    # url     = PUBLIC services URL (through NGINX reverse proxy) — this
+    #           is what external clients use to reach Server services.
+    # adminUrl = INTERNAL Server URL — what Portal uses for admin calls.
+    #
+    # Both working reference implementations use:
+    #   url=https://<public-domain>/server
+    #   adminUrl=https://<internal-fqdn>:6443/arcgis
+    # ------------------------------------------------------------------
+    echo "  Services URL (public):   https://$DOMAIN/server"
+    echo "  Admin URL (internal):    https://$SERVER_MACHINE:6443/arcgis"
 
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
-      -d "url=https://$SERVER_MACHINE:6443/arcgis" \
+      -d "url=https://$DOMAIN/server" \
       -d "adminUrl=https://$SERVER_MACHINE:6443/arcgis" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
-      -d "token=$FED_TOKEN" \
-      -d "f=json" 2>/dev/null) || true
+      -d "token=$TOKEN" \
+      -d "f=json" 2>/dev/null) || FEDERATE_RESULT=""
     echo "Federation result: $FEDERATE_RESULT"
 
     if echo "$FEDERATE_RESULT" | grep -q '"error"'; then
       echo "ERROR: Federation failed. See output above."
-      echo "You can federate manually via Portal Admin."
+      echo "You can federate manually: Portal Admin → Organization → Settings → Servers → Add server"
+      echo "  Services URL:    https://$DOMAIN/server"
+      echo "  Admin URL:       https://$SERVER_MACHINE:6443/arcgis"
       # Print recent Server logs to help diagnose
       SERVER_LOG_DIR="$ESRI_BASE/arcgis/server/usr/logs/$SERVER_MACHINE/server"
       if [[ -d "$SERVER_LOG_DIR" ]]; then
         echo ""
         echo "  --- Recent ArcGIS Server log entries ---"
-        ls -t "$SERVER_LOG_DIR"/*.log 2>/dev/null | head -1 | xargs -r tail -100 2>/dev/null \
-          | grep -i "error\|exception\|federation\|security" | tail -30 || true
+        ls -t "$SERVER_LOG_DIR"/*.log 2>/dev/null | head -1 \
+          | xargs -r tail -200 2>/dev/null \
+          | grep -i "error\|exception\|federation\|security\|warn" | tail -40 || true
         echo "  --- End Server log ---"
       fi
     else
@@ -1041,29 +975,27 @@ except Exception:
       sleep 10
 
       # Set as hosting server
-      echo "Setting Server as hosting server..."
+      echo "  Setting Server as hosting server..."
       SERVERS=$(curl -sk \
-        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$FED_TOKEN" \
-        2>/dev/null) || true
-      FEDERATED_SERVER_ID=$(echo "$SERVERS" | python3 -c "import sys,json; s=json.load(sys.stdin).get('servers',[]); print(s[0]['id'] if s else '')" 2>/dev/null) || FEDERATED_SERVER_ID=""
+        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
+        2>/dev/null) || SERVERS=""
+      FEDERATED_SERVER_ID=$(echo "$SERVERS" | python3 -c \
+        "import sys,json; s=json.load(sys.stdin).get('servers',[]); print(s[0]['id'] if s else '')" \
+        2>/dev/null) || FEDERATED_SERVER_ID=""
 
       if [[ -n "$FEDERATED_SERVER_ID" ]]; then
         HOSTING_RESULT=$(curl -sk -X POST \
           "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
           -d "serverRole=HOSTING_SERVER" \
-          -d "token=$FED_TOKEN" \
-          -d "f=json" 2>/dev/null) || true
-        echo "Hosting server result: $HOSTING_RESULT"
+          -d "token=$TOKEN" \
+          -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
+        echo "  Hosting server result: $HOSTING_RESULT"
       else
-        echo "WARNING: Could not find federated server to set as hosting."
+        echo "  WARNING: Could not find federated server ID to set as hosting."
       fi
     fi
 
-    fi  # end of post-restart token check
-
-  else
-    echo "WARNING: Could not get Portal token. Federation may need to be done manually."
-    echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
+    fi  # end token-after-property-set check
   fi
 fi
 
@@ -1127,28 +1059,38 @@ echo ">>> Step 16: Configuring Reverse Proxy Properties"
 echo ""
 
 # --- 16a: Portal WebContextURL + privatePortalURL ---
+# These were set in Step 14 before federation. This step verifies/re-applies
+# them in case Step 14 was skipped (already federated) or failed to set them.
 PORTAL_TOKEN=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN=""
 if [[ -n "$PORTAL_TOKEN" ]]; then
-  echo "Portal admin token acquired."
-
-  # Discover Portal's internal FQDN for privatePortalURL
   PORTAL_INTERNAL_HOST=$(hostname -f 2>/dev/null || echo "localhost")
 
-  echo "Setting Portal WebContextURL to https://$DOMAIN/portal ..."
-  echo "Setting Portal privatePortalURL to https://$PORTAL_INTERNAL_HOST:7443/arcgis ..."
-  CTX_RESULT=$(curl -sk -X POST \
-    "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
-    --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
-    -d "token=$PORTAL_TOKEN" \
-    -d "f=json" 2>/dev/null) || CTX_RESULT=""
-  echo "  Result: $CTX_RESULT"
-  if echo "$CTX_RESULT" | grep -q '"error"'; then
-    echo "  WARNING: Failed to set Portal properties."
+  # Check current properties to avoid unnecessary restart
+  CURRENT_PROPS=$(curl -sk \
+    "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$PORTAL_TOKEN" \
+    2>/dev/null) || CURRENT_PROPS=""
+  CURRENT_WCU=$(echo "$CURRENT_PROPS" | python3 -c \
+    "import sys,json; p=json.load(sys.stdin); print(p.get('WebContextURL',''))" 2>/dev/null) || CURRENT_WCU=""
+
+  if [[ "$CURRENT_WCU" == "https://$DOMAIN/portal" ]]; then
+    echo "  Portal WebContextURL already set to https://$DOMAIN/portal, skipping."
   else
-    echo "  Portal reverse proxy properties configured."
-    echo "  Waiting for Portal to restart..."
-    sleep 30
-    wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+    echo "  Setting Portal WebContextURL = https://$DOMAIN/portal"
+    echo "  Setting Portal privatePortalURL = https://$PORTAL_INTERNAL_HOST:7443/arcgis"
+    CTX_RESULT=$(curl -sk -X POST \
+      "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
+      --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
+      -d "token=$PORTAL_TOKEN" \
+      -d "f=json" 2>/dev/null) || CTX_RESULT=""
+    echo "  Result: $CTX_RESULT"
+    if echo "$CTX_RESULT" | grep -q '"error"'; then
+      echo "  WARNING: Failed to set Portal properties."
+    else
+      echo "  Portal reverse proxy properties configured."
+      echo "  Waiting for Portal to restart..."
+      sleep 30
+      wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+    fi
   fi
 else
   echo "WARNING: Could not get Portal token. Set WebContextURL manually."
