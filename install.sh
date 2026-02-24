@@ -175,24 +175,36 @@ apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk \
   tar unzip curl jq
 
 # ---------------------------------------------------------------------------
-# Tomcat 9 (required — Esri Web Adaptor uses javax.servlet, NOT jakarta).
-# Tomcat 10+ uses jakarta.servlet and is INCOMPATIBLE with the Web Adaptor WAR.
-# Ubuntu 24.04 only ships Tomcat 10, so we install Tomcat 9 from Apache directly.
+# Tomcat 10.1 (required — ArcGIS Enterprise 12.0 Web Adaptor uses jakarta.servlet).
+# Tomcat 9 uses javax.servlet which is INCOMPATIBLE with the 12.0 WAR.
+# Ubuntu 24.04 ships Tomcat 10 but as a system package; we install from Apache
+# directly for a clean, self-contained deployment.
 # ---------------------------------------------------------------------------
-TOMCAT_VER="9.0.102"
-TOMCAT_HOME="/opt/tomcat9"
+TOMCAT_VER="10.1.34"
+TOMCAT_HOME="/opt/tomcat10"
 TOMCAT_USER="tomcat"
 TOMCAT_WEBAPPS="$TOMCAT_HOME/webapps"
-TOMCAT_SERVICE="tomcat9"
+TOMCAT_SERVICE="tomcat10"
+
+# Migration: remove old Tomcat 9 installed by previous versions of this script.
+# The ArcGIS 12.0 Web Adaptor WAR requires jakarta.servlet (Tomcat 10+).
+if [[ -d "/opt/tomcat9" && -f "/opt/tomcat9/bin/catalina.sh" ]]; then
+  echo "Removing old Tomcat 9 (ArcGIS 12.0 requires Tomcat 10+ for jakarta.servlet)..."
+  systemctl stop tomcat9 2>/dev/null || true
+  systemctl disable tomcat9 2>/dev/null || true
+  rm -f /etc/systemd/system/tomcat9.service
+  rm -rf /opt/tomcat9
+  systemctl daemon-reload
+fi
 
 if [[ -d "$TOMCAT_HOME" && -f "$TOMCAT_HOME/bin/catalina.sh" ]]; then
-  echo "Tomcat 9 already installed at $TOMCAT_HOME, skipping..."
+  echo "Tomcat 10 already installed at $TOMCAT_HOME, skipping..."
 else
-  echo "Installing Apache Tomcat $TOMCAT_VER (Tomcat 10 is incompatible with Esri Web Adaptor)..."
+  echo "Installing Apache Tomcat $TOMCAT_VER (ArcGIS 12.0 Web Adaptor requires jakarta.servlet)..."
 
-  # Remove Ubuntu's Tomcat 10 if present to avoid port conflicts
+  # Remove Ubuntu's system Tomcat 10 package if present to avoid port conflicts
   if dpkg -l tomcat10 2>/dev/null | grep -q '^ii'; then
-    echo "Removing incompatible Tomcat 10 package..."
+    echo "Removing system Tomcat 10 package (using manual install instead)..."
     systemctl stop tomcat10 2>/dev/null || true
     systemctl disable tomcat10 2>/dev/null || true
     apt-get remove -y tomcat10 2>/dev/null || true
@@ -202,21 +214,21 @@ else
   id "$TOMCAT_USER" &>/dev/null || useradd -r -m -d "$TOMCAT_HOME" -s /bin/false "$TOMCAT_USER"
 
   # Download and extract
-  TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz"
+  TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz"
   echo "Downloading from: $TOMCAT_URL"
-  curl -fsSL "$TOMCAT_URL" -o /tmp/tomcat9.tar.gz
+  curl -fsSL "$TOMCAT_URL" -o /tmp/tomcat10.tar.gz
   mkdir -p "$TOMCAT_HOME"
-  tar -xzf /tmp/tomcat9.tar.gz -C "$TOMCAT_HOME" --strip-components=1
-  rm -f /tmp/tomcat9.tar.gz
+  tar -xzf /tmp/tomcat10.tar.gz -C "$TOMCAT_HOME" --strip-components=1
+  rm -f /tmp/tomcat10.tar.gz
 
   # Set ownership
   chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_HOME"
   chmod +x "$TOMCAT_HOME"/bin/*.sh
 
   # Create systemd service
-  cat > /etc/systemd/system/tomcat9.service <<EOF
+  cat > /etc/systemd/system/tomcat10.service <<EOF
 [Unit]
-Description=Apache Tomcat 9
+Description=Apache Tomcat 10
 After=network.target
 
 [Service]
@@ -236,12 +248,12 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable tomcat9
-  systemctl start tomcat9
-  echo "Tomcat 9 installed and started."
+  systemctl enable tomcat10
+  systemctl start tomcat10
+  echo "Tomcat 10 installed and started."
 fi
 
-echo "Using Tomcat 9 at: $TOMCAT_HOME"
+echo "Using Tomcat 10 at: $TOMCAT_HOME"
 
 # Ensure the VM can resolve its own FQDN to localhost.
 # Azure/cloud VMs often cannot hairpin through the public IP, so
@@ -511,14 +523,12 @@ else
   echo "WARNING: Web Adaptor installer not found in $INSTALLERS"
 fi
 
-# Deploy Web Adaptor WARs to Tomcat 9 (two instances: portal and server)
+# Deploy Web Adaptor WARs to Tomcat 10 (two instances: portal and server)
 WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
 if [[ -n "$WA_WAR" && -f "$TOMCAT_WEBAPPS/portal.war" && -f "$TOMCAT_WEBAPPS/server.war" ]]; then
   echo "Web Adaptor WARs already deployed, skipping..."
 elif [[ -n "$WA_WAR" ]]; then
-  echo "Deploying Web Adaptor WARs to Tomcat 9 from: $WA_WAR"
-  # Remove old Tomcat 10 WARs if they exist
-  rm -rf /var/lib/tomcat10/webapps/portal* /var/lib/tomcat10/webapps/server* 2>/dev/null || true
+  echo "Deploying Web Adaptor WARs to Tomcat 10 from: $WA_WAR"
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/portal.war"
   cp "$WA_WAR" "$TOMCAT_WEBAPPS/server.war"
   chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/portal.war"
@@ -742,29 +752,14 @@ if [[ -f "$CATALINA_LOG" ]]; then
 fi
 
 # Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 stack traces appear
-# Dump the FULL log to capture the exception message at the top, not just the bottom frames.
 LOCALHOST_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
 if [[ -n "$LOCALHOST_LOG" && -f "$LOCALHOST_LOG" ]]; then
-  echo "  Full $LOCALHOST_LOG:"
-  cat "$LOCALHOST_LOG" 2>/dev/null | sed 's/^/    /'
-  echo ""
-fi
-
-# Show any SEVERE / context-init-failure lines from catalina.out
-if [[ -f "$CATALINA_LOG" ]]; then
-  SEVERE_LINES=$(grep -i 'SEVERE\|WARN.*Exception\|context.*fail\|StandardContext.*listenerStart' "$CATALINA_LOG" 2>/dev/null | tail -20)
-  if [[ -n "$SEVERE_LINES" ]]; then
-    echo "  SEVERE / init-failure entries in catalina.out:"
-    echo "$SEVERE_LINES" | sed 's/^/    /'
+  SEVERE_COUNT=$(grep -c "SEVERE" "$LOCALHOST_LOG" 2>/dev/null || echo "0")
+  if [[ "$SEVERE_COUNT" -gt 0 ]]; then
+    echo "  SEVERE errors found in $LOCALHOST_LOG ($SEVERE_COUNT occurrences):"
+    grep -A5 "SEVERE" "$LOCALHOST_LOG" 2>/dev/null | head -30 | sed 's/^/    /'
     echo ""
   fi
-fi
-
-# Show servlet mappings (helps verify the WAR structure is intact)
-if [[ -f "$TOMCAT_WEBAPPS/portal/WEB-INF/web.xml" ]]; then
-  echo "  Servlet mappings in portal webapp (WEB-INF/web.xml):"
-  grep -A2 'servlet-mapping\|url-pattern\|servlet-class' "$TOMCAT_WEBAPPS/portal/WEB-INF/web.xml" 2>/dev/null | head -40 | sed 's/^/    /'
-  echo ""
 fi
 
 # Import the Let's Encrypt cert into ALL Java truststores on the system.
