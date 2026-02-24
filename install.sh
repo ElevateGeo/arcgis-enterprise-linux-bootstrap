@@ -685,51 +685,57 @@ echo ""
 echo ">>> Step 13: Configuring Web Adaptors"
 echo ""
 
-# --- Pre-flight: verify Tomcat is serving the Web Adaptor WARs ---
+# --- Pre-flight: verify Tomcat deployed the WARs correctly ---
+echo "Pre-flight: checking WAR deployment..."
+echo "  Tomcat service: $(systemctl is-active $TOMCAT_SERVICE 2>/dev/null || echo 'NOT RUNNING')"
+
+# Verify WARs were exploded into directories
+for WA_CTX in portal server; do
+  if [[ -d "$TOMCAT_WEBAPPS/$WA_CTX" ]]; then
+    echo "  $WA_CTX WAR exploded: YES"
+  elif [[ -f "$TOMCAT_WEBAPPS/$WA_CTX.war" ]]; then
+    echo "  $WA_CTX WAR present but NOT exploded — restarting Tomcat..."
+    systemctl restart "$TOMCAT_SERVICE"
+    sleep 20
+    break
+  else
+    echo "  $WA_CTX WAR missing! Re-deploying..."
+    WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
+    if [[ -n "$WA_WAR" ]]; then
+      cp "$WA_WAR" "$TOMCAT_WEBAPPS/$WA_CTX.war"
+      chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/$WA_CTX.war"
+    fi
+    systemctl restart "$TOMCAT_SERVICE"
+    sleep 20
+    break
+  fi
+done
+
+# Test endpoints
 echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
-echo -n "  http://localhost:8080/portal/webadaptor → "
-TOMCAT_PORTAL_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "http://localhost:8080/portal/webadaptor" 2>/dev/null || echo "000")
-echo "HTTP $TOMCAT_PORTAL_TEST"
-echo -n "  http://localhost:8080/server/webadaptor → "
-TOMCAT_SERVER_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "http://localhost:8080/server/webadaptor" 2>/dev/null || echo "000")
-echo "HTTP $TOMCAT_SERVER_TEST"
+for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/" \
+                "http://localhost:8080/portal/webadaptor" "http://localhost:8080/server/webadaptor"; do
+  HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$TEST_URL" 2>/dev/null || echo "000")
+  echo "  $TEST_URL → HTTP $HTTP_CODE"
+done
 
-if [[ "$TOMCAT_PORTAL_TEST" == "000" || "$TOMCAT_SERVER_TEST" == "000" ]]; then
-  echo "Tomcat doesn't seem to be responding. Restarting $TOMCAT_SERVICE..."
-  systemctl restart "$TOMCAT_SERVICE"
-  sleep 20
-fi
-
-echo -n "  https://$DOMAIN/portal/webadaptor (via NGINX) → "
-NGINX_PORTAL_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "https://$DOMAIN/portal/webadaptor" 2>/dev/null || echo "000")
-echo "HTTP $NGINX_PORTAL_TEST"
-echo -n "  https://$DOMAIN/server/webadaptor (via NGINX) → "
-NGINX_SERVER_TEST=$(curl -sk -o /dev/null -w "%{http_code}" "https://$DOMAIN/server/webadaptor" 2>/dev/null || echo "000")
-echo "HTTP $NGINX_SERVER_TEST"
-
-if [[ "$NGINX_PORTAL_TEST" == "000" ]]; then
+# Show last 15 lines of Tomcat log for deployment diagnosis
+CATALINA_LOG="$TOMCAT_HOME/logs/catalina.out"
+if [[ -f "$CATALINA_LOG" ]]; then
   echo ""
-  echo "ERROR: Cannot reach https://$DOMAIN/portal/webadaptor from this machine."
-  echo "Diagnostics:"
-  echo "  - /etc/hosts: $(grep "$DOMAIN" /etc/hosts 2>/dev/null || echo 'NOT FOUND')"
-  echo "  - NGINX status: $(systemctl is-active nginx)"
-  echo "  - Tomcat status: $(systemctl is-active $TOMCAT_SERVICE)"
-  echo "  - Tomcat webapps: $(ls -la $TOMCAT_WEBAPPS/*.war 2>/dev/null || echo 'NO WARS')"
+  echo "  Last 15 lines of catalina.out:"
+  tail -15 "$CATALINA_LOG" 2>/dev/null | sed 's/^/    /'
   echo ""
 fi
 
 # Import the Let's Encrypt cert into ALL Java truststores on the system.
-# configurewebadaptor.sh is a Java tool that validates the HTTPS connection.
-# Esri ships its own JRE (under /opt/esri), so the system JRE alone isn't enough.
 LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
 if [[ -f "$LE_CERT" ]]; then
   echo "Importing Let's Encrypt certificate into all Java truststores..."
-  # Find every cacerts file: system JRE, Esri-shipped JREs, Tomcat, etc.
   while IFS= read -r CACERTS_FILE; do
-    # Try to import; skip if alias already exists or file is read-only
     KEYTOOL_BIN=$(dirname "$CACERTS_FILE")/../bin/keytool
     if [[ ! -x "$KEYTOOL_BIN" ]]; then
-      KEYTOOL_BIN="keytool"  # fall back to system keytool
+      KEYTOOL_BIN="keytool"
     fi
     if ! "$KEYTOOL_BIN" -list -keystore "$CACERTS_FILE" -storepass changeit \
         -alias "letsencrypt-$DOMAIN" > /dev/null 2>&1; then
@@ -745,12 +751,13 @@ fi
 
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
-# Force ALL JVMs (including Esri's bundled JREs) to use the system truststore
-# that contains our Let's Encrypt cert. JAVA_TOOL_OPTIONS is respected by all JVMs.
+# Build the JAVA_TOOL_OPTIONS string to force all JVMs to use the system truststore.
+# We pass it explicitly via `sudo ... env` because `sudo -E` is blocked by env_reset.
 SYS_CACERTS="/etc/ssl/certs/java/cacerts"
+JTO=""
 if [[ -f "$SYS_CACERTS" ]]; then
-  export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$SYS_CACERTS -Djavax.net.ssl.trustStorePassword=changeit"
-  echo "Set JAVA_TOOL_OPTIONS to use system truststore: $SYS_CACERTS"
+  JTO="-Djavax.net.ssl.trustStore=$SYS_CACERTS -Djavax.net.ssl.trustStorePassword=changeit"
+  echo "Will pass JAVA_TOOL_OPTIONS to configurewebadaptor.sh"
 fi
 
 if [[ -z "$WA_TOOLS" || ! -d "$WA_TOOLS" ]]; then
@@ -766,10 +773,11 @@ else
   else
     wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
-    # Try FQDN gateway first, then localhost fallback
+    WA_PORTAL_RC=1
     for PORTAL_GW in "https://$DOMAIN:7443" "https://localhost:7443"; do
       echo "Configuring Web Adaptor for Portal (gateway: $PORTAL_GW)..."
-      WA_PORTAL_OUTPUT=$(sudo -E -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+      WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
+        ./configurewebadaptor.sh \
         -m portal \
         -w "https://$DOMAIN/portal/webadaptor" \
         -g "$PORTAL_GW" \
@@ -783,7 +791,7 @@ else
         echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
       fi
     done
-    if [[ ${WA_PORTAL_RC:-1} -ne 0 ]]; then
+    if [[ $WA_PORTAL_RC -ne 0 ]]; then
       echo "You can configure it manually later — see README."
     fi
     sleep 10
@@ -796,9 +804,11 @@ else
   else
     wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
 
+    WA_SERVER_RC=1
     for SERVER_GW in "https://$DOMAIN:6443" "https://localhost:6443"; do
       echo "Configuring Web Adaptor for Server (gateway: $SERVER_GW)..."
-      WA_SERVER_OUTPUT=$(sudo -E -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+      WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
+        ./configurewebadaptor.sh \
         -m server \
         -w "https://$DOMAIN/server/webadaptor" \
         -g "$SERVER_GW" \
@@ -813,14 +823,11 @@ else
         echo "ERROR: Server Web Adaptor configuration failed (exit code $WA_SERVER_RC)."
       fi
     done
-    if [[ ${WA_SERVER_RC:-1} -ne 0 ]]; then
+    if [[ $WA_SERVER_RC -ne 0 ]]; then
       echo "You can configure it manually later — see README."
     fi
   fi
 fi
-
-# Clear JAVA_TOOL_OPTIONS so it doesn't affect subsequent tools
-unset JAVA_TOOL_OPTIONS
 
 # ==============================================================================
 # Step 14: Configure Data Store
