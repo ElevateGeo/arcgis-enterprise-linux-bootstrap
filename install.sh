@@ -824,41 +824,33 @@ else
     HTTP_DIRECT=$(curl -sk -o /tmp/wa_diag_direct.txt -w "%{http_code}" \
       "http://localhost:8080/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
     echo "  Direct (Tomcat):  http://localhost:8080/${WA_PATH}/webadaptor → HTTP $HTTP_DIRECT"
-    if [[ "$HTTP_DIRECT" != "200" && "$HTTP_DIRECT" != "302" ]]; then
-      echo "    Response body:"
-      head -20 /tmp/wa_diag_direct.txt 2>/dev/null | sed 's/^/      /'
-    fi
     # Through NGINX (same path the config tool uses)
     HTTP_NGINX=$(curl -sk -o /tmp/wa_diag_nginx.txt -w "%{http_code}" \
       "https://$DOMAIN/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
     echo "  Via NGINX (HTTPS): https://$DOMAIN/${WA_PATH}/webadaptor → HTTP $HTTP_NGINX"
-    if [[ "$HTTP_NGINX" != "200" && "$HTTP_NGINX" != "302" ]]; then
-      echo "    Response body:"
-      head -20 /tmp/wa_diag_nginx.txt 2>/dev/null | sed 's/^/      /'
-    fi
+    # JSON endpoint test (what the config tool likely sends)
+    JSON_RESP=$(curl -sk "http://localhost:8080/${WA_PATH}/webadaptor?f=json" 2>/dev/null | head -3)
+    echo "  JSON test (?f=json): ${JSON_RESP:0:200}"
   done
 
-  # Show SEVERE entries triggered by the diagnostic curls
-  DIAG_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
-  if [[ -n "$DIAG_LOG" && -f "$DIAG_LOG" ]]; then
-    DIAG_SEVERE=$(grep -A5 "SEVERE" "$DIAG_LOG" 2>/dev/null | tail -30)
-    if [[ -n "$DIAG_SEVERE" ]]; then
-      echo ""
-      echo "  SEVERE entries in Tomcat localhost log:"
-      echo "$DIAG_SEVERE" | sed 's/^/    /'
-    fi
-  fi
-
-  # Show what Java the config tool uses
+  # OpenSSL TLS chain verification (does the cert chain validate?)
   echo ""
-  echo "  configurewebadaptor.sh internals (Java/JRE references):"
-  grep -i "java_home\|JAVA_HOME\|jre\|java " ./configurewebadaptor.sh 2>/dev/null | head -10 | sed 's/^/    /'
+  echo "  OpenSSL certificate chain test to $DOMAIN:443:"
+  echo "Q" | openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" 2>&1 | \
+    grep -E "Verify return|error|depth|s:|i:|SSL-Session" | head -12 | sed 's/^/    /'
 
-  # Check file permissions on WA install directory
+  # Show configurewebadaptor.sh FULL content — must see what JRE/truststore it uses
   echo ""
-  echo "  Web Adaptor install dir permissions:"
-  ls -la "$WA_TOOLS/../" 2>/dev/null | head -15 | sed 's/^/    /'
+  echo "  ┌── configurewebadaptor.sh ──────────────────"
+  cat ./configurewebadaptor.sh 2>/dev/null | sed 's/^/  │ /'
+  echo "  └────────────────────────────────────────────"
+
+  # List Java/JRE files the script references
+  echo ""
+  echo "  Web Adaptor install dir layout:"
+  find "$WA_TOOLS/.." -maxdepth 2 -name "*.sh" -o -name "java" -o -name "cacerts" -o -name "*.properties" 2>/dev/null | sort | sed 's/^/    /'
   echo "  tomcat user groups: $(id tomcat 2>/dev/null || echo 'user not found')"
+  echo "  arcgis user groups: $(id "$ARCGIS_USER" 2>/dev/null || echo 'user not found')"
   echo ""
 
   # --- Portal Web Adaptor ---
@@ -871,19 +863,31 @@ else
     WA_PORTAL_RC=1
     for PORTAL_GW in "https://$DOMAIN:7443" "https://localhost:7443"; do
       echo "Configuring Web Adaptor for Portal (gateway: $PORTAL_GW)..."
-      WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
+      # Add SSL handshake debug on first attempt to diagnose "Unable to connect"
+      if [[ $WA_PORTAL_RC -eq 1 && "$PORTAL_GW" == "https://$DOMAIN:7443" ]]; then
+        JTO_THIS="$JTO -Djavax.net.debug=ssl,handshake"
+      else
+        JTO_THIS="$JTO"
+      fi
+      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO_THIS" \
         ./configurewebadaptor.sh \
         -m portal \
         -w "https://$DOMAIN/portal/webadaptor" \
         -g "$PORTAL_GW" \
         -u "$ADMIN_USER" \
-        -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
-      echo "$WA_PORTAL_OUTPUT"
-      if [[ $WA_PORTAL_RC -eq 0 ]]; then
+        -p "$ADMIN_PASS" > /tmp/wa_portal_debug.log 2>&1 && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
+      # Show the tool's actual output (last lines, skip SSL debug noise)
+      echo "  Config tool output:"
+      grep -v "^javax.net.ssl\|^%% \|^*** \|^main, \|^Padded plaintext\|^Plaintext\|^Raw \|^Nonce\|^Produced\|^Consumed\|^READ:\|^WRITE:" \
+        /tmp/wa_portal_debug.log | tail -20 | sed 's/^/    /'
+      if [[ $WA_PORTAL_RC -ne 0 ]]; then
+        echo "  SSL/TLS debug (errors and key events):"
+        grep -iE "exception|FAILED|fatal|alert_|unable|trustStore|CertificateException|handshake|ServerHello|server_name" \
+          /tmp/wa_portal_debug.log 2>/dev/null | head -25 | sed 's/^/    /'
+        echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
+      else
         echo "Portal Web Adaptor configured successfully."
         break
-      else
-        echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
       fi
     done
     if [[ $WA_PORTAL_RC -ne 0 ]]; then
