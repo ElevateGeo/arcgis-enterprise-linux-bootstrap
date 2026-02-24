@@ -908,7 +908,35 @@ else
   if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
     echo "Federating ArcGIS Server with Portal..."
 
-    # Discover Server's machine name (matches its SSL certificate)
+    # ------------------------------------------------------------------
+    # Pre-federation cleanup — critical for re-runs.
+    # Previous runs may have set Portal WebContextURL / privatePortalURL.
+    # Portal includes those properties in the security-config payload it
+    # sends to Server during federation; the nested JSON value triggers a
+    # ClassCastException in Server's security-config update handler.
+    # ------------------------------------------------------------------
+
+    # 1. Clear Portal system properties and wait for restart
+    echo "  Clearing Portal system properties (pre-federation)..."
+    CLEAR_P=$(curl -sk -X POST \
+      "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
+      --data-urlencode 'properties={}' \
+      -d "token=$TOKEN" -d "f=json" 2>/dev/null) || CLEAR_P=""
+    echo "  Portal properties cleared: $CLEAR_P"
+    if echo "$CLEAR_P" | grep -q '"recheckAfterSeconds"'; then
+      echo "  Waiting for Portal to restart..."
+      sleep 30
+      wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+    fi
+
+    # Generate a fresh Portal token (old one may be invalid after restart)
+    TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
+    if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+      echo "ERROR: Cannot get Portal token after property reset."
+      echo "  Federation must be done manually."
+    else
+
+    # 2. Discover Server's machine name (matches its SSL certificate)
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
     SERVER_MACHINE=""
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
@@ -924,18 +952,47 @@ for m in data.get('machines',[]):
       SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
     fi
 
-    # Clear Server's system properties before federation.
+    # 3. Clear Server system properties
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      echo "  Clearing Server system properties before federation..."
+      echo "  Clearing Server system properties..."
       curl -sk -X POST "https://localhost:6443/arcgis/admin/system/properties/update" \
         --data-urlencode 'properties={}' \
         -d "token=$SERVER_TOKEN_FED" -d "f=json" > /dev/null 2>&1 || true
     fi
 
-    # Federate using INTERNAL URLs to avoid ClassCastException.
-    # Portal and Server communicate directly without NGINX in the path.
-    # We update the services URL to the public reverse-proxy URL after
-    # federation succeeds (Step 16).
+    # 4. Reset Server security config to clean GIS_SERVER defaults.
+    #    Clears any partial federation state from a previous failed attempt.
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      echo "  Resetting Server security config to defaults..."
+      RST_SEC=$(curl -sk -X POST \
+        "https://localhost:6443/arcgis/admin/security/config/update" \
+        --data-urlencode 'securityConfig={"authenticationTier":"GIS_SERVER","allowDirectAccess":true,"Protocol":"HTTP_AND_HTTPS","virtualDirsSecurityEnabled":false,"allowedAdminAccessIPs":""}' \
+        -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null) || RST_SEC=""
+      echo "  Security config reset: $RST_SEC"
+    fi
+
+    # 5. Diagnostic — dump current state
+    echo ""
+    echo "  --- Pre-federation diagnostics ---"
+    echo "  Portal properties:"
+    curl -sk "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$TOKEN" 2>/dev/null || true
+    echo ""
+    echo "  Server security config:"
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      curl -sk "https://localhost:6443/arcgis/admin/security/config?f=json&token=$SERVER_TOKEN_FED" 2>/dev/null || true
+      echo ""
+    fi
+    echo "  Server system properties:"
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      curl -sk "https://localhost:6443/arcgis/admin/system/properties?f=json&token=$SERVER_TOKEN_FED" 2>/dev/null || true
+      echo ""
+    fi
+    echo "  --- End diagnostics ---"
+    echo ""
+
+    # 6. Federate using INTERNAL URLs.
+    #    We update the services URL to the public reverse-proxy URL after
+    #    federation succeeds (Step 16).
     echo "  Services URL (internal): https://$SERVER_MACHINE:6443/arcgis"
     echo "  Admin URL:               https://$SERVER_MACHINE:6443/arcgis"
 
@@ -974,6 +1031,8 @@ for m in data.get('machines',[]):
         echo "WARNING: Could not find federated server to set as hosting."
       fi
     fi
+
+    fi  # end of post-restart token check
 
   else
     echo "WARNING: Could not get Portal token. Federation may need to be done manually."
