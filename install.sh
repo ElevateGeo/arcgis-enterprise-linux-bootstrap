@@ -940,7 +940,48 @@ for m in data.get('machines',[]):
         -d "token=$SERVER_TOKEN_FED" -d "f=json" > /dev/null 2>&1 || true
     fi
 
-    # 5. Federate using INTERNAL URLs.
+    # 5. Unregister DataStore items from Server's config store.
+    #    DataStore registration persists in Server's on-disk config store and
+    #    survives JVM restarts. The complex JSON descriptors in those items
+    #    may cause a ClassCastException in the federation security handler.
+    #    DataStore will auto-reconnect after federation completes.
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      echo "  Unregistering DataStore items from Server config store..."
+      DS_ITEMS=$(curl -sk \
+        "https://localhost:6443/arcgis/admin/data/items?f=json&token=$SERVER_TOKEN_FED" \
+        2>/dev/null) || DS_ITEMS=""
+      echo "$DS_ITEMS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for item in data.get('items', data.get('rootItems', [])):
+    p = item.get('path', item.get('id', ''))
+    if p:
+        print(p)
+" 2>/dev/null | while IFS= read -r item_path; do
+        echo "    Unregistering: $item_path"
+        curl -sk -X POST "https://localhost:6443/arcgis/admin/data/unregisterItem" \
+          --data-urlencode "itempath=$item_path" \
+          -d "token=$SERVER_TOKEN_FED" -d "f=json" 2>/dev/null | python3 -c \
+          "import sys,json; r=json.load(sys.stdin); print('    -> ' + r.get('status', str(r)))" 2>/dev/null || true
+      done
+    fi
+
+    # 6. Generate Portal admin token via portaladmin/generateToken
+    #    (matches what the Portal Admin UI uses — different from sharing/rest token)
+    PORTAL_FQDN=$(hostname -f 2>/dev/null || echo "localhost")
+    FED_TOKEN=$(curl -sk -X POST \
+      "https://$PORTAL_FQDN:7443/arcgis/portaladmin/generateToken" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null \
+      | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t)" 2>/dev/null) || FED_TOKEN=""
+    if [[ -z "$FED_TOKEN" || "$FED_TOKEN" == "None" ]]; then
+      echo "  portaladmin/generateToken failed, falling back to sharing token..."
+      FED_TOKEN="$TOKEN"
+    else
+      echo "  Portal admin token (portaladmin endpoint) acquired."
+    fi
+
+    # 7. Federate using INTERNAL URLs.
     #    We update the services URL to the public reverse-proxy URL after
     #    federation succeeds (Step 16).
     echo "  Services URL (internal): https://$SERVER_MACHINE:6443/arcgis"
@@ -952,13 +993,22 @@ for m in data.get('machines',[]):
       -d "adminUrl=https://$SERVER_MACHINE:6443/arcgis" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
-      -d "token=$TOKEN" \
+      -d "token=$FED_TOKEN" \
       -d "f=json" 2>/dev/null) || true
     echo "Federation result: $FEDERATE_RESULT"
 
     if echo "$FEDERATE_RESULT" | grep -q '"error"'; then
       echo "ERROR: Federation failed. See output above."
       echo "You can federate manually via Portal Admin."
+      # Print recent Server logs to help diagnose
+      SERVER_LOG_DIR="$ESRI_BASE/arcgis/server/usr/logs/$SERVER_MACHINE/server"
+      if [[ -d "$SERVER_LOG_DIR" ]]; then
+        echo ""
+        echo "  --- Recent ArcGIS Server log entries ---"
+        ls -t "$SERVER_LOG_DIR"/*.log 2>/dev/null | head -1 | xargs -r tail -100 2>/dev/null \
+          | grep -i "error\|exception\|federation\|security" | tail -30 || true
+        echo "  --- End Server log ---"
+      fi
     else
       echo "  Federation successful."
       sleep 10
@@ -966,7 +1016,7 @@ for m in data.get('machines',[]):
       # Set as hosting server
       echo "Setting Server as hosting server..."
       SERVERS=$(curl -sk \
-        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
+        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$FED_TOKEN" \
         2>/dev/null) || true
       FEDERATED_SERVER_ID=$(echo "$SERVERS" | python3 -c "import sys,json; s=json.load(sys.stdin).get('servers',[]); print(s[0]['id'] if s else '')" 2>/dev/null) || FEDERATED_SERVER_ID=""
 
@@ -974,7 +1024,7 @@ for m in data.get('machines',[]):
         HOSTING_RESULT=$(curl -sk -X POST \
           "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
           -d "serverRole=HOSTING_SERVER" \
-          -d "token=$TOKEN" \
+          -d "token=$FED_TOKEN" \
           -d "f=json" 2>/dev/null) || true
         echo "Hosting server result: $HOSTING_RESULT"
       else
