@@ -813,44 +813,83 @@ else
   echo "Found Web Adaptor tools at: $WA_TOOLS"
   cd "$WA_TOOLS"
 
-  # --- Diagnostics: verify the /webadaptor endpoint is reachable ---
+  # Determine the WA install root (parent of tools/)
+  WA_JAVA_DIR=$(cd "$WA_TOOLS/.." && pwd)
+
+  # --- Diagnostics: WAR internals and config directory ---
   echo ""
-  echo "Diagnostic: testing Web Adaptor /webadaptor endpoint connectivity..."
-  echo "  NGINX: $(systemctl is-active nginx 2>/dev/null || echo 'NOT RUNNING')"
-  for WA_PATH in portal server; do
+  echo "Diagnostic: WAR and Web Adaptor configuration analysis..."
+
+  # 1. init_webadaptor.sh — might configure the WAR's config directory
+  WA_INIT="$WA_JAVA_DIR/init_webadaptor.sh"
+  if [[ -f "$WA_INIT" ]]; then
     echo ""
-    echo "  ── $WA_PATH ──"
-    # Direct to Tomcat (bypass NGINX/SSL)
-    HTTP_DIRECT=$(curl -sk -o /tmp/wa_diag_direct.txt -w "%{http_code}" \
-      "http://localhost:8080/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
-    echo "  Direct (Tomcat):  http://localhost:8080/${WA_PATH}/webadaptor → HTTP $HTTP_DIRECT"
-    # Through NGINX (same path the config tool uses)
-    HTTP_NGINX=$(curl -sk -o /tmp/wa_diag_nginx.txt -w "%{http_code}" \
-      "https://$DOMAIN/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
-    echo "  Via NGINX (HTTPS): https://$DOMAIN/${WA_PATH}/webadaptor → HTTP $HTTP_NGINX"
-    # JSON endpoint test (what the config tool likely sends)
-    JSON_RESP=$(curl -sk "http://localhost:8080/${WA_PATH}/webadaptor?f=json" 2>/dev/null | head -3)
-    echo "  JSON test (?f=json): ${JSON_RESP:0:200}"
+    echo "  ┌── init_webadaptor.sh ──────────────────"
+    cat "$WA_INIT" 2>/dev/null | sed 's/^/  │ /'
+    echo "  └────────────────────────────────────────"
+  else
+    echo "  init_webadaptor.sh: NOT FOUND"
+  fi
+
+  # 2. Exploded WAR's web.xml — look for context-param / init-param for config paths
+  for WA_CTX in portal server; do
+    WA_WEB_XML="$TOMCAT_WEBAPPS/$WA_CTX/WEB-INF/web.xml"
+    if [[ -f "$WA_WEB_XML" ]]; then
+      echo ""
+      echo "  ┌── $WA_CTX/WEB-INF/web.xml (full) ──────"
+      cat "$WA_WEB_XML" 2>/dev/null | sed 's/^/  │ /'
+      echo "  └────────────────────────────────────────"
+    fi
+
+    # META-INF/context.xml (Tomcat-specific config)
+    WA_CTX_XML="$TOMCAT_WEBAPPS/$WA_CTX/META-INF/context.xml"
+    if [[ -f "$WA_CTX_XML" ]]; then
+      echo ""
+      echo "  ┌── $WA_CTX/META-INF/context.xml ────────"
+      cat "$WA_CTX_XML" 2>/dev/null | sed 's/^/  │ /'
+      echo "  └────────────────────────────────────────"
+    fi
   done
 
-  # OpenSSL TLS chain verification (does the cert chain validate?)
+  # 3. Find ALL properties files in WA install dir and exploded WARs
   echo ""
-  echo "  OpenSSL certificate chain test to $DOMAIN:443:"
-  echo "Q" | openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" 2>&1 | \
-    grep -E "Verify return|error|depth|s:|i:|SSL-Session" | head -12 | sed 's/^/    /'
+  echo "  Properties files in WA install dir:"
+  find "$WA_JAVA_DIR" -name "*.properties" -type f 2>/dev/null | sed 's/^/    /'
+  echo "  Properties files in Tomcat webapps:"
+  find "$TOMCAT_WEBAPPS/portal" "$TOMCAT_WEBAPPS/server" -name "*.properties" -type f 2>/dev/null | sed 's/^/    /'
 
-  # Show configurewebadaptor.sh FULL content — must see what JRE/truststore it uses
+  # 4. Complete listing of WA install directory (non-lib)
   echo ""
-  echo "  ┌── configurewebadaptor.sh ──────────────────"
-  cat ./configurewebadaptor.sh 2>/dev/null | sed 's/^/  │ /'
-  echo "  └────────────────────────────────────────────"
+  echo "  WA Java dir listing (excluding lib/ JARs):"
+  find "$WA_JAVA_DIR" -maxdepth 3 -not -path "*/lib/*" -not -path "*/.Setup/*" | sort | sed 's/^/    /'
 
-  # List Java/JRE files the script references
+  # 5. Quick connectivity test
   echo ""
-  echo "  Web Adaptor install dir layout:"
-  find "$WA_TOOLS/.." -maxdepth 2 -name "*.sh" -o -name "java" -o -name "cacerts" -o -name "*.properties" 2>/dev/null | sort | sed 's/^/    /'
-  echo "  tomcat user groups: $(id tomcat 2>/dev/null || echo 'user not found')"
-  echo "  arcgis user groups: $(id "$ARCGIS_USER" 2>/dev/null || echo 'user not found')"
+  echo "  Quick endpoint tests:"
+  for WA_PATH in portal server; do
+    HTTP_DIRECT=$(curl -sk -o /dev/null -w "%{http_code}" \
+      "http://localhost:8080/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
+    echo "  http://localhost:8080/${WA_PATH}/webadaptor → HTTP $HTTP_DIRECT"
+  done
+
+  # 6. Test with Java directly (same JRE the tool uses)
+  WA_JAVA=$(which java 2>/dev/null || echo "NOT FOUND")
+  echo "  Java binary: $WA_JAVA"
+  echo "  Java version: $($WA_JAVA -version 2>&1 | head -1)"
+  echo "  JAVA_HOME: ${JAVA_HOME:-not set}"
+
+  # 7. Test WAR connection via Java (same as arcgis-wareg.jar would)
+  echo ""
+  echo "  Testing Java HTTPS connectivity to https://$DOMAIN/portal/webadaptor ..."
+  sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" java -cp "" \
+    -Djava.net.useSystemProxies=false \
+    jdk.internal.net.http.HttpClientImpl 2>/dev/null || true
+  # Simple Java URL test via one-liner
+  sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" java -e \
+    "var c=java.net.URI.create(\"https://$DOMAIN/portal/webadaptor\").toURL().openConnection(); \
+     c.setRequestMethod(\"GET\"); \
+     System.out.println(\"HTTP \"+c.getResponseCode()+\" \"+c.getResponseMessage());" 2>&1 | \
+    tail -5 | sed 's/^/    /' || echo "    (Java URL test failed)"
   echo ""
 
   # --- Portal Web Adaptor ---
