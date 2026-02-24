@@ -378,6 +378,13 @@ ln -sf /etc/nginx/sites-available/arcgis /etc/nginx/sites-enabled/arcgis
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
+# Ensure the public domain resolves locally so Portal/Server can reach
+# their own public URLs through NGINX (federation, OAuth callbacks, etc.)
+if ! grep -q "$DOMAIN" /etc/hosts 2>/dev/null; then
+  echo "127.0.0.1 $DOMAIN" >> /etc/hosts
+  echo "Added $DOMAIN to /etc/hosts (loopback for local federation)."
+fi
+
 # ==============================================================================
 # Step 4: ArcGIS User and System Configuration
 # Ref: https://enterprise.arcgis.com/en/portal/12.0/install/linux/system-requirements-portal.htm
@@ -817,7 +824,7 @@ generate_server_token() {
   return 1
 }
 
-# --- Portal: set WebContextURL ---
+# --- Portal: set WebContextURL + privatePortalURL ---
 PORTAL_CTX_OK=false
 wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
@@ -828,65 +835,38 @@ if [[ -z "$PORTAL_TOKEN" ]]; then
 else
   echo "Portal admin token acquired."
 
-  # Check if WebContextURL is already set
-  CUR_PROPS=$(curl -sk \
-    "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$PORTAL_TOKEN" \
-    2>/dev/null) || CUR_PROPS=""
-  if echo "$CUR_PROPS" | grep -q "https://$DOMAIN/portal"; then
-    echo "Portal WebContextURL already set — skipping."
-    PORTAL_CTX_OK=true
-  else
-    echo "Setting Portal WebContextURL to https://$DOMAIN/portal ..."
-    CTX_RESULT=$(curl -sk -X POST \
-      "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
-      --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\"}" \
-      -d "token=$PORTAL_TOKEN" \
-      -d "f=json" 2>/dev/null) || CTX_RESULT=""
-    echo "  Result: $CTX_RESULT"
-    if echo "$CTX_RESULT" | grep -q '"error"'; then
-      echo "  WARNING: Failed to set Portal WebContextURL."
-    else
-      echo "  Portal WebContextURL configured."
-      PORTAL_CTX_OK=true
-      # Portal restarts internally after WebContextURL change.
-      # Wait for it to come back up before continuing.
-      echo "  Waiting for Portal to restart after WebContextURL change..."
-      sleep 30
-      wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
-    fi
-  fi
-fi
+  # Discover Portal's internal FQDN for privatePortalURL
+  PORTAL_INTERNAL_HOST=$(hostname -f 2>/dev/null || echo "localhost")
 
-# --- Server: set WebContextURL ---
-SERVER_CTX_OK=false
-wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
-
-SERVER_TOKEN=$(generate_server_token 2>/tmp/server_token_debug) || SERVER_TOKEN=""
-if [[ -z "$SERVER_TOKEN" ]]; then
-  echo "WARNING: Could not generate Server admin token."
-  cat /tmp/server_token_debug 2>/dev/null || true
-else
-  echo "Server admin token acquired."
-  echo "Setting Server WebContextURL to https://$DOMAIN/server ..."
+  # Always set WebContextURL + privatePortalURL.
+  # privatePortalURL tells Portal which URL is internal vs public — required
+  # for Portal to generate correct OAuth redirect URIs and public URLs.
+  echo "Setting Portal WebContextURL to https://$DOMAIN/portal ..."
+  echo "Setting Portal privatePortalURL to https://$PORTAL_INTERNAL_HOST:7443/arcgis ..."
   CTX_RESULT=$(curl -sk -X POST \
-    "https://localhost:6443/arcgis/admin/system/properties/update" \
-    --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
-    -d "token=$SERVER_TOKEN" \
+    "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
+    --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
+    -d "token=$PORTAL_TOKEN" \
     -d "f=json" 2>/dev/null) || CTX_RESULT=""
   echo "  Result: $CTX_RESULT"
   if echo "$CTX_RESULT" | grep -q '"error"'; then
-    echo "  WARNING: Failed to set Server WebContextURL."
+    echo "  WARNING: Failed to set Portal WebContextURL."
   else
-    echo "  Server WebContextURL configured."
-    SERVER_CTX_OK=true
+    echo "  Portal reverse proxy properties configured."
+    PORTAL_CTX_OK=true
+    # Portal restarts internally after property changes.
+    echo "  Waiting for Portal to restart..."
+    sleep 30
+    wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
   fi
 fi
 
-if [[ "$PORTAL_CTX_OK" != "true" || "$SERVER_CTX_OK" != "true" ]]; then
+# --- Server WebContextURL is set AFTER federation (Step 15) to avoid ---
+# --- a ClassCastException in Server's security config update.       ---
+
+if [[ "$PORTAL_CTX_OK" != "true" ]]; then
   echo ""
-  echo "WARNING: Reverse proxy configuration incomplete."
-  echo "  Portal: $( [ "$PORTAL_CTX_OK" = "true" ] && echo "OK" || echo "NEEDS ATTENTION" )"
-  echo "  Server: $( [ "$SERVER_CTX_OK" = "true" ] && echo "OK" || echo "NEEDS ATTENTION" )"
+  echo "WARNING: Portal reverse proxy configuration incomplete."
 fi
 
 # ==============================================================================
@@ -965,9 +945,7 @@ else
   if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
     echo "Federating ArcGIS Server with Portal..."
 
-    # adminUrl must use the hostname Server was created with — this matches
-    # Server's SSL certificate.  hostname -f may return a different Azure DNS
-    # name, so we discover the actual machine name from Server's admin API.
+    # Discover Server's machine name (matches its SSL certificate)
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
     SERVER_MACHINE=""
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
@@ -980,9 +958,19 @@ for m in data.get('machines',[]):
     print(m.get('machineName','')); break" 2>/dev/null) || SERVER_MACHINE=""
     fi
     if [[ -z "$SERVER_MACHINE" ]]; then
-      # Fallback: use hostname -f or localhost
       SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
     fi
+
+    # Clear Server's system properties before federation to avoid
+    # ClassCastException in Server's security config update.
+    # (WebContextURL stored as JSON confuses the security update handler)
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      echo "  Clearing Server system properties before federation..."
+      curl -sk -X POST "https://localhost:6443/arcgis/admin/system/properties/update" \
+        --data-urlencode 'properties={}' \
+        -d "token=$SERVER_TOKEN_FED" -d "f=json" > /dev/null 2>&1 || true
+    fi
+
     echo "  Services URL: https://$DOMAIN/server"
     echo "  Admin URL:    https://$SERVER_MACHINE:6443/arcgis"
 
@@ -1000,6 +988,7 @@ for m in data.get('machines',[]):
       echo "ERROR: Federation failed. See output above."
       echo "You can federate manually via Portal Admin."
     else
+      echo "  Federation successful."
       sleep 10
 
       # Set as hosting server
@@ -1020,6 +1009,28 @@ for m in data.get('machines',[]):
         echo "WARNING: Could not find federated server to set as hosting."
       fi
     fi
+
+    # --- Set Server WebContextURL AFTER federation ---
+    # Must be done after federation to avoid ClassCastException in
+    # Server's security config update.
+    echo ""
+    echo "Setting Server WebContextURL to https://$DOMAIN/server ..."
+    SRV_TOK=$(generate_server_token 2>/dev/null) || SRV_TOK=""
+    if [[ -n "$SRV_TOK" ]]; then
+      CTX_RESULT=$(curl -sk -X POST \
+        "https://localhost:6443/arcgis/admin/system/properties/update" \
+        --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
+        -d "token=$SRV_TOK" -d "f=json" 2>/dev/null) || CTX_RESULT=""
+      echo "  Result: $CTX_RESULT"
+      if echo "$CTX_RESULT" | grep -q '"error"'; then
+        echo "  WARNING: Failed to set Server WebContextURL."
+      else
+        echo "  Server WebContextURL configured."
+      fi
+    else
+      echo "  WARNING: Could not get Server token for WebContextURL."
+    fi
+
   else
     echo "WARNING: Could not get Portal token. Federation may need to be done manually."
     echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
