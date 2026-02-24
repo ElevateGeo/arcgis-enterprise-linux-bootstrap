@@ -826,7 +826,7 @@ else
       WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m portal \
-        -w "https://$DOMAIN/portal" \
+        -w "https://$DOMAIN/portal/webadaptor" \
         -g "$PORTAL_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
@@ -857,7 +857,7 @@ else
       WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m server \
-        -w "https://$DOMAIN/server" \
+        -w "https://$DOMAIN/server/webadaptor" \
         -g "$SERVER_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" \
