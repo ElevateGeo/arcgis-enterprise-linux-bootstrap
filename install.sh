@@ -813,6 +813,54 @@ else
   echo "Found Web Adaptor tools at: $WA_TOOLS"
   cd "$WA_TOOLS"
 
+  # --- Diagnostics: verify the /webadaptor endpoint is reachable ---
+  echo ""
+  echo "Diagnostic: testing Web Adaptor /webadaptor endpoint connectivity..."
+  echo "  NGINX: $(systemctl is-active nginx 2>/dev/null || echo 'NOT RUNNING')"
+  for WA_PATH in portal server; do
+    echo ""
+    echo "  ── $WA_PATH ──"
+    # Direct to Tomcat (bypass NGINX/SSL)
+    HTTP_DIRECT=$(curl -sk -o /tmp/wa_diag_direct.txt -w "%{http_code}" \
+      "http://localhost:8080/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
+    echo "  Direct (Tomcat):  http://localhost:8080/${WA_PATH}/webadaptor → HTTP $HTTP_DIRECT"
+    if [[ "$HTTP_DIRECT" != "200" && "$HTTP_DIRECT" != "302" ]]; then
+      echo "    Response body:"
+      head -20 /tmp/wa_diag_direct.txt 2>/dev/null | sed 's/^/      /'
+    fi
+    # Through NGINX (same path the config tool uses)
+    HTTP_NGINX=$(curl -sk -o /tmp/wa_diag_nginx.txt -w "%{http_code}" \
+      "https://$DOMAIN/${WA_PATH}/webadaptor" 2>/dev/null || echo "000")
+    echo "  Via NGINX (HTTPS): https://$DOMAIN/${WA_PATH}/webadaptor → HTTP $HTTP_NGINX"
+    if [[ "$HTTP_NGINX" != "200" && "$HTTP_NGINX" != "302" ]]; then
+      echo "    Response body:"
+      head -20 /tmp/wa_diag_nginx.txt 2>/dev/null | sed 's/^/      /'
+    fi
+  done
+
+  # Show SEVERE entries triggered by the diagnostic curls
+  DIAG_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
+  if [[ -n "$DIAG_LOG" && -f "$DIAG_LOG" ]]; then
+    DIAG_SEVERE=$(grep -A5 "SEVERE" "$DIAG_LOG" 2>/dev/null | tail -30)
+    if [[ -n "$DIAG_SEVERE" ]]; then
+      echo ""
+      echo "  SEVERE entries in Tomcat localhost log:"
+      echo "$DIAG_SEVERE" | sed 's/^/    /'
+    fi
+  fi
+
+  # Show what Java the config tool uses
+  echo ""
+  echo "  configurewebadaptor.sh internals (Java/JRE references):"
+  grep -i "java_home\|JAVA_HOME\|jre\|java " ./configurewebadaptor.sh 2>/dev/null | head -10 | sed 's/^/    /'
+
+  # Check file permissions on WA install directory
+  echo ""
+  echo "  Web Adaptor install dir permissions:"
+  ls -la "$WA_TOOLS/../" 2>/dev/null | head -15 | sed 's/^/    /'
+  echo "  tomcat user groups: $(id tomcat 2>/dev/null || echo 'user not found')"
+  echo ""
+
   # --- Portal Web Adaptor ---
   PORTAL_WA_STATUS=$(curl -sk "https://$DOMAIN/portal/sharing/rest?f=json" 2>/dev/null || echo "")
   if echo "$PORTAL_WA_STATUS" | grep -q "currentVersion"; then
