@@ -745,6 +745,14 @@ fi
 
 WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
 
+# Force ALL JVMs (including Esri's bundled JREs) to use the system truststore
+# that contains our Let's Encrypt cert. JAVA_TOOL_OPTIONS is respected by all JVMs.
+SYS_CACERTS="/etc/ssl/certs/java/cacerts"
+if [[ -f "$SYS_CACERTS" ]]; then
+  export JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$SYS_CACERTS -Djavax.net.ssl.trustStorePassword=changeit"
+  echo "Set JAVA_TOOL_OPTIONS to use system truststore: $SYS_CACERTS"
+fi
+
 if [[ -z "$WA_TOOLS" || ! -d "$WA_TOOLS" ]]; then
   echo "ERROR: Web Adaptor tools directory not found — skipping Web Adaptor config."
 else
@@ -758,26 +766,25 @@ else
   else
     wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
 
-    echo "Configuring Web Adaptor for Portal..."
-    WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
-      -m portal \
-      -w "https://$DOMAIN/portal/webadaptor" \
-      -g "https://$DOMAIN:7443" \
-      -u "$ADMIN_USER" \
-      -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
-    echo "$WA_PORTAL_OUTPUT"
-    if [[ $WA_PORTAL_RC -ne 0 ]]; then
-      echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
-      echo "Trying once more with localhost gateway..."
-      sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+    # Try FQDN gateway first, then localhost fallback
+    for PORTAL_GW in "https://$DOMAIN:7443" "https://localhost:7443"; do
+      echo "Configuring Web Adaptor for Portal (gateway: $PORTAL_GW)..."
+      WA_PORTAL_OUTPUT=$(sudo -E -u "$ARCGIS_USER" ./configurewebadaptor.sh \
         -m portal \
         -w "https://$DOMAIN/portal/webadaptor" \
-        -g "https://localhost:7443" \
+        -g "$PORTAL_GW" \
         -u "$ADMIN_USER" \
-        -p "$ADMIN_PASS" 2>&1 || {
-          echo "ERROR: Portal Web Adaptor configuration failed on retry too."
-          echo "You can configure it manually later — see README."
-        }
+        -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
+      echo "$WA_PORTAL_OUTPUT"
+      if [[ $WA_PORTAL_RC -eq 0 ]]; then
+        echo "Portal Web Adaptor configured successfully."
+        break
+      else
+        echo "ERROR: Portal Web Adaptor configuration failed (exit code $WA_PORTAL_RC)."
+      fi
+    done
+    if [[ ${WA_PORTAL_RC:-1} -ne 0 ]]; then
+      echo "You can configure it manually later — see README."
     fi
     sleep 10
   fi
@@ -787,34 +794,33 @@ else
   if echo "$SERVER_WA_STATUS" | grep -q "currentVersion"; then
     echo "Server Web Adaptor already configured, skipping..."
   else
-    # Server site exists by now (Step 11), so healthCheck works
     wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
 
-    echo "Configuring Web Adaptor for Server..."
-    WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
-      -m server \
-      -w "https://$DOMAIN/server/webadaptor" \
-      -g "https://$DOMAIN:6443" \
-      -u "$ADMIN_USER" \
-      -p "$ADMIN_PASS" \
-      -a true 2>&1) && WA_SERVER_RC=0 || WA_SERVER_RC=$?
-    echo "$WA_SERVER_OUTPUT"
-    if [[ $WA_SERVER_RC -ne 0 ]]; then
-      echo "ERROR: Server Web Adaptor configuration failed (exit code $WA_SERVER_RC)."
-      echo "Trying once more with localhost gateway..."
-      sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
+    for SERVER_GW in "https://$DOMAIN:6443" "https://localhost:6443"; do
+      echo "Configuring Web Adaptor for Server (gateway: $SERVER_GW)..."
+      WA_SERVER_OUTPUT=$(sudo -E -u "$ARCGIS_USER" ./configurewebadaptor.sh \
         -m server \
         -w "https://$DOMAIN/server/webadaptor" \
-        -g "https://localhost:6443" \
+        -g "$SERVER_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" \
-        -a true 2>&1 || {
-          echo "ERROR: Server Web Adaptor configuration failed on retry too."
-          echo "You can configure it manually later — see README."
-        }
+        -a true 2>&1) && WA_SERVER_RC=0 || WA_SERVER_RC=$?
+      echo "$WA_SERVER_OUTPUT"
+      if [[ $WA_SERVER_RC -eq 0 ]]; then
+        echo "Server Web Adaptor configured successfully."
+        break
+      else
+        echo "ERROR: Server Web Adaptor configuration failed (exit code $WA_SERVER_RC)."
+      fi
+    done
+    if [[ ${WA_SERVER_RC:-1} -ne 0 ]]; then
+      echo "You can configure it manually later — see README."
     fi
   fi
 fi
+
+# Clear JAVA_TOOL_OPTIONS so it doesn't affect subsequent tools
+unset JAVA_TOOL_OPTIONS
 
 # ==============================================================================
 # Step 14: Configure Data Store
