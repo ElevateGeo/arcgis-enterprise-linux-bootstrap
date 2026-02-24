@@ -398,7 +398,7 @@ if [[ -n "${WA_TOOLS:-}" && -d "${WA_TOOLS:-}" && -n "${ADMIN_USER:-}" && -n "${
   cd "$WA_TOOLS"
   sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
     -m portal \
-    -w "https://$DOMAIN/portal/webadaptor" \
+    -w "https://$DOMAIN/portal" \
     -g "https://localhost:7443" \
     -u "$ADMIN_USER" \
     -p "$ADMIN_PASS" || true
@@ -408,7 +408,7 @@ if [[ -n "${WA_TOOLS:-}" && -d "${WA_TOOLS:-}" && -n "${ADMIN_USER:-}" && -n "${
   echo "Re-configuring Web Adaptor for Server..."
   sudo -u "$ARCGIS_USER" ./configurewebadaptor.sh \
     -m server \
-    -w "https://$DOMAIN/server/webadaptor" \
+    -w "https://$DOMAIN/server" \
     -g "https://localhost:6443" \
     -u "$ADMIN_USER" \
     -p "$ADMIN_PASS" \

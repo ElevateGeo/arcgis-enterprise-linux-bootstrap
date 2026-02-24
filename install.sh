@@ -546,6 +546,20 @@ elif [[ -n "$WA_WAR" ]]; then
   chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_HOME/work"
 fi
 
+# Grant tomcat user access to WA config directory.
+# The WAR reads/writes web_adaptor.properties from the Esri install location;
+# tomcat needs group access via the arcgis group.
+if [[ -n "${WA_HOME:-}" && -d "${WA_HOME:-}" ]]; then
+  if ! id -nG "$TOMCAT_USER" 2>/dev/null | grep -qw "$ARCGIS_USER"; then
+    echo "Adding $TOMCAT_USER to $ARCGIS_USER group for Web Adaptor config access..."
+    usermod -aG "$ARCGIS_USER" "$TOMCAT_USER"
+  fi
+  chmod -R g+rwX "$WA_HOME/java"
+  # Restart Tomcat so the new group membership takes effect
+  systemctl restart "$TOMCAT_SERVICE"
+  sleep 10
+fi
+
 # ==============================================================================
 # Step 10: Start ArcGIS Services
 # ==============================================================================
@@ -732,8 +746,7 @@ done
 
 # Test endpoints (capture 500 response bodies inline for diagnosis)
 echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
-for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/" \
-                "http://localhost:8080/portal/webadaptor" "http://localhost:8080/server/webadaptor"; do
+for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/"; do
   HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$TEST_URL" 2>/dev/null || echo "000")
   echo "  $TEST_URL → HTTP $HTTP_CODE"
   if [[ "$HTTP_CODE" == "500" ]]; then
@@ -754,7 +767,7 @@ fi
 # Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 stack traces appear
 LOCALHOST_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
 if [[ -n "$LOCALHOST_LOG" && -f "$LOCALHOST_LOG" ]]; then
-  SEVERE_COUNT=$(grep -c "SEVERE" "$LOCALHOST_LOG" 2>/dev/null || echo "0")
+  SEVERE_COUNT=$(grep -c "SEVERE" "$LOCALHOST_LOG" 2>/dev/null) || SEVERE_COUNT=0
   if [[ "$SEVERE_COUNT" -gt 0 ]]; then
     echo "  SEVERE errors found in $LOCALHOST_LOG ($SEVERE_COUNT occurrences):"
     grep -A5 "SEVERE" "$LOCALHOST_LOG" 2>/dev/null | head -30 | sed 's/^/    /'
@@ -813,7 +826,7 @@ else
       WA_PORTAL_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m portal \
-        -w "https://$DOMAIN/portal/webadaptor" \
+        -w "https://$DOMAIN/portal" \
         -g "$PORTAL_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" 2>&1) && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
@@ -844,7 +857,7 @@ else
       WA_SERVER_OUTPUT=$(sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
         ./configurewebadaptor.sh \
         -m server \
-        -w "https://$DOMAIN/server/webadaptor" \
+        -w "https://$DOMAIN/server" \
         -g "$SERVER_GW" \
         -u "$ADMIN_USER" \
         -p "$ADMIN_PASS" \
