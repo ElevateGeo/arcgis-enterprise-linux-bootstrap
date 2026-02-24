@@ -20,7 +20,7 @@ set -euo pipefail
 #  10. Start services
 #  11. Create ArcGIS Server site (requires prior authorization)
 #  12. Create Portal (with JSON license via -lf flag)
-#  13. Configure Web Adaptors
+#  13. Configure reverse proxy (set WebContextURL on Portal + Server)
 #  14. Configure Data Store (relational + object)
 #  15. Federate Server with Portal & set as hosting server
 
@@ -324,29 +324,41 @@ server {
     proxy_set_header Upgrade    $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
 
-    # Portal Web Adaptor
-    location /portal {
-        proxy_pass http://localhost:8080/portal;
+    # Portal — direct reverse proxy to Portal for ArcGIS (port 7443)
+    # Rewrites /portal/* → /arcgis/* on the backend
+    location = /portal {
+        return 301 /portal/;
+    }
+    location /portal/ {
+        proxy_pass https://localhost:7443/arcgis/;
+        proxy_ssl_verify off;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
     }
 
-    # Server Web Adaptor
-    location /server {
-        proxy_pass http://localhost:8080/server;
+    # Server — direct reverse proxy to ArcGIS Server (port 6443)
+    # Rewrites /server/* → /arcgis/* on the backend
+    location = /server {
+        return 301 /server/;
+    }
+    location /server/ {
+        proxy_pass https://localhost:6443/arcgis/;
+        proxy_ssl_verify off;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
     }
 
-    # Default
-    location / {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Forwarded-Proto https;
+    # Default — redirect to Portal home
+    location = / {
+        return 302 /portal/home/;
     }
 }
 NGINX_EOF
@@ -710,46 +722,16 @@ else
 fi
 
 # ==============================================================================
-# Step 13: Configure Web Adaptors
-# Ref: https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/configure-arcgis-web-adaptor-portal.htm
-# Ref: https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/configure-arcgis-web-adaptor-server.htm
+# Step 13: Configure Reverse Proxy Integration
+# NGINX proxies directly to Portal (7443) and Server (6443) — no Web Adaptor
+# WAR in the request path.  We set WebContextURL so each component generates
+# correct public-facing URLs.
+# Ref: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/using-a-reverse-proxy-server-with-portal-for-arcgis.htm
+# Ref: https://enterprise.arcgis.com/en/server/12.0/administer/linux/using-a-reverse-proxy-server-with-arcgis-server.htm
 # ==============================================================================
 echo ""
-echo ">>> Step 13: Configuring Web Adaptors"
+echo ">>> Step 13: Configuring Reverse Proxy Integration"
 echo ""
-
-# --- Pre-flight: verify Tomcat deployed the WARs correctly ---
-echo "Pre-flight: checking WAR deployment..."
-echo "  Tomcat service: $(systemctl is-active $TOMCAT_SERVICE 2>/dev/null || echo 'NOT RUNNING')"
-
-# Verify WARs were exploded into directories
-for WA_CTX in portal server; do
-  if [[ -d "$TOMCAT_WEBAPPS/$WA_CTX" ]]; then
-    echo "  $WA_CTX WAR exploded: YES"
-  elif [[ -f "$TOMCAT_WEBAPPS/$WA_CTX.war" ]]; then
-    echo "  $WA_CTX WAR present but NOT exploded — restarting Tomcat..."
-    systemctl restart "$TOMCAT_SERVICE"
-    sleep 20
-    break
-  else
-    echo "  $WA_CTX WAR missing! Re-deploying..."
-    WA_WAR=$(find "$ESRI_BASE" -path "*/java/arcgis.war" -type f 2>/dev/null | head -1)
-    if [[ -n "$WA_WAR" ]]; then
-      cp "$WA_WAR" "$TOMCAT_WEBAPPS/$WA_CTX.war"
-      chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/$WA_CTX.war"
-    fi
-    systemctl restart "$TOMCAT_SERVICE"
-    sleep 20
-    break
-  fi
-done
-
-# Test key endpoints
-echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
-for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/"; do
-  HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$TEST_URL" 2>/dev/null || echo "000")
-  echo "  $TEST_URL → HTTP $HTTP_CODE"
-done
 
 # Import the Let's Encrypt cert into ALL Java truststores on the system.
 LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -772,155 +754,119 @@ if [[ -f "$LE_CERT" ]]; then
   done < <(find /opt/esri /usr/lib/jvm /etc/ssl -name "cacerts" -type f 2>/dev/null | sort -u)
 fi
 
-WA_TOOLS=$(find "$ESRI_BASE" -path "*/webadaptor*/java/tools" -type d 2>/dev/null | head -1)
+# ---------------------------------------------------------------------------
+# Helper: generate a Portal admin token (tries multiple approaches)
+# ---------------------------------------------------------------------------
+generate_portal_token() {
+  local _resp _token _host
+  # Approach 1: localhost + requestip
+  _resp=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
 
-# Build the JAVA_TOOL_OPTIONS string to force all JVMs to use the system truststore.
-# We pass it explicitly via `sudo ... env` because `sudo -E` is blocked by env_reset.
-SYS_CACERTS="/etc/ssl/certs/java/cacerts"
-JTO=""
-if [[ -f "$SYS_CACERTS" ]]; then
-  JTO="-Djavax.net.ssl.trustStore=$SYS_CACERTS -Djavax.net.ssl.trustStorePassword=changeit"
-  echo "Will pass JAVA_TOOL_OPTIONS to configurewebadaptor.sh"
+  # Approach 2: internal FQDN + requestip
+  _host=$(hostname -f 2>/dev/null) || _host=""
+  if [[ -n "$_host" ]]; then
+    _resp=$(curl -sk -X POST "https://$_host:7443/arcgis/sharing/rest/generateToken" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+    _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  fi
+
+  # Approach 3: localhost + referer (self-referencing)
+  _resp=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=referer" -d "referer=https://localhost:7443" -d "f=json" 2>/dev/null) || _resp=""
+  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+
+  # All failed — emit debug info on stderr
+  echo "DEBUG: Portal generateToken last response: $_resp" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: generate a Server admin token
+# ---------------------------------------------------------------------------
+generate_server_token() {
+  local _resp _token
+  _resp=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  echo "DEBUG: Server generateToken response: $_resp" >&2
+  return 1
+}
+
+# --- Portal: set WebContextURL ---
+PORTAL_CTX_OK=false
+wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+
+PORTAL_TOKEN=$(generate_portal_token 2>/tmp/portal_token_debug) || PORTAL_TOKEN=""
+if [[ -z "$PORTAL_TOKEN" ]]; then
+  echo "WARNING: Could not generate Portal admin token."
+  cat /tmp/portal_token_debug 2>/dev/null || true
+else
+  echo "Portal admin token acquired."
+
+  # Check if WebContextURL is already set
+  CUR_PROPS=$(curl -sk \
+    "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$PORTAL_TOKEN" \
+    2>/dev/null) || CUR_PROPS=""
+  if echo "$CUR_PROPS" | grep -q "https://$DOMAIN/portal"; then
+    echo "Portal WebContextURL already set — skipping."
+    PORTAL_CTX_OK=true
+  else
+    echo "Setting Portal WebContextURL to https://$DOMAIN/portal ..."
+    CTX_RESULT=$(curl -sk -X POST \
+      "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
+      --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\"}" \
+      -d "token=$PORTAL_TOKEN" \
+      -d "f=json" 2>/dev/null) || CTX_RESULT=""
+    echo "  Result: $CTX_RESULT"
+    if echo "$CTX_RESULT" | grep -q '"error"'; then
+      echo "  WARNING: Failed to set Portal WebContextURL."
+    else
+      echo "  Portal WebContextURL configured."
+      PORTAL_CTX_OK=true
+    fi
+  fi
 fi
 
-if [[ -z "$WA_TOOLS" || ! -d "$WA_TOOLS" ]]; then
-  echo "ERROR: Web Adaptor tools directory not found — skipping Web Adaptor config."
+# --- Server: set WebContextURL ---
+SERVER_CTX_OK=false
+wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
+
+SERVER_TOKEN=$(generate_server_token 2>/tmp/server_token_debug) || SERVER_TOKEN=""
+if [[ -z "$SERVER_TOKEN" ]]; then
+  echo "WARNING: Could not generate Server admin token."
+  cat /tmp/server_token_debug 2>/dev/null || true
 else
-  echo "Found Web Adaptor tools at: $WA_TOOLS"
-  cd "$WA_TOOLS"
-
-  # --- Portal Web Adaptor ---
-  PORTAL_WA_STATUS=$(curl -sk "https://$DOMAIN/portal/sharing/rest?f=json" 2>/dev/null || echo "")
-  if echo "$PORTAL_WA_STATUS" | grep -q "currentVersion"; then
-    echo "Portal Web Adaptor already configured, skipping..."
+  echo "Server admin token acquired."
+  echo "Setting Server WebContextURL to https://$DOMAIN/server ..."
+  CTX_RESULT=$(curl -sk -X POST \
+    "https://localhost:6443/arcgis/admin/system/properties/update" \
+    --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
+    -d "token=$SERVER_TOKEN" \
+    -d "f=json" 2>/dev/null) || CTX_RESULT=""
+  echo "  Result: $CTX_RESULT"
+  if echo "$CTX_RESULT" | grep -q '"error"'; then
+    echo "  WARNING: Failed to set Server WebContextURL."
   else
-    wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
-
-    WA_PORTAL_RC=1
-    # Per Esri docs: -g is the machine name (FQDN) or URL of the Portal machine.
-    for PORTAL_GW in "$DOMAIN" "https://localhost:7443"; do
-      echo "Configuring Web Adaptor for Portal (gateway: $PORTAL_GW)..."
-      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
-        ./configurewebadaptor.sh \
-        -m portal \
-        -w "https://$DOMAIN/portal/webadaptor" \
-        -g "$PORTAL_GW" \
-        -u "$ADMIN_USER" \
-        -p "$ADMIN_PASS" 2>&1 && WA_PORTAL_RC=0 || WA_PORTAL_RC=$?
-      if [[ $WA_PORTAL_RC -eq 0 ]]; then
-        echo "Portal Web Adaptor configured successfully via configurewebadaptor.sh."
-        break
-      fi
-    done
-
-    # Fallback: register the Web Adaptor via Portal Admin REST API.
-    # This bypasses the config tool which can fail when the WAR's /webadaptor
-    # endpoint returns HTTP 400 (expected for unconfigured first-time setup).
-    if [[ $WA_PORTAL_RC -ne 0 ]]; then
-      echo ""
-      echo "configurewebadaptor.sh failed — falling back to REST API registration..."
-      PORTAL_TOKEN=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-        -d "username=$ADMIN_USER" \
-        -d "password=$ADMIN_PASS" \
-        -d "client=referer" \
-        -d "referer=https://$DOMAIN" \
-        -d "f=json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || PORTAL_TOKEN=""
-      if [[ -n "$PORTAL_TOKEN" ]]; then
-        MACHINE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-        MACHINE_FQDN=$(hostname -f 2>/dev/null || echo "$DOMAIN")
-        echo "Registering Portal Web Adaptor via REST API..."
-        REG_RESULT=$(curl -sk -X POST \
-          "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
-          -d "webAdaptorURL=https://$DOMAIN/portal" \
-          -d "machineName=$MACHINE_FQDN" \
-          -d "machineIP=$MACHINE_IP" \
-          -d "httpPort=80" \
-          -d "httpsPort=443" \
-          -d "isAdminEnabled=true" \
-          -d "token=$PORTAL_TOKEN" \
-          -d "f=json" 2>/dev/null) || REG_RESULT=""
-        echo "  Result: $REG_RESULT"
-        if echo "$REG_RESULT" | grep -q '"error"'; then
-          echo "  REST API registration failed. Manual configuration required."
-        else
-          echo "  Portal Web Adaptor registered via REST API."
-          WA_PORTAL_RC=0
-        fi
-      else
-        echo "  Could not get Portal token for REST API fallback."
-      fi
-    fi
-
-    if [[ $WA_PORTAL_RC -ne 0 ]]; then
-      echo "You can configure it manually later — see README."
-    fi
-    sleep 10
+    echo "  Server WebContextURL configured."
+    SERVER_CTX_OK=true
   fi
+fi
 
-  # --- Server Web Adaptor ---
-  SERVER_WA_STATUS=$(curl -sk "https://$DOMAIN/server/rest/info?f=json" 2>/dev/null || echo "")
-  if echo "$SERVER_WA_STATUS" | grep -q "currentVersion"; then
-    echo "Server Web Adaptor already configured, skipping..."
-  else
-    wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 120 || true
-
-    WA_SERVER_RC=1
-    # Per Esri docs: -g is the machine name (FQDN) or URL of the Server machine.
-    for SERVER_GW in "$DOMAIN" "https://localhost:6443"; do
-      echo "Configuring Web Adaptor for Server (gateway: $SERVER_GW)..."
-      sudo -u "$ARCGIS_USER" env JAVA_TOOL_OPTIONS="$JTO" \
-        ./configurewebadaptor.sh \
-        -m server \
-        -w "https://$DOMAIN/server/webadaptor" \
-        -g "$SERVER_GW" \
-        -u "$ADMIN_USER" \
-        -p "$ADMIN_PASS" \
-        -a true 2>&1 && WA_SERVER_RC=0 || WA_SERVER_RC=$?
-      if [[ $WA_SERVER_RC -eq 0 ]]; then
-        echo "Server Web Adaptor configured successfully via configurewebadaptor.sh."
-        break
-      fi
-    done
-
-    # Fallback: register the Web Adaptor via Server Admin REST API.
-    if [[ $WA_SERVER_RC -ne 0 ]]; then
-      echo ""
-      echo "configurewebadaptor.sh failed — falling back to REST API registration..."
-      SERVER_TOKEN=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
-        -d "username=$ADMIN_USER" \
-        -d "password=$ADMIN_PASS" \
-        -d "client=requestip" \
-        -d "f=json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null) || SERVER_TOKEN=""
-      if [[ -n "$SERVER_TOKEN" ]]; then
-        MACHINE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-        MACHINE_FQDN=$(hostname -f 2>/dev/null || echo "$DOMAIN")
-        echo "Registering Server Web Adaptor via REST API..."
-        REG_RESULT=$(curl -sk -X POST \
-          "https://localhost:6443/arcgis/admin/system/webadaptors/register" \
-          -d "webAdaptorURL=https://$DOMAIN/server" \
-          -d "machineName=$MACHINE_FQDN" \
-          -d "machineIP=$MACHINE_IP" \
-          -d "httpPort=80" \
-          -d "httpsPort=443" \
-          -d "isAdminEnabled=true" \
-          -d "token=$SERVER_TOKEN" \
-          -d "f=json" 2>/dev/null) || REG_RESULT=""
-        echo "  Result: $REG_RESULT"
-        if echo "$REG_RESULT" | grep -q '"error"'; then
-          echo "  REST API registration failed. Manual configuration required."
-        else
-          echo "  Server Web Adaptor registered via REST API."
-          WA_SERVER_RC=0
-        fi
-      else
-        echo "  Could not get Server token for REST API fallback."
-      fi
-    fi
-
-    if [[ $WA_SERVER_RC -ne 0 ]]; then
-      echo "You can configure it manually later — see README."
-    fi
-  fi
+if [[ "$PORTAL_CTX_OK" != "true" || "$SERVER_CTX_OK" != "true" ]]; then
+  echo ""
+  echo "WARNING: Reverse proxy configuration incomplete."
+  echo "  Portal: $( [ "$PORTAL_CTX_OK" = "true" ] && echo "OK" || echo "NEEDS ATTENTION" )"
+  echo "  Server: $( [ "$SERVER_CTX_OK" = "true" ] && echo "OK" || echo "NEEDS ATTENTION" )"
 fi
 
 # ==============================================================================
@@ -980,24 +926,10 @@ echo ""
 echo ">>> Step 15: Federating Server with Portal"
 echo ""
 
-get_portal_token() {
-  local _resp
-  _resp=$(curl -sk -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-    -d "username=$ADMIN_USER" \
-    -d "password=$ADMIN_PASS" \
-    -d "client=referer" \
-    -d "referer=https://$DOMAIN" \
-    -d "f=json" 2>/dev/null)
-  # Try jq first, fall back to python3
-  if command -v jq &>/dev/null; then
-    echo "$_resp" | jq -r '.token // empty'
-  else
-    echo "$_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null
-  fi
-}
+# Reuse generate_portal_token() defined in Step 13
 
 # Check if already federated
-PREV_TOKEN=$(get_portal_token 2>/dev/null) || true
+PREV_TOKEN=$(generate_portal_token 2>/dev/null) || true
 EXISTING_FEDERATION=""
 if [[ -n "${PREV_TOKEN:-}" && "$PREV_TOKEN" != "null" ]]; then
   EXISTING_FEDERATION=$(curl -sk \
@@ -1008,7 +940,7 @@ fi
 if echo "$EXISTING_FEDERATION" | grep -q '"id"'; then
   echo "Server is already federated with Portal, skipping..."
 else
-  TOKEN=$(get_portal_token) || true
+  TOKEN=$(generate_portal_token 2>/dev/null) || true
 
   if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
     echo "Federating ArcGIS Server with Portal..."
@@ -1034,7 +966,7 @@ else
       SERVERS=$(curl -sk \
         "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
         2>/dev/null) || true
-      FEDERATED_SERVER_ID=$(echo "$SERVERS" | jq -r '.servers[0].id // empty')
+      FEDERATED_SERVER_ID=$(echo "$SERVERS" | python3 -c "import sys,json; s=json.load(sys.stdin).get('servers',[]); print(s[0]['id'] if s else '')" 2>/dev/null) || FEDERATED_SERVER_ID=""
 
       if [[ -n "$FEDERATED_SERVER_ID" ]]; then
         HOSTING_RESULT=$(curl -sk -X POST \
