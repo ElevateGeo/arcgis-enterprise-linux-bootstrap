@@ -894,11 +894,26 @@ else
     echo "  Restarting ArcGIS Server before federation..."
     if [[ -f "$ESRI_BASE/arcgis/server/stopserver.sh" ]]; then
       sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
-      sleep 10
+      # Wait for the Server JVM process to actually die (up to 120s)
+      echo "  Waiting for Server process to stop..."
+      _stop_wait=0
+      while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+        if (( _stop_wait >= 120 )); then
+          echo "  Server process did not stop cleanly; force-killing..."
+          pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true
+          sleep 5
+          break
+        fi
+        sleep 5
+        _stop_wait=$((_stop_wait + 5))
+      done
+      echo "  Server stopped. (waited ${_stop_wait}s)"
+      sleep 5
     fi
     if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
       sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-      wait_for_service "https://localhost:6443/arcgis/admin?f=json" "Server" 180 || true
+      # /arcgis/rest/info returns currentVersion only when fully initialised
+      wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
     fi
 
     # 3. Discover Server's machine name (matches its SSL certificate)
