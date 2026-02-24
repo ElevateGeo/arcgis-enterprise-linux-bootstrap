@@ -1002,7 +1002,31 @@ except: print('    (could not parse)')" 2>/dev/null || true
     fi
 
     # ------------------------------------------------------------------
-    # Step 14c: Federate.
+    # Step 14c: Ensure Server machine name resolves locally.
+    # Portal's JVM looks up the adminUrl hostname before connecting.
+    # ArcGIS Server registers its machine name in uppercase (e.g.
+    # ARCGIS.INTERNAL.CLOUDAPP.NET) which is NOT in Azure DNS.
+    # Adding it to /etc/hosts makes Portal able to reach Server on
+    # the same VM via 127.0.0.1, and the SSL cert matches the name.
+    # ------------------------------------------------------------------
+    _SM_LOWER=$(echo "$SERVER_MACHINE" | tr '[:upper:]' '[:lower:]')
+    if ! grep -qiE "^\s*127\.0\.0\.1\s+.*$SERVER_MACHINE" /etc/hosts 2>/dev/null; then
+      echo "  Adding $SERVER_MACHINE → 127.0.0.1 in /etc/hosts (Portal needs it for adminUrl)..."
+      echo "127.0.0.1  $SERVER_MACHINE $_SM_LOWER" >> /etc/hosts
+    else
+      echo "  /etc/hosts already has entry for $SERVER_MACHINE."
+    fi
+
+    # Verify reachability — if this fails, we'll get the same "not accessible" error
+    if curl -sk --connect-timeout 10 \
+        "https://$SERVER_MACHINE:6443/arcgis/rest/info?f=json" > /dev/null 2>&1; then
+      echo "  Confirmed: Server is reachable at https://$SERVER_MACHINE:6443/arcgis"
+    else
+      echo "  WARNING: Server not reachable at https://$SERVER_MACHINE:6443/arcgis — federation may fail."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 14d: Federate.
     # url     = PUBLIC services URL (through NGINX reverse proxy) — this
     #           is what external clients use to reach Server services.
     # adminUrl = INTERNAL Server URL — what Portal uses for admin calls.
