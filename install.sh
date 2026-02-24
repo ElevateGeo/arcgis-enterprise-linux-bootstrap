@@ -338,6 +338,10 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host  $host;
         proxy_set_header X-Forwarded-Port  443;
+
+        # Rewrite redirect Location headers from backend → public URL
+        proxy_redirect https://localhost:7443/arcgis/ https://$host/portal/;
+        proxy_redirect ~*https?://[^/]+(:7443)?/arcgis/ https://$host/portal/;
     }
 
     # Server — direct reverse proxy to ArcGIS Server (port 6443)
@@ -354,6 +358,10 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host  $host;
         proxy_set_header X-Forwarded-Port  443;
+
+        # Rewrite redirect Location headers from backend → public URL
+        proxy_redirect https://localhost:6443/arcgis/ https://$host/server/;
+        proxy_redirect ~*https?://[^/]+(:6443)?/arcgis/ https://$host/server/;
     }
 
     # Default — redirect to Portal home
@@ -957,17 +965,31 @@ else
   if [[ -n "${TOKEN:-}" && "$TOKEN" != "null" ]]; then
     echo "Federating ArcGIS Server with Portal..."
 
-    # adminUrl must use the internal FQDN — Server's SSL cert is issued for
-    # the internal hostname, not the public domain.  Portal connects to Server
-    # admin on this URL directly (not through NGINX).
-    INTERNAL_FQDN=$(hostname -f 2>/dev/null || echo "localhost")
+    # adminUrl must use the hostname Server was created with — this matches
+    # Server's SSL certificate.  hostname -f may return a different Azure DNS
+    # name, so we discover the actual machine name from Server's admin API.
+    SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+    SERVER_MACHINE=""
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      SERVER_MACHINE=$(curl -sk \
+        "https://localhost:6443/arcgis/admin/machines?f=json&token=$SERVER_TOKEN_FED" \
+        2>/dev/null | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+for m in data.get('machines',[]):
+    print(m.get('machineName','')); break" 2>/dev/null) || SERVER_MACHINE=""
+    fi
+    if [[ -z "$SERVER_MACHINE" ]]; then
+      # Fallback: use hostname -f or localhost
+      SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
+    fi
     echo "  Services URL: https://$DOMAIN/server"
-    echo "  Admin URL:    https://$INTERNAL_FQDN:6443/arcgis"
+    echo "  Admin URL:    https://$SERVER_MACHINE:6443/arcgis"
 
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://$INTERNAL_FQDN:6443/arcgis" \
+      -d "adminUrl=https://$SERVER_MACHINE:6443/arcgis" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
