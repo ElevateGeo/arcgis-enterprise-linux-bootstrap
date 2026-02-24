@@ -766,26 +766,62 @@ echo ""
 echo ">>> Step 13: Configuring Reverse Proxy Integration"
 echo ""
 
-# Import the Let's Encrypt cert into ALL Java truststores on the system.
-LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-if [[ -f "$LE_CERT" ]]; then
-  echo "Importing Let's Encrypt certificate into all Java truststores..."
+# Import the Let's Encrypt INTERMEDIATE CA into all Java truststores.
+#
+# IMPORTANT — import chain.pem (the intermediate CA), NOT fullchain.pem.
+# fullchain.pem starts with the leaf/domain cert which changes every 90 days.
+# chain.pem contains only the CA intermediate(s) which are stable for years.
+# Importing the intermediate means any renewed leaf cert signed by the same CA
+# is automatically trusted — no truststore update needed on renewal.
+#
+# On renewal certbot replaces the symlinks; NGINX reloads via the deploy hook
+# installed below. Java truststores need no action unless Let's Encrypt rotates
+# to a new intermediate (rare — they announce it months in advance).
+# ---------------------------------------------------------------------------
+LE_CHAIN="/etc/letsencrypt/live/$DOMAIN/chain.pem"   # intermediate CA only
+LE_ALIAS="letsencrypt-intermediate"                   # stable alias, not domain-specific
+if [[ -f "$LE_CHAIN" ]]; then
+  echo "Importing Let's Encrypt intermediate CA into all Java truststores..."
+  # Get fingerprint of the current intermediate so we can detect CA rotation
+  _NEW_FP=$(openssl x509 -in "$LE_CHAIN" -fingerprint -sha256 -noout 2>/dev/null | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]') || _NEW_FP=""
+
   while IFS= read -r CACERTS_FILE; do
     KEYTOOL_BIN=$(dirname "$CACERTS_FILE")/../bin/keytool
-    if [[ ! -x "$KEYTOOL_BIN" ]]; then
-      KEYTOOL_BIN="keytool"
-    fi
-    if ! "$KEYTOOL_BIN" -list -keystore "$CACERTS_FILE" -storepass changeit \
-        -alias "letsencrypt-$DOMAIN" > /dev/null 2>&1; then
+    [[ ! -x "$KEYTOOL_BIN" ]] && KEYTOOL_BIN="keytool"
+
+    # Check if the SAME intermediate is already present (compare fingerprint)
+    _CUR_FP=$("$KEYTOOL_BIN" -list -keystore "$CACERTS_FILE" -storepass changeit \
+      -alias "$LE_ALIAS" -v 2>/dev/null \
+      | grep -i 'SHA-256\|SHA256' | head -1 \
+      | grep -oP '[0-9A-Fa-f:]{95}' | tr -d ':' | tr '[:upper:]' '[:lower:]') || _CUR_FP=""
+
+    if [[ -n "$_NEW_FP" && "$_CUR_FP" == "$_NEW_FP" ]]; then
+      echo "  Already imported: $CACERTS_FILE"
+    else
+      # Remove stale entry (different intermediate or missing) then re-import
+      "$KEYTOOL_BIN" -delete -keystore "$CACERTS_FILE" -storepass changeit \
+        -alias "$LE_ALIAS" 2>/dev/null || true
       echo "  Importing into: $CACERTS_FILE"
       "$KEYTOOL_BIN" -importcert -trustcacerts -keystore "$CACERTS_FILE" \
-        -storepass changeit -alias "letsencrypt-$DOMAIN" \
-        -file "$LE_CERT" -noprompt 2>/dev/null || true
-    else
-      echo "  Already imported: $CACERTS_FILE"
+        -storepass changeit -alias "$LE_ALIAS" \
+        -file "$LE_CHAIN" -noprompt 2>/dev/null || true
     fi
   done < <(find /opt/esri /usr/lib/jvm /etc/ssl -name "cacerts" -type f 2>/dev/null | sort -u)
 fi
+
+# ---------------------------------------------------------------------------
+# Install a certbot deploy hook so NGINX reloads automatically after every
+# renewal. Java truststores don't need updating unless the CA intermediate
+# changes (handled above on the next install.sh run).
+# ---------------------------------------------------------------------------
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'HOOK_EOF'
+#!/bin/bash
+# Reload NGINX to pick up the renewed certificate.
+systemctl reload nginx || systemctl restart nginx
+HOOK_EOF
+chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+echo "  Certbot deploy hook installed: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
 
 # ---------------------------------------------------------------------------
 # Helper: generate a Portal admin token (tries multiple approaches)
