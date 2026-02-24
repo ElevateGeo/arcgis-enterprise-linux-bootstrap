@@ -728,6 +728,21 @@ if [[ -f "$CATALINA_LOG" ]]; then
   echo ""
 fi
 
+# Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 errors appear
+LOCALHOST_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
+if [[ -n "$LOCALHOST_LOG" && -f "$LOCALHOST_LOG" ]]; then
+  echo "  Last 30 lines of $LOCALHOST_LOG:"
+  tail -30 "$LOCALHOST_LOG" 2>/dev/null | sed 's/^/    /'
+  echo ""
+fi
+
+# If getting 500 errors, grab the response body for diagnosis
+if [[ "$HTTP_CODE" == "500" ]]; then
+  echo "  HTTP 500 response body from http://localhost:8080/portal/:"
+  curl -sk "http://localhost:8080/portal/" 2>/dev/null | head -50 | sed 's/^/    /'
+  echo ""
+fi
+
 # Import the Let's Encrypt cert into ALL Java truststores on the system.
 LE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
 if [[ -f "$LE_CERT" ]]; then
