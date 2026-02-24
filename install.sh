@@ -760,27 +760,33 @@ fi
 generate_portal_token() {
   local _resp _token _host
 
-  # Approach 1: portaladmin endpoint on localhost (most reliable — healthCheck works here)
-  _resp=$(curl -skL -X POST "https://localhost:7443/arcgis/portaladmin/generateToken" \
+  # Portal redirects localhost → internal FQDN, and curl drops POST body on
+  # redirect unless --post301/--post302 are given.  Best approach: use the
+  # internal FQDN that Portal was created with to avoid redirects entirely.
+  _host=$(hostname -f 2>/dev/null) || _host=""
+
+  # Approach 1: internal FQDN + sharing/rest (avoids redirect)
+  if [[ -n "$_host" ]]; then
+    _resp=$(curl -sk -X POST "https://$_host:7443/arcgis/sharing/rest/generateToken" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
+    _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  fi
+
+  # Approach 2: localhost with --post301 --post302 to preserve POST through redirect
+  _resp=$(curl -sk --post301 --post302 -L -X POST \
+    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
     -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
 
-  # Approach 2: sharing/rest endpoint on internal FQDN (Portal may redirect localhost)
-  _host=$(hostname -f 2>/dev/null | tr '[:upper:]' '[:lower:]') || _host=""
-  if [[ -n "$_host" ]]; then
-    _resp=$(curl -skL -X POST "https://$_host:7443/arcgis/sharing/rest/generateToken" \
-      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
-    _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
-    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
-  fi
-
-  # Approach 3: sharing/rest on localhost with redirect following
-  _resp=$(curl -skL -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+  # Approach 3: portaladmin endpoint with --post301 --post302
+  _resp=$(curl -sk --post301 --post302 -L -X POST \
+    "https://localhost:7443/arcgis/portaladmin/generateToken" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+    -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
 
