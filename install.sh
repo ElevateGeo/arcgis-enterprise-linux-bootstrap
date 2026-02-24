@@ -525,6 +525,15 @@ elif [[ -n "$WA_WAR" ]]; then
   chown "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/server.war"
   systemctl restart "$TOMCAT_SERVICE"
   sleep 15
+
+  # Ensure tomcat user owns all exploded content and work directory
+  for WA_CTX in portal server; do
+    if [[ -d "$TOMCAT_WEBAPPS/$WA_CTX" ]]; then
+      chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_WEBAPPS/$WA_CTX"
+    fi
+  done
+  mkdir -p "$TOMCAT_HOME/work"
+  chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_HOME/work"
 fi
 
 # ==============================================================================
@@ -711,12 +720,16 @@ for WA_CTX in portal server; do
   fi
 done
 
-# Test endpoints
+# Test endpoints (capture 500 response bodies inline for diagnosis)
 echo "Pre-flight: testing Tomcat Web Adaptor endpoints..."
 for TEST_URL in "http://localhost:8080/portal/" "http://localhost:8080/server/" \
                 "http://localhost:8080/portal/webadaptor" "http://localhost:8080/server/webadaptor"; do
   HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$TEST_URL" 2>/dev/null || echo "000")
   echo "  $TEST_URL → HTTP $HTTP_CODE"
+  if [[ "$HTTP_CODE" == "500" ]]; then
+    echo "    --- 500 Response Body (first 30 lines) ---"
+    curl -sk "$TEST_URL" 2>/dev/null | head -30 | sed 's/^/    /'
+  fi
 done
 
 # Show last 15 lines of Tomcat log for deployment diagnosis
@@ -728,18 +741,29 @@ if [[ -f "$CATALINA_LOG" ]]; then
   echo ""
 fi
 
-# Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 errors appear
+# Show Tomcat's app-level error log (localhost.DATE.log) — this is where 500 stack traces appear
+# Dump the FULL log to capture the exception message at the top, not just the bottom frames.
 LOCALHOST_LOG=$(ls -t "$TOMCAT_HOME"/logs/localhost.*.log 2>/dev/null | head -1)
 if [[ -n "$LOCALHOST_LOG" && -f "$LOCALHOST_LOG" ]]; then
-  echo "  Last 30 lines of $LOCALHOST_LOG:"
-  tail -30 "$LOCALHOST_LOG" 2>/dev/null | sed 's/^/    /'
+  echo "  Full $LOCALHOST_LOG:"
+  cat "$LOCALHOST_LOG" 2>/dev/null | sed 's/^/    /'
   echo ""
 fi
 
-# If getting 500 errors, grab the response body for diagnosis
-if [[ "$HTTP_CODE" == "500" ]]; then
-  echo "  HTTP 500 response body from http://localhost:8080/portal/:"
-  curl -sk "http://localhost:8080/portal/" 2>/dev/null | head -50 | sed 's/^/    /'
+# Show any SEVERE / context-init-failure lines from catalina.out
+if [[ -f "$CATALINA_LOG" ]]; then
+  SEVERE_LINES=$(grep -i 'SEVERE\|WARN.*Exception\|context.*fail\|StandardContext.*listenerStart' "$CATALINA_LOG" 2>/dev/null | tail -20)
+  if [[ -n "$SEVERE_LINES" ]]; then
+    echo "  SEVERE / init-failure entries in catalina.out:"
+    echo "$SEVERE_LINES" | sed 's/^/    /'
+    echo ""
+  fi
+fi
+
+# Show servlet mappings (helps verify the WAR structure is intact)
+if [[ -f "$TOMCAT_WEBAPPS/portal/WEB-INF/web.xml" ]]; then
+  echo "  Servlet mappings in portal webapp (WEB-INF/web.xml):"
+  grep -A2 'servlet-mapping\|url-pattern\|servlet-class' "$TOMCAT_WEBAPPS/portal/WEB-INF/web.xml" 2>/dev/null | head -40 | sed 's/^/    /'
   echo ""
 fi
 
