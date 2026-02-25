@@ -256,12 +256,18 @@ fi
 
 echo "Using Tomcat 10 at: $TOMCAT_HOME"
 
-# Ensure the VM can resolve its own FQDN to localhost.
-# Azure/cloud VMs often cannot hairpin through the public IP, so
-# configurewebadaptor.sh (and other tools) fail to reach https://$DOMAIN.
-if ! grep -q "$DOMAIN" /etc/hosts 2>/dev/null; then
-  echo "Adding $DOMAIN to /etc/hosts for local resolution..."
+# Ensure the VM can resolve its own FQDN to localhost (127.0.0.1).
+# We specifically check if the domain is mapped to 127.0.0.1, not just "present in the file".
+# This prevents issues where the domain might be mapped to the private networking IP
+# (which can fail hairpinning) or the public IP (which usually fails hairpinning).
+if ! grep -q "127.0.0.1.*$DOMAIN" /etc/hosts 2>/dev/null; then
+  echo "Adding 127.0.0.1 $DOMAIN to /etc/hosts for local resolution..."
+  # If the domain is already there (e.g. on another IP), we append the localhost entry.
+  # Most resolvers prioritize /etc/hosts order, but having a distinct 127.0.0.1 entry 
+  # is usually sufficient for curl/local tools.
   echo "127.0.0.1  $DOMAIN" >> /etc/hosts
+else
+  echo "Host logic: $DOMAIN is already mapped to 127.0.0.1 in /etc/hosts."
 fi
 
 # ==============================================================================
@@ -659,22 +665,21 @@ wait_for_server() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: generate a Portal admin token via localhost (client=ip&ip=127.0.0.1
-# prevents the token being bound to the VM private IP which would cause 498
-# errors when subsequent calls arrive via 127.0.0.1).
+# Helper: generate a Portal admin token
 # ---------------------------------------------------------------------------
 generate_portal_token() {
   local _resp _token
 
-  # Try portaladmin/generateToken first (admin-scoped), then sharing/rest as
-  # fallback — both via localhost so the bound IP is 127.0.0.1.
+  # Try portaladmin/generateToken first (admin-scoped), then sharing/rest as fallback.
+  # Use client=referer for robustness against IP changes/NAT loopbacks.
   local _ep
   for _ep in \
     "https://localhost:7443/arcgis/portaladmin/generateToken" \
     "https://localhost:7443/arcgis/sharing/rest/generateToken"; do
     _resp=$(curl -sk --post301 --post302 -L -X POST "$_ep" \
+      -H "Referer: https://localhost:7443/arcgis" \
       -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=ip" -d "ip=127.0.0.1" \
+      -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
       -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
     _token=$(echo "$_resp" | python3 -c "
 import sys,json
@@ -694,10 +699,12 @@ except: pass" 2>/dev/null) || _token=""
 # ---------------------------------------------------------------------------
 generate_server_token() {
   local _resp _token
-  # Use client=ip and ip=127.0.0.1 to ensure the token is valid for local admin usage
+  # Use client=referer to avoid IP mismatches (e.g. 127.0.0.1 vs ::1)
   _resp=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
+    -H "Referer: https://localhost:6443/arcgis/admin" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=ip" -d "ip=127.0.0.1" -d "expiration=60" \
+    -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
+    -d "expiration=60" \
     -d "f=json" 2>/dev/null) || _resp=""
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
@@ -1079,12 +1086,13 @@ else
     # Step 14c: Federate.
     #
     # We use the internal local URL for the 'adminUrl' to ensure Portal
-    # can communicate with Server reliably inside the VM/container, bypassing
-    # any hairpin nat or self-signed cert trust issues with the public domain.
-    # Public clients will still use the 'url' (services URL).
+    # can communipublic URL for both 'url' and 'adminUrl', assuming local
+    # DNS resolution (via /etc/hosts) routes this to localhost/127.0.0.1.
+    # This avoids ClassCastException issues caused by protocol mismatches
+    # or unexpected URL patterns (e.g. using localhost directly).
     # ------------------------------------------------------------------
     echo "  Services URL: https://$DOMAIN/server"
-    echo "  Admin URL:    https://localhost:6443/arcgis"
+    echo "  Admin URL:    https://$DOMAIN/server"
 
     # Refresh the Portal token immediately before calling federate.
     TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
@@ -1093,13 +1101,11 @@ else
       echo "ERROR: Could not refresh Portal token before federation. Aborting."
     else
 
-    # NOTE: We use localhost for adminUrl to avoid 400 "not accessible" errors
-    # if Portal cannot resolve/reach the public domain from within the VM.
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
+      -H "Referer: https://localhost:7443/arcgis" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://localhost:6443/arcgis" \
-      -d "username=$ADMIN_USER" \
+      -d "adminUrl=https://$DOMAIN/server
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
       -d "f=json" 2>/dev/null) || FEDERATE_RESULT=""
