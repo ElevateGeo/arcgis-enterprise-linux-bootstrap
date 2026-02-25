@@ -834,22 +834,25 @@ else
   fi
   # else: Server isn't up enough to query — createsite will handle it
 
-  # Give the admin endpoint a moment to be ready for createsite.sh
-  # (wait_for_server checks REST; admin takes a few extra seconds after that)
-  echo "  Waiting for Server admin endpoint before running createsite..."
+  # Give the admin endpoint a moment to be ready for createsite.sh.
+  # createsite.sh internally polls /arcgis/rest/info/healthCheck — wait for
+  # that to succeed before invoking it to avoid "Failed for healthcheck" errors.
+  echo "  Waiting for Server healthCheck before running createsite..."
   _cs_wait=0
   while (( _cs_wait < 120 )); do
-    _cs_info=$(curl -sk "https://localhost:6443/arcgis/admin/info?f=json" 2>/dev/null) || _cs_info=""
-    # Admin is ready when it responds — even "no site" is a valid response
-    if [[ -n "$_cs_info" ]]; then
-      echo "  Server admin endpoint is responding."
+    _hc=$(curl -sk "https://localhost:6443/arcgis/rest/info/healthCheck?f=json" 2>/dev/null) || _hc=""
+    if echo "$_hc" | grep -q '"success"'; then
+      echo "  Server healthCheck passed."
       break
     fi
     sleep 5; _cs_wait=$((_cs_wait + 5))
-    (( _cs_wait % 30 == 0 )) && echo "    ... still waiting for admin endpoint (${_cs_wait}s)"
+    (( _cs_wait % 30 == 0 )) && echo "    ... still waiting for healthCheck (${_cs_wait}s)"
   done
 
-  # Now create (or recreate) the site
+  # Now create (or recreate) the site.
+  # IMPORTANT: use "|| _cs_rc=$?" not "|| true" so we capture the real exit
+  # code without triggering set -e (which would kill the script).
+  _cs_rc=0
   if [[ -f "$CREATESITE_TOOL" ]]; then
     echo "Creating ArcGIS Server site using createsite.sh..."
     chmod +x "$CREATESITE_TOOL"
@@ -857,8 +860,7 @@ else
       -u "$ADMIN_USER" \
       -p "$ADMIN_PASS" \
       -d "$ESRI_BASE/arcgis/server/usr/directories" \
-      -c "$SERVER_CS" 2>&1)
-    _cs_rc=$?
+      -c "$SERVER_CS" 2>&1) || _cs_rc=$?
     echo "$_cs_out"
     if (( _cs_rc != 0 )); then
       echo "  WARNING: createsite.sh exited with code $_cs_rc — will still wait for health check."
