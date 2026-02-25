@@ -805,21 +805,24 @@ wipe_server_config_store() {
   done
 
   # Wipe Config Store
-  local _cs_bak="${SERVER_CS}.bak.$(date +%s)"
-  mv "$SERVER_CS" "$_cs_bak" 2>/dev/null || rm -rf "$SERVER_CS"
-  echo "  Config-store backed up to $_cs_bak"
+  local _cs_bak="${ESRI_BASE}/arcgis/server/usr/config-store.bak.$(date +%s)"
+  if [[ -d "$SERVER_CS" ]]; then
+    # remove content recursively instead of moving the folder to avoid permission issues
+    # or "device busy" errors if it's a mount point.
+    rm -rf "$SERVER_CS"/* "$SERVER_CS"/.* 2>/dev/null || true
+    echo "  Config-store wiped."
+  fi
   mkdir -p "$SERVER_CS"
-  chown "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
 
   # Wipe Server Directories (critical for clean createsite)
   local _dirs="$ESRI_BASE/arcgis/server/usr/directories"
-  local _dirs_bak="${_dirs}.bak.$(date +%s)"
   if [[ -d "$_dirs" ]]; then
-    mv "$_dirs" "$_dirs_bak" 2>/dev/null || rm -rf "$_dirs"
-    echo "  Server directories backed up to $_dirs_bak"
+    rm -rf "$_dirs"/* "$_dirs"/.* 2>/dev/null || true
+    echo "  Server directories wiped."
   fi
   mkdir -p "$_dirs"
-  chown "$ARCGIS_USER:$ARCGIS_USER" "$_dirs"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$_dirs"
 
   echo "  Starting Server with fresh config-store and directories..."
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
@@ -1075,34 +1078,27 @@ else
     # ------------------------------------------------------------------
     # Step 14c: Federate.
     #
-    # Per Esri docs for cloud/reverse-proxy environments:
-    #   url      = public reverse proxy URL (external clients use this)
-    #   adminUrl = ALSO the reverse proxy URL — Portal uses this for all
-    #              admin calls to Server. Because NGINX proxies /server/
-    #              to localhost:6443/arcgis/, Portal reaches Server via
-    #              the trusted Let's Encrypt cert instead of Server's
-    #              self-signed cert on port 6443.
-    #
-    # "If your ArcGIS Server is hosted in a cloud environment, use the
-    #  Web Adaptor or load balancer URL in this field instead."
-    #   — Esri Enterprise 12.0 federation docs
+    # We use the internal local URL for the 'adminUrl' to ensure Portal
+    # can communicate with Server reliably inside the VM/container, bypassing
+    # any hairpin nat or self-signed cert trust issues with the public domain.
+    # Public clients will still use the 'url' (services URL).
     # ------------------------------------------------------------------
     echo "  Services URL: https://$DOMAIN/server"
-    echo "  Admin URL:    https://$DOMAIN/server  (reverse proxy — trusted LE cert)"
+    echo "  Admin URL:    https://localhost:6443/arcgis"
 
     # Refresh the Portal token immediately before calling federate.
-    # Steps above (Server WebContextURL update, etc.) can take > 60s,
-    # expiring the token generated at the top of this block.
     TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
     FEDERATE_RESULT=""
     if [[ -z "${TOKEN:-}" ]]; then
       echo "ERROR: Could not refresh Portal token before federation. Aborting."
     else
 
+    # NOTE: We use localhost for adminUrl to avoid 400 "not accessible" errors
+    # if Portal cannot resolve/reach the public domain from within the VM.
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://$DOMAIN/server" \
+      -d "adminUrl=https://localhost:6443/arcgis" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
