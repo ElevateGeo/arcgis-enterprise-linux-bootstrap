@@ -629,9 +629,33 @@ wait_for_service() {
   return 1
 }
 
-# Server needs up to 8 min on first start (site creation / fresh install)
+# Server needs up to 8 min on first start (site creation / fresh install).
+# If the process is alive but port 6443 is not responding (broken init state
+# from a prior failed run), force a stop/start cycle before giving up.
 wait_for_server() {
-  wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 480
+  # Fast path: already responding
+  if curl -sk --connect-timeout 5 \
+      "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null \
+      | grep -q "currentVersion"; then
+    echo "ArcGIS Server is ready."
+    return 0
+  fi
+
+  # Wait up to 4 min for a clean start
+  wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 240 && return 0
+
+  # Still not up — the process may be running but stuck (broken security
+  # init state). Force a restart.
+  echo "  ArcGIS Server process is running but not responding — forcing restart..."
+  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+  _sw=0
+  while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+    (( _sw >= 60 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
+    sleep 5; _sw=$((_sw+5))
+  done
+  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+  echo "  Restarted. Waiting up to 5 min for Server..."
+  wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 300
 }
 
 # ==============================================================================
@@ -835,40 +859,41 @@ chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 echo "  Certbot deploy hook installed: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
 
 # ---------------------------------------------------------------------------
-# Helper: generate a Portal admin token (tries multiple approaches)
+# Helper: generate a Portal admin token
+# Tries portaladmin/generateToken FIRST — this produces an admin-scoped token
+# that is accepted by all portaladmin/* endpoints including federation.
+# sharing/rest/generateToken produces a REST-scoped token that some admin
+# endpoints reject with code 498.
 # ---------------------------------------------------------------------------
 generate_portal_token() {
   local _resp _token _host
-
-  # Portal redirects localhost → internal FQDN, and curl drops POST body on
-  # redirect unless --post301/--post302 are given.  Best approach: use the
-  # internal FQDN that Portal was created with to avoid redirects entirely.
   _host=$(hostname -f 2>/dev/null) || _host=""
 
-  # Approach 1: internal FQDN + sharing/rest (avoids redirect)
+  # Approach 1: portaladmin/generateToken via internal FQDN (admin-scoped token)
   if [[ -n "$_host" ]]; then
-    _resp=$(curl -sk -X POST "https://$_host:7443/arcgis/sharing/rest/generateToken" \
+    _resp=$(curl -sk -X POST "https://$_host:7443/arcgis/portaladmin/generateToken" \
       -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
+      -d "client=requestip" -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
     _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
     if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
   fi
 
-  # Approach 2: localhost with --post301 --post302 to preserve POST through redirect
-  _resp=$(curl -sk --post301 --post302 -L -X POST \
-    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
-  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
-  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
-
-  # Approach 3: portaladmin endpoint with --post301 --post302
+  # Approach 2: portaladmin/generateToken via localhost with redirect follow
   _resp=$(curl -sk --post301 --post302 -L -X POST \
     "https://localhost:7443/arcgis/portaladmin/generateToken" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=requestip" -d "expiration=60" -d "f=json" 2>/dev/null) || _resp=""
+    -d "client=requestip" -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+
+  # Approach 3: sharing/rest/generateToken via internal FQDN (REST-scoped fallback)
+  if [[ -n "$_host" ]]; then
+    _resp=$(curl -sk -X POST "https://$_host:7443/arcgis/sharing/rest/generateToken" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=requestip" -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
+    _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  fi
 
   # All failed — emit debug info on stderr
   echo "DEBUG: Portal generateToken last response: $_resp" >&2
