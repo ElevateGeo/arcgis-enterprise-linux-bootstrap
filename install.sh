@@ -658,6 +658,51 @@ wait_for_server() {
   wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 300
 }
 
+# ---------------------------------------------------------------------------
+# Helper: generate a Portal admin token via localhost (client=ip&ip=127.0.0.1
+# prevents the token being bound to the VM private IP which would cause 498
+# errors when subsequent calls arrive via 127.0.0.1).
+# ---------------------------------------------------------------------------
+generate_portal_token() {
+  local _resp _token
+
+  # Try portaladmin/generateToken first (admin-scoped), then sharing/rest as
+  # fallback — both via localhost so the bound IP is 127.0.0.1.
+  local _ep
+  for _ep in \
+    "https://localhost:7443/arcgis/portaladmin/generateToken" \
+    "https://localhost:7443/arcgis/sharing/rest/generateToken"; do
+    _resp=$(curl -sk --post301 --post302 -L -X POST "$_ep" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=ip" -d "ip=127.0.0.1" \
+      -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
+    _token=$(echo "$_resp" | python3 -c "
+import sys,json
+try:
+  t=json.load(sys.stdin).get('token','')
+  print(t if t else '')
+except: pass" 2>/dev/null) || _token=""
+    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  done
+
+  echo "DEBUG: Portal generateToken last response: $_resp" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: generate a Server admin token
+# ---------------------------------------------------------------------------
+generate_server_token() {
+  local _resp _token
+  _resp=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  echo "DEBUG: Server generateToken response: $_resp" >&2
+  return 1
+}
+
 # ==============================================================================
 # Step 10: Start ArcGIS Services
 # ==============================================================================
@@ -719,41 +764,68 @@ CREATESITE_TOOL="$ESRI_BASE/arcgis/server/tools/createsite/createsite.sh"
 SERVER_ADMIN_URL="https://localhost:6443/arcgis/admin"
 SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store"
 
-# Distinguish three states:
-#  A) Admin healthy (/admin/info returns currentVersion) — skip
-#  B) REST up but admin broken                           — wipe config-store, recreate
-#  C) Neither responding                                 — create fresh site
-SERVER_ADMIN_RESP=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null || echo "")
-SERVER_REST_RESP=$(curl -sk  "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || echo "")
+# ---------------------------------------------------------------------------
+# Helper: test if Server admin is TRULY healthy (info + token generation).
+# /admin/info returns currentVersion even when the security subsystem is
+# broken (SecurityConfig null). Token generation is the real proof that the
+# admin layer is fully functional.
+# ---------------------------------------------------------------------------
+server_admin_is_healthy() {
+  local _info _tok
+  _info=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
+  echo "$_info" | grep -q '"currentVersion"' || return 1
+  _tok=$(generate_server_token 2>/dev/null) || return 1
+  [[ -n "$_tok" ]] || return 1
+  return 0
+}
 
-if echo "$SERVER_ADMIN_RESP" | grep -q '"currentVersion"'; then
-  echo "ArcGIS Server site already exists and admin is healthy, skipping..."
+# ---------------------------------------------------------------------------
+# Wipe the config-store so createsite.sh starts from a clean slate.
+# Called when admin is known-broken regardless of whether /admin/info works.
+# ---------------------------------------------------------------------------
+wipe_server_config_store() {
+  echo "  Stopping Server to wipe config-store..."
+  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+  local _sw=0
+  while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+    (( _sw >= 90 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
+    sleep 5; _sw=$((_sw+5))
+  done
+  local _bak="${SERVER_CS}.bak.$(date +%s)"
+  mv "$SERVER_CS" "$_bak" 2>/dev/null || rm -rf "$SERVER_CS"
+  echo "  Config-store backed up to $_bak"
+  mkdir -p "$SERVER_CS"
+  chown "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
+  echo "  Starting Server with fresh config-store..."
+  sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+  # Wait for REST endpoint, which is what createsite.sh checks internally.
+  # /admin/info may not respond on a fresh (no-site) Server instance.
+  wait_for_server || echo "  WARNING: Server did not come up within expected time after wipe."
+}
+
+# Determine Server state and act accordingly:
+#   Healthy  = /admin/info + token generation both succeed  → skip
+#   Degraded = /admin/info succeeds but token fails          → wipe + recreate
+#   Down     = /admin/info fails (no site or admin unreachable) → create (or wipe+create)
+if server_admin_is_healthy; then
+  echo "ArcGIS Server site exists and admin is healthy, skipping..."
 else
-  if echo "$SERVER_REST_RESP" | grep -q '"currentVersion"'; then
-    # State B: REST is up but admin layer is broken (e.g. after a security
-    # wipe that left config-store corrupt).  Wipe and recreate.
-    echo "  Server REST is up but admin is broken — wiping config-store and recreating site..."
-    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
-    _sw=0
-    while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
-      (( _sw >= 60 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
-      sleep 5; _sw=$((_sw+5))
-    done
-    # Back up rather than delete, in case manual recovery is needed
-    _CS_BAK="${SERVER_CS}.bak.$(date +%s)"
-    mv "$SERVER_CS" "$_CS_BAK" 2>/dev/null || rm -rf "$SERVER_CS"
-    echo "  Old config-store backed up to $_CS_BAK"
-    mkdir -p "$SERVER_CS"
-    chown "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
-    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-    wait_for_server || true
-  fi
+  SERVER_ADMIN_JSON=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null || echo "")
+  SERVER_REST_JSON=$(curl -sk "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || echo "")
 
-  # State B continued, or State C: create site
-  SERVER_ADMIN_RESP=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null || echo "")
-  if echo "$SERVER_ADMIN_RESP" | grep -q '"currentVersion"'; then
-    echo "ArcGIS Server site already exists (post-restart check), skipping..."
-  elif [[ -f "$CREATESITE_TOOL" ]]; then
+  if echo "$SERVER_ADMIN_JSON" | grep -q '"currentVersion"'; then
+    # Site exists on disk but security/token broken — wipe and recreate
+    echo "  Server admin responds but token generation failed (broken security state)."
+    wipe_server_config_store
+  elif echo "$SERVER_REST_JSON" | grep -q '"currentVersion"'; then
+    # REST is partially up but admin is down — also wipe
+    echo "  Server REST is up but admin is unreachable — wiping config-store."
+    wipe_server_config_store
+  fi
+  # else: Server isn't up enough to query — createsite will handle it
+
+  # Now create (or recreate) the site
+  if [[ -f "$CREATESITE_TOOL" ]]; then
     echo "Creating ArcGIS Server site using createsite.sh..."
     chmod +x "$CREATESITE_TOOL"
     sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
@@ -761,9 +833,6 @@ else
       -p "$ADMIN_PASS" \
       -d "$ESRI_BASE/arcgis/server/usr/directories" \
       -c "$SERVER_CS" || true
-    echo "  Waiting for Server admin to come online after site creation..."
-    sleep 30
-    wait_for_server || true
   else
     echo "Creating ArcGIS Server site via REST API..."
     curl -sk -X POST "$SERVER_ADMIN_URL/createNewSite" \
@@ -772,8 +841,21 @@ else
       -d "configStoreConnection={\"connectionString\":\"$SERVER_CS\",\"type\":\"FILESYSTEM\"}" \
       -d "directories={\"directories\":[{\"name\":\"arcgiscache\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgiscache\",\"directoryType\":\"CACHE\"},{\"name\":\"arcgisjobs\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgisjobs\",\"directoryType\":\"JOBS\"},{\"name\":\"arcgisoutput\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgisoutput\",\"directoryType\":\"OUTPUT\"},{\"name\":\"arcgissystem\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgissystem\",\"directoryType\":\"SYSTEM\"}]}" \
       -d "f=json" || true
-    sleep 30
-    wait_for_server || true
+  fi
+
+  # Wait for admin to be fully operational (token generation must succeed)
+  echo "  Waiting for Server admin to be fully ready after site creation..."
+  _elapsed=0
+  while (( _elapsed < 300 )); do
+    if server_admin_is_healthy; then
+      echo "  Server admin is healthy."
+      break
+    fi
+    sleep 15; _elapsed=$((_elapsed + 15))
+    echo "  ... still waiting for Server admin (${_elapsed}s)"
+  done
+  if ! server_admin_is_healthy; then
+    echo "  ERROR: Server admin did not become healthy within 300s. Check Server logs."
   fi
 fi
 
@@ -888,56 +970,6 @@ systemctl reload nginx || systemctl restart nginx
 HOOK_EOF
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 echo "  Certbot deploy hook installed: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
-
-# ---------------------------------------------------------------------------
-# Helper: generate a Portal admin token
-#
-# CRITICAL: use client=ip + ip=127.0.0.1 so the token is explicitly bound to
-# the loopback address.  All our API calls also go to https://localhost:7443
-# (127.0.0.1).  Using client=requestip with a hostname-based URL binds the
-# token to the VM's private IP; subsequent calls to localhost (a different
-# IP) get rejected with code 498.  Keep token URLs and API URLs on the same
-# address.
-# ---------------------------------------------------------------------------
-generate_portal_token() {
-  local _resp _token
-
-  # Try portaladmin/generateToken first (admin-scoped, best for portaladmin/*)
-  # then sharing/rest as fallback, both via localhost so IP = 127.0.0.1.
-  local _ep
-  for _ep in \
-    "https://localhost:7443/arcgis/portaladmin/generateToken" \
-    "https://localhost:7443/arcgis/sharing/rest/generateToken"; do
-    _resp=$(curl -sk --post301 --post302 -L -X POST "$_ep" \
-      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=ip" -d "ip=127.0.0.1" \
-      -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
-    _token=$(echo "$_resp" | python3 -c "
-import sys,json
-try:
-  t=json.load(sys.stdin).get('token','')
-  print(t if t else '')
-except: pass" 2>/dev/null) || _token=""
-    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
-  done
-
-  echo "DEBUG: Portal generateToken last response: $_resp" >&2
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# Helper: generate a Server admin token
-# ---------------------------------------------------------------------------
-generate_server_token() {
-  local _resp _token
-  _resp=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
-    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
-  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
-  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
-  echo "DEBUG: Server generateToken response: $_resp" >&2
-  return 1
-}
 
 # ==============================================================================
 # Step 14: Federate Server with Portal
