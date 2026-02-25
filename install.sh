@@ -820,19 +820,11 @@ wipe_server_config_store() {
 if server_admin_is_healthy; then
   echo "ArcGIS Server site exists and admin is healthy, skipping..."
 else
-  SERVER_ADMIN_JSON=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null || echo "")
-  SERVER_REST_JSON=$(curl -sk "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || echo "")
-
-  if echo "$SERVER_ADMIN_JSON" | grep -q '"currentVersion"'; then
-    # Site exists on disk but security/config broken — wipe and recreate
-    echo "  Server admin responds but /admin/security/config is broken."
-    wipe_server_config_store
-  elif echo "$SERVER_REST_JSON" | grep -q '"currentVersion"'; then
-    # REST is partially up but admin is down — also wipe
-    echo "  Server REST is up but admin is unreachable — wiping config-store."
-    wipe_server_config_store
-  fi
-  # else: Server isn't up enough to query — createsite will handle it
+  # If the admin is not 100% healthy, we assume the site is broken or non-existent.
+  # We FORCE a wipe of the config-store to ensure a clean slate for createsite.sh.
+  # Previous attempts to detect "if site exists but broken" were flaky.
+  echo "  Server admin is not fully healthy (missing token or config) — wiping config-store to force fresh creation."
+  wipe_server_config_store
 
   # Give the admin endpoint a moment to be ready for createsite.sh.
   # createsite.sh internally polls /arcgis/rest/info/healthCheck — wait for
