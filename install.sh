@@ -694,9 +694,11 @@ except: pass" 2>/dev/null) || _token=""
 # ---------------------------------------------------------------------------
 generate_server_token() {
   local _resp _token
+  # Use client=ip and ip=127.0.0.1 to ensure the token is valid for local admin usage
   _resp=$(curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=requestip" -d "f=json" 2>/dev/null) || _resp=""
+    -d "client=ip" -d "ip=127.0.0.1" -d "expiration=60" \
+    -d "f=json" 2>/dev/null) || _resp=""
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
   echo "DEBUG: Server generateToken response: $_resp" >&2
@@ -1051,23 +1053,24 @@ else
   else
 
     # ------------------------------------------------------------------
-    # Step 14a: Set Server WebContextURL to the public reverse proxy URL.
-    # Esri docs: set this BEFORE federation so Server constructs correct
-    # self-reference URLs during the federation handshake.
-    # Ref: https://enterprise.arcgis.com/en/server/12.0/deploy/linux/using-a-reverse-proxy-server-with-arcgis-server.htm
+    # Step 14a: Set Server WebContextURL (pre-federation)
     # ------------------------------------------------------------------
-    SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      echo "  Setting Server WebContextURL = https://$DOMAIN/server (pre-federation)..."
-      _WCU_RESULT=$(curl -sk -X POST \
-        "https://localhost:6443/arcgis/admin/system/properties/update" \
-        -d "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
-        -d "token=$SERVER_TOKEN_FED" \
-        -d "f=json" 2>/dev/null) || _WCU_RESULT=""
-      echo "  Server WebContextURL result: $_WCU_RESULT"
-    else
-      echo "  WARNING: Cannot get Server token to set WebContextURL — continuing anyway."
-    fi
+    # DISABLED: Setting WebContextURL before federation causes ClassCastException 
+    # (JSONObject cannot be cast to String) during federation on 11.x/12.x in 
+    # some environments. We will set WebContextURL in Step 16 (post-federation).
+    
+    # SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+    # if [[ -n "$SERVER_TOKEN_FED" ]]; then
+    #   echo "  Setting Server WebContextURL = https://$DOMAIN/server (pre-federation)..."
+    #   _WCU_RESULT=$(curl -sk -X POST \
+    #     "https://localhost:6443/arcgis/admin/system/properties/update" \
+    #     -d "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
+    #     -d "token=$SERVER_TOKEN_FED" \
+    #     -d "f=json" 2>/dev/null) || _WCU_RESULT=""
+    #   echo "  Server WebContextURL result: $_WCU_RESULT"
+    # else
+    #   echo "  WARNING: Cannot get Server token to set WebContextURL — continuing anyway."
+    # fi
 
     # ------------------------------------------------------------------
     # Step 14c: Federate.
