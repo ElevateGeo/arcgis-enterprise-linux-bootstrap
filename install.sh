@@ -606,6 +606,35 @@ if [[ -n "${WA_HOME:-}" && -d "${WA_HOME:-}" ]]; then
 fi
 
 # ==============================================================================
+# Helper functions — defined here so Step 10 and onwards can use them
+# ==============================================================================
+
+# wait_for_service URL NAME [MAX_SECONDS]
+wait_for_service() {
+  local url="$1"
+  local name="$2"
+  local max_wait="${3:-300}"  # default 5 minutes
+  local elapsed=0
+  echo "Waiting for $name to be ready at $url ..."
+  while (( elapsed < max_wait )); do
+    if curl -sk "$url" 2>/dev/null | grep -q "status.*success\|currentVersion\|html\|arcgis"; then
+      echo "$name is ready."
+      return 0
+    fi
+    sleep 10
+    elapsed=$((elapsed + 10))
+    (( elapsed % 30 == 0 )) && echo "  ... still waiting ($elapsed s)"
+  done
+  echo "WARNING: $name did not respond within ${max_wait}s"
+  return 1
+}
+
+# Server needs up to 8 min on first start (site creation / fresh install)
+wait_for_server() {
+  wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 480
+}
+
+# ==============================================================================
 # Step 10: Start ArcGIS Services
 # ==============================================================================
 echo ""
@@ -619,7 +648,9 @@ if [[ -f "$ESRI_BASE/arcgis/server/startserver.sh" ]]; then
   else
     echo "Starting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" || true
-    sleep 30
+    # Server takes 3-5 min on first boot after site creation; wait here so
+    # createsite (Step 11) doesn't immediately fail.
+    wait_for_server || true
   fi
 fi
 
@@ -643,30 +674,10 @@ if [[ -f "$ESRI_BASE/arcgis/datastore/startdatastore.sh" ]]; then
   fi
 fi
 
-# Helper: wait until a service health-check responds
-wait_for_service() {
-  local url="$1"
-  local name="$2"
-  local max_wait="${3:-300}"  # default 5 minutes
-  local elapsed=0
-  echo "Waiting for $name to be ready at $url ..."
-  while (( elapsed < max_wait )); do
-    if curl -sk "$url" 2>/dev/null | grep -q "status.*success\|currentVersion\|html\|arcgis"; then
-      echo "$name is ready."
-      return 0
-    fi
-    sleep 10
-    elapsed=$((elapsed + 10))
-    echo "  ... still waiting ($elapsed s)"
-  done
-  echo "WARNING: $name did not respond within ${max_wait}s"
-  return 1
-}
-
-# || true prevents set -e from aborting — services may need extra time
-# Use /arcgis/rest/info for Server — /admin/healthCheck requires an existing site (Step 11)
-# Use /portaladmin/healthCheck for Portal — reliable JSON response
-wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "ArcGIS Server" 120 || true
+# Confirm services are ready before proceeding to site creation
+# (Server was already waited on in Step 10 if it was just started;
+#  these calls return immediately if the service is already up.)
+wait_for_server || true
 wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 || true
 
 # ==============================================================================
@@ -800,7 +811,7 @@ if [[ -f "$LE_CHAIN" ]]; then
     else
       # Remove stale entry (different intermediate or missing) then re-import
       "$KEYTOOL_BIN" -delete -keystore "$CACERTS_FILE" -storepass changeit \
-        -alias "$LE_ALIAS" 2>/dev/null || true
+        -alias "$LE_ALIAS" > /dev/null 2>&1 || true
       echo "  Importing into: $CACERTS_FILE"
       "$KEYTOOL_BIN" -importcert -trustcacerts -keystore "$CACERTS_FILE" \
         -storepass changeit -alias "$LE_ALIAS" \
@@ -921,77 +932,7 @@ else
   else
 
     # ------------------------------------------------------------------
-    # Step 14a: Wipe any corrupt Server security state left by prior
-    # failed federation attempts. Security files are in the config-store.
-    # Locate path via: API → XML fallback → filesystem find.
-    # ------------------------------------------------------------------
-    SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
-    SERVER_SEC_DIR=""
-
-    if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      _CS_PATH=$(curl -sk \
-        "https://localhost:6443/arcgis/admin/system/configstore?f=json&token=$SERVER_TOKEN_FED" \
-        2>/dev/null | python3 -c \
-        "import sys,json; print(json.load(sys.stdin).get('connectionString',''))" 2>/dev/null) || _CS_PATH=""
-      [[ -n "$_CS_PATH" ]] && SERVER_SEC_DIR="$_CS_PATH/security"
-    fi
-
-    # Fallback 1: parse the XML connection file
-    if [[ -z "$SERVER_SEC_DIR" ]]; then
-      _CS_XML="$ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml"
-      if [[ -f "$_CS_XML" ]]; then
-        _CS_PATH=$(python3 -c "
-import xml.etree.ElementTree as ET, sys
-try:
-  tree=ET.parse('$_CS_XML')
-  print(tree.find('.//connectionString').text.strip())
-except: pass" 2>/dev/null) || _CS_PATH=""
-        [[ -n "$_CS_PATH" ]] && SERVER_SEC_DIR="$_CS_PATH/security"
-      fi
-    fi
-
-    # Fallback 2: filesystem find (known relative location)
-    if [[ -z "$SERVER_SEC_DIR" ]]; then
-      SERVER_SEC_DIR=$(find "$ESRI_BASE/arcgis/server/usr" -maxdepth 4 \
-        -type d -name "security" 2>/dev/null | head -1) || SERVER_SEC_DIR=""
-    fi
-
-    echo "  Server security dir: ${SERVER_SEC_DIR:-not found}"
-
-    if [[ -n "$SERVER_SEC_DIR" && -d "$SERVER_SEC_DIR" ]]; then
-      # Only wipe if security-config.json exists AND Server is not already federated
-      # (authenticationTier=GIS_SERVER means standalone — safe to wipe)
-      _SEC_JSON="$SERVER_SEC_DIR/security-config.json"
-      _CUR_TIER=""
-      [[ -f "$_SEC_JSON" ]] && _CUR_TIER=$(python3 -c \
-        "import json; print(json.load(open('$_SEC_JSON')).get('authenticationTier',''))" \
-        2>/dev/null) || _CUR_TIER=""
-
-      if [[ "$_CUR_TIER" == "PORTAL" ]]; then
-        echo "  Server security already federated (authenticationTier=PORTAL) — skipping wipe."
-      elif [[ -f "$_SEC_JSON" ]]; then
-        echo "  Wiping stale Server security config (authenticationTier=${_CUR_TIER:-unknown})..."
-        sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
-        _sw=0
-        while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
-          (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
-          sleep 5; _sw=$((_sw+5))
-        done
-        find "$SERVER_SEC_DIR" -maxdepth 1 -type f | while IFS= read -r f; do
-          echo "    Removing: $f"
-          rm -f "$f" || true
-        done
-        echo "  Done. Restarting Server..."
-        sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-        wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
-        SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
-      else
-        echo "  No stale security-config.json found — skipping wipe."
-      fi
-    fi
-
-    # ------------------------------------------------------------------
-    # Step 14b: Set Server WebContextURL to the public reverse proxy URL.
+    # Step 14a: Set Server WebContextURL to the public reverse proxy URL.
     # Esri docs: set this BEFORE federation so Server constructs correct
     # self-reference URLs during the federation handshake.
     # Ref: https://enterprise.arcgis.com/en/server/12.0/deploy/linux/using-a-reverse-proxy-server-with-arcgis-server.htm
@@ -1027,6 +968,15 @@ except: pass" 2>/dev/null) || _CS_PATH=""
     echo "  Services URL: https://$DOMAIN/server"
     echo "  Admin URL:    https://$DOMAIN/server  (reverse proxy — trusted LE cert)"
 
+    # Refresh the Portal token immediately before calling federate.
+    # Steps above (Server WebContextURL update, etc.) can take > 60s,
+    # expiring the token generated at the top of this block.
+    TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
+    FEDERATE_RESULT=""
+    if [[ -z "${TOKEN:-}" ]]; then
+      echo "ERROR: Could not refresh Portal token before federation. Aborting."
+    else
+
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -d "url=https://$DOMAIN/server" \
@@ -1036,6 +986,8 @@ except: pass" 2>/dev/null) || _CS_PATH=""
       -d "token=$TOKEN" \
       -d "f=json" 2>/dev/null) || FEDERATE_RESULT=""
     echo "Federation result: $FEDERATE_RESULT"
+
+    fi  # token refresh check
 
     if echo "$FEDERATE_RESULT" | grep -q '"error"'; then
       echo "ERROR: Federation failed. See output above."
