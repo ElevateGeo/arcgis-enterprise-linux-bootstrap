@@ -801,12 +801,25 @@ wipe_server_config_store() {
     (( _sw >= 90 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
     sleep 5; _sw=$((_sw+5))
   done
-  local _bak="${SERVER_CS}.bak.$(date +%s)"
-  mv "$SERVER_CS" "$_bak" 2>/dev/null || rm -rf "$SERVER_CS"
-  echo "  Config-store backed up to $_bak"
+
+  # Wipe Config Store
+  local _cs_bak="${SERVER_CS}.bak.$(date +%s)"
+  mv "$SERVER_CS" "$_cs_bak" 2>/dev/null || rm -rf "$SERVER_CS"
+  echo "  Config-store backed up to $_cs_bak"
   mkdir -p "$SERVER_CS"
   chown "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
-  echo "  Starting Server with fresh config-store..."
+
+  # Wipe Server Directories (critical for clean createsite)
+  local _dirs="$ESRI_BASE/arcgis/server/usr/directories"
+  local _dirs_bak="${_dirs}.bak.$(date +%s)"
+  if [[ -d "$_dirs" ]]; then
+    mv "$_dirs" "$_dirs_bak" 2>/dev/null || rm -rf "$_dirs"
+    echo "  Server directories backed up to $_dirs_bak"
+  fi
+  mkdir -p "$_dirs"
+  chown "$ARCGIS_USER:$ARCGIS_USER" "$_dirs"
+
+  echo "  Starting Server with fresh config-store and directories..."
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
   # Wait for REST endpoint, which is what createsite.sh checks internally.
   # /admin/info may not respond on a fresh (no-site) Server instance.
