@@ -765,17 +765,27 @@ SERVER_ADMIN_URL="https://localhost:6443/arcgis/admin"
 SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store"
 
 # ---------------------------------------------------------------------------
-# Helper: test if Server admin is TRULY healthy (info + token generation).
-# /admin/info returns currentVersion even when the security subsystem is
-# broken (SecurityConfig null). Token generation is the real proof that the
-# admin layer is fully functional.
+# Helper: test if Server admin is TRULY healthy.
+# Three-layer probe:
+#   1. /admin/info returns currentVersion  (site exists)
+#   2. generate_server_token returns a token (auth layer responds)
+#   3. /admin/security/config with that token returns valid config
+#      — this is the call that fails with "SecurityConfig null" when the
+#      security subsystem is broken. /admin/info and even generateToken can
+#      succeed in the broken state; /admin/security/config does not.
 # ---------------------------------------------------------------------------
 server_admin_is_healthy() {
-  local _info _tok
+  local _info _tok _sec
   _info=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
   echo "$_info" | grep -q '"currentVersion"' || return 1
   _tok=$(generate_server_token 2>/dev/null) || return 1
   [[ -n "$_tok" ]] || return 1
+  # /admin/security/config must return a valid config (not an error).
+  # A broken SecurityConfig causes this endpoint to return {"error": ...}.
+  _sec=$(curl -sk "$SERVER_ADMIN_URL/security/config?f=json&token=$_tok" 2>/dev/null) || return 1
+  echo "$_sec" | grep -q '"error"' && return 1
+  # Must contain authenticationTier or allowedAdminAccessIPs — any real key
+  echo "$_sec" | grep -qE '"authenticationTier"|"allowedAdminAccessIPs"|"virtualDirsSecurityEnabled"' || return 1
   return 0
 }
 
@@ -814,8 +824,8 @@ else
   SERVER_REST_JSON=$(curl -sk "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || echo "")
 
   if echo "$SERVER_ADMIN_JSON" | grep -q '"currentVersion"'; then
-    # Site exists on disk but security/token broken — wipe and recreate
-    echo "  Server admin responds but token generation failed (broken security state)."
+    # Site exists on disk but security/config broken — wipe and recreate
+    echo "  Server admin responds but /admin/security/config is broken."
     wipe_server_config_store
   elif echo "$SERVER_REST_JSON" | grep -q '"currentVersion"'; then
     # REST is partially up but admin is down — also wipe
@@ -824,15 +834,35 @@ else
   fi
   # else: Server isn't up enough to query — createsite will handle it
 
+  # Give the admin endpoint a moment to be ready for createsite.sh
+  # (wait_for_server checks REST; admin takes a few extra seconds after that)
+  echo "  Waiting for Server admin endpoint before running createsite..."
+  _cs_wait=0
+  while (( _cs_wait < 120 )); do
+    _cs_info=$(curl -sk "https://localhost:6443/arcgis/admin/info?f=json" 2>/dev/null) || _cs_info=""
+    # Admin is ready when it responds — even "no site" is a valid response
+    if [[ -n "$_cs_info" ]]; then
+      echo "  Server admin endpoint is responding."
+      break
+    fi
+    sleep 5; _cs_wait=$((_cs_wait + 5))
+    (( _cs_wait % 30 == 0 )) && echo "    ... still waiting for admin endpoint (${_cs_wait}s)"
+  done
+
   # Now create (or recreate) the site
   if [[ -f "$CREATESITE_TOOL" ]]; then
     echo "Creating ArcGIS Server site using createsite.sh..."
     chmod +x "$CREATESITE_TOOL"
-    sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
+    _cs_out=$(sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
       -u "$ADMIN_USER" \
       -p "$ADMIN_PASS" \
       -d "$ESRI_BASE/arcgis/server/usr/directories" \
-      -c "$SERVER_CS" || true
+      -c "$SERVER_CS" 2>&1)
+    _cs_rc=$?
+    echo "$_cs_out"
+    if (( _cs_rc != 0 )); then
+      echo "  WARNING: createsite.sh exited with code $_cs_rc — will still wait for health check."
+    fi
   else
     echo "Creating ArcGIS Server site via REST API..."
     curl -sk -X POST "$SERVER_ADMIN_URL/createNewSite" \
