@@ -878,206 +878,159 @@ generate_server_token() {
   return 1
 }
 
-# WebContextURL and privatePortalURL are set AFTER federation (Step 16)
-# to avoid a ClassCastException in Server's security config update.
-# During federation, Portal and Server communicate using their native
-# internal URLs without any reverse proxy involvement.
-wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
-echo "Portal is healthy. Reverse proxy properties deferred to post-federation."
-
 # ==============================================================================
 # Step 14: Federate Server with Portal
-# Correct order based on Esri docs and working reference implementations:
-#   - Portal MUST have no WebContextURL/privatePortalURL set at federation time.
-#     Portal includes its own system properties in the security-config payload
-#     it sends to Server. When those include nested JSON values (e.g. a stored
-#     property that was written as a JSON object instead of a plain string),
-#     Server's security/config/update handler throws:
-#       "class JSONObject$a cannot be cast to class java.lang.String"
-#   - Federate with bare Portal (properties cleared).
-#   - Set WebContextURL, privatePortalURL, Server WebContextURL AFTER (Step 16).
+#
+# Esri-documented order for a reverse-proxy / cloud deployment:
+#   1. Set Server WebContextURL (so Server self-references the public URL)
+#   2. Federate — use the REVERSE PROXY URL as adminUrl so Portal uses the
+#      trusted Let's Encrypt cert rather than Server's self-signed cert on
+#      port 6443. Esri docs explicitly state: "if your ArcGIS Server is
+#      hosted in a cloud environment, use the Web Adaptor or load balancer
+#      URL in this field instead."
+#   3. Promote federated server to Hosting Server role.
+#   4. Set Portal WebContextURL / privatePortalURL (Step 16).
+#
 # Ref: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm
+# Ref: https://enterprise.arcgis.com/en/server/12.0/deploy/linux/using-a-reverse-proxy-server-with-arcgis-server.htm
 # ==============================================================================
 echo ""
 echo ">>> Step 14: Federating Server with Portal"
 echo ""
 
-# Check if already federated
+wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+
+# Check if already federated — idempotency gate
 PREV_TOKEN=$(generate_portal_token 2>/dev/null) || PREV_TOKEN=""
 EXISTING_FEDERATION=""
-if [[ -n "${PREV_TOKEN:-}" && "$PREV_TOKEN" != "null" ]]; then
+if [[ -n "${PREV_TOKEN:-}" ]]; then
   EXISTING_FEDERATION=$(curl -sk \
     "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PREV_TOKEN" \
-    2>/dev/null || echo "")
+    2>/dev/null) || EXISTING_FEDERATION=""
 fi
 
-if echo "$EXISTING_FEDERATION" | grep -q '"id"'; then
+if echo "$EXISTING_FEDERATION" | python3 -c \
+    "import sys,json; s=json.load(sys.stdin).get('servers',[]); exit(0 if s else 1)" 2>/dev/null; then
   echo "Server is already federated with Portal, skipping..."
 else
   TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
 
-  if [[ -z "${TOKEN:-}" || "$TOKEN" == "null" ]]; then
+  if [[ -z "${TOKEN:-}" ]]; then
     echo "WARNING: Could not get Portal token. Federation must be done manually."
     echo "See: https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm"
   else
 
     # ------------------------------------------------------------------
-    # Step 14a: Clear Portal system properties before federating.
-    # Previous runs (or manual config) may have set WebContextURL /
-    # privatePortalURL. Portal passes ALL system properties to Server as
-    # part of the security-config update during federation. If any
-    # property is stored internally as a JSON object rather than a plain
-    # string, Server throws ClassCastException. Clear them to ensure
-    # Portal sends a minimal, clean payload. Step 16 re-applies them
-    # after federation succeeds.
-    # ------------------------------------------------------------------
-    echo "  Clearing Portal system properties (pre-federation)..."
-    CLEAR_RESULT=$(curl -sk -X POST \
-      "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
-      -d 'properties={}' \
-      -d "token=$TOKEN" \
-      -d "f=json" 2>/dev/null) || CLEAR_RESULT=""
-    echo "  Clear result: $CLEAR_RESULT"
-
-    if echo "$CLEAR_RESULT" | grep -q '"recheckAfterSeconds"'; then
-      RECHECK=$(echo "$CLEAR_RESULT" | python3 -c \
-        "import sys,json; print(json.load(sys.stdin).get('recheckAfterSeconds',30))" 2>/dev/null) || RECHECK=30
-      RECHECK=$(( RECHECK < 10 ? 30 : RECHECK ))
-      echo "  Portal restarting; waiting ${RECHECK}s..."
-      sleep "$RECHECK"
-      wait_for_service "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
-    fi
-
-    # Refresh token after possible restart
-    TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
-    if [[ -z "${TOKEN:-}" || "$TOKEN" == "null" ]]; then
-      echo "ERROR: Cannot get Portal token after clearing properties. Federation must be done manually."
-    else
-
-    # ------------------------------------------------------------------
-    # Step 14b: Discover Server's machine name and config-store path via
-    # the admin API, then wipe the security config so Server regenerates
-    # a clean default — the ClassCastException is caused by corrupted
-    # security state written by previous failed federation attempts.
+    # Step 14a: Wipe any corrupt Server security state left by prior
+    # failed federation attempts. Security files are in the config-store.
+    # Locate path via: API → XML fallback → filesystem find.
     # ------------------------------------------------------------------
     SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
-    SERVER_MACHINE=""
-    SERVER_CONFIGSTORE_PATH=""
+    SERVER_SEC_DIR=""
 
     if [[ -n "$SERVER_TOKEN_FED" ]]; then
-      # Get machine name
-      SERVER_MACHINE=$(curl -sk \
-        "https://localhost:6443/arcgis/admin/machines?f=json&token=$SERVER_TOKEN_FED" \
-        2>/dev/null | python3 -c "
-import sys,json
-data=json.load(sys.stdin)
-for m in data.get('machines',[]):
-    print(m.get('machineName','')); break" 2>/dev/null) || SERVER_MACHINE=""
-
-      # Get config-store path from the API — don't guess the path
-      SERVER_CONFIGSTORE_PATH=$(curl -sk \
+      _CS_PATH=$(curl -sk \
         "https://localhost:6443/arcgis/admin/system/configstore?f=json&token=$SERVER_TOKEN_FED" \
-        2>/dev/null | python3 -c "
-import sys,json
-data=json.load(sys.stdin)
-# connectionString is the filesystem path to the config store root
-print(data.get('connectionString', data.get('configPersistenceType','')))" 2>/dev/null) || SERVER_CONFIGSTORE_PATH=""
-      echo "  Server config-store path: $SERVER_CONFIGSTORE_PATH"
-
-      # Print current security config so we can see what's corrupt
-      echo "  Server current security config:"
-      curl -sk \
-        "https://localhost:6443/arcgis/admin/security/config?f=json&token=$SERVER_TOKEN_FED" \
-        2>/dev/null | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    for k,v in d.items(): print(f'    {k}: {repr(v)[:120]}')
-except: print('    (could not parse)')" 2>/dev/null || true
+        2>/dev/null | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('connectionString',''))" 2>/dev/null) || _CS_PATH=""
+      [[ -n "$_CS_PATH" ]] && SERVER_SEC_DIR="$_CS_PATH/security"
     fi
 
-    [[ -z "$SERVER_MACHINE" ]] && SERVER_MACHINE=$(hostname -f 2>/dev/null || echo "localhost")
-    echo "  Server machine name: $SERVER_MACHINE"
-
-    # Wipe security config directory using the path from the API
-    if [[ -n "$SERVER_CONFIGSTORE_PATH" ]]; then
-      SERVER_SEC_DIR="$SERVER_CONFIGSTORE_PATH/security"
-    else
-      # Fallback: try to read it from the XML connection file
+    # Fallback 1: parse the XML connection file
+    if [[ -z "$SERVER_SEC_DIR" ]]; then
       _CS_XML="$ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml"
       if [[ -f "$_CS_XML" ]]; then
-        SERVER_SEC_DIR=$(grep -oP '(?<=<connectionString>)[^<]+' "$_CS_XML" 2>/dev/null \
-          | head -1 | tr -d '[:space:]')/security || SERVER_SEC_DIR=""
+        _CS_PATH=$(python3 -c "
+import xml.etree.ElementTree as ET, sys
+try:
+  tree=ET.parse('$_CS_XML')
+  print(tree.find('.//connectionString').text.strip())
+except: pass" 2>/dev/null) || _CS_PATH=""
+        [[ -n "$_CS_PATH" ]] && SERVER_SEC_DIR="$_CS_PATH/security"
       fi
     fi
+
+    # Fallback 2: filesystem find (known relative location)
+    if [[ -z "$SERVER_SEC_DIR" ]]; then
+      SERVER_SEC_DIR=$(find "$ESRI_BASE/arcgis/server/usr" -maxdepth 4 \
+        -type d -name "security" 2>/dev/null | head -1) || SERVER_SEC_DIR=""
+    fi
+
     echo "  Server security dir: ${SERVER_SEC_DIR:-not found}"
 
     if [[ -n "$SERVER_SEC_DIR" && -d "$SERVER_SEC_DIR" ]]; then
-      echo "  Stopping Server to wipe corrupted security config..."
-      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
-      _sw=0
-      while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
-        (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
-        sleep 5; _sw=$((_sw+5))
-      done
-      # Wipe only top-level files; subdirs (PrincipalStore etc) hold accounts
-      _SEC_FILES=$(find "$SERVER_SEC_DIR" -maxdepth 1 -type f 2>/dev/null) || _SEC_FILES=""
-      while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
-        echo "    Removing: $f"
-        cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
-        rm -f "$f" || true
-      done <<< "$_SEC_FILES"
-      echo "  Done. Restarting Server..."
-      sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-      wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
-      SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
-    else
-      echo "  WARNING: Could not locate security dir — skipping wipe."
-      echo "  To fix manually: find \$(sudo -u $ARCGIS_USER cat $ESRI_BASE/arcgis/server/framework/etc/config-store-connection.xml)/security -maxdepth 1 -type f -delete"
+      # Only wipe if security-config.json exists AND Server is not already federated
+      # (authenticationTier=GIS_SERVER means standalone — safe to wipe)
+      _SEC_JSON="$SERVER_SEC_DIR/security-config.json"
+      _CUR_TIER=""
+      [[ -f "$_SEC_JSON" ]] && _CUR_TIER=$(python3 -c \
+        "import json; print(json.load(open('$_SEC_JSON')).get('authenticationTier',''))" \
+        2>/dev/null) || _CUR_TIER=""
+
+      if [[ "$_CUR_TIER" == "PORTAL" ]]; then
+        echo "  Server security already federated (authenticationTier=PORTAL) — skipping wipe."
+      elif [[ -f "$_SEC_JSON" ]]; then
+        echo "  Wiping stale Server security config (authenticationTier=${_CUR_TIER:-unknown})..."
+        sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
+        _sw=0
+        while pgrep -u "$ARCGIS_USER" -f "arcgis/server" > /dev/null 2>&1; do
+          (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/server" 2>/dev/null || true; sleep 3; break; }
+          sleep 5; _sw=$((_sw+5))
+        done
+        find "$SERVER_SEC_DIR" -maxdepth 1 -type f | while IFS= read -r f; do
+          echo "    Removing: $f"
+          rm -f "$f" || true
+        done
+        echo "  Done. Restarting Server..."
+        sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
+        wait_for_service "https://localhost:6443/arcgis/rest/info?f=json" "Server" 300 || true
+        SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+      else
+        echo "  No stale security-config.json found — skipping wipe."
+      fi
     fi
 
     # ------------------------------------------------------------------
-    # Step 14c: Ensure Server machine name resolves locally.
-    # Portal's JVM looks up the adminUrl hostname before connecting.
-    # ArcGIS Server registers its machine name in uppercase (e.g.
-    # ARCGIS.INTERNAL.CLOUDAPP.NET) which is NOT in Azure DNS.
-    # Adding it to /etc/hosts makes Portal able to reach Server on
-    # the same VM via 127.0.0.1, and the SSL cert matches the name.
+    # Step 14b: Set Server WebContextURL to the public reverse proxy URL.
+    # Esri docs: set this BEFORE federation so Server constructs correct
+    # self-reference URLs during the federation handshake.
+    # Ref: https://enterprise.arcgis.com/en/server/12.0/deploy/linux/using-a-reverse-proxy-server-with-arcgis-server.htm
     # ------------------------------------------------------------------
-    _SM_LOWER=$(echo "$SERVER_MACHINE" | tr '[:upper:]' '[:lower:]')
-    if ! grep -qiE "^\s*127\.0\.0\.1\s+.*$SERVER_MACHINE" /etc/hosts 2>/dev/null; then
-      echo "  Adding $SERVER_MACHINE → 127.0.0.1 in /etc/hosts (Portal needs it for adminUrl)..."
-      echo "127.0.0.1  $SERVER_MACHINE $_SM_LOWER" >> /etc/hosts
+    SERVER_TOKEN_FED=$(generate_server_token 2>/dev/null) || SERVER_TOKEN_FED=""
+    if [[ -n "$SERVER_TOKEN_FED" ]]; then
+      echo "  Setting Server WebContextURL = https://$DOMAIN/server (pre-federation)..."
+      _WCU_RESULT=$(curl -sk -X POST \
+        "https://localhost:6443/arcgis/admin/system/properties/update" \
+        -d "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
+        -d "token=$SERVER_TOKEN_FED" \
+        -d "f=json" 2>/dev/null) || _WCU_RESULT=""
+      echo "  Server WebContextURL result: $_WCU_RESULT"
     else
-      echo "  /etc/hosts already has entry for $SERVER_MACHINE."
-    fi
-
-    # Verify reachability — if this fails, we'll get the same "not accessible" error
-    if curl -sk --connect-timeout 10 \
-        "https://$SERVER_MACHINE:6443/arcgis/rest/info?f=json" > /dev/null 2>&1; then
-      echo "  Confirmed: Server is reachable at https://$SERVER_MACHINE:6443/arcgis"
-    else
-      echo "  WARNING: Server not reachable at https://$SERVER_MACHINE:6443/arcgis — federation may fail."
+      echo "  WARNING: Cannot get Server token to set WebContextURL — continuing anyway."
     fi
 
     # ------------------------------------------------------------------
-    # Step 14d: Federate.
-    # url     = PUBLIC services URL (through NGINX reverse proxy) — this
-    #           is what external clients use to reach Server services.
-    # adminUrl = INTERNAL Server URL — what Portal uses for admin calls.
+    # Step 14c: Federate.
     #
-    # Both working reference implementations use:
-    #   url=https://<public-domain>/server
-    #   adminUrl=https://<internal-fqdn>:6443/arcgis
+    # Per Esri docs for cloud/reverse-proxy environments:
+    #   url      = public reverse proxy URL (external clients use this)
+    #   adminUrl = ALSO the reverse proxy URL — Portal uses this for all
+    #              admin calls to Server. Because NGINX proxies /server/
+    #              to localhost:6443/arcgis/, Portal reaches Server via
+    #              the trusted Let's Encrypt cert instead of Server's
+    #              self-signed cert on port 6443.
+    #
+    # "If your ArcGIS Server is hosted in a cloud environment, use the
+    #  Web Adaptor or load balancer URL in this field instead."
+    #   — Esri Enterprise 12.0 federation docs
     # ------------------------------------------------------------------
-    echo "  Services URL (public):   https://$DOMAIN/server"
-    echo "  Admin URL (internal):    https://$SERVER_MACHINE:6443/arcgis"
+    echo "  Services URL: https://$DOMAIN/server"
+    echo "  Admin URL:    https://$DOMAIN/server  (reverse proxy — trusted LE cert)"
 
     FEDERATE_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://$SERVER_MACHINE:6443/arcgis" \
+      -d "adminUrl=https://$DOMAIN/server" \
       -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
@@ -1087,14 +1040,15 @@ except: print('    (could not parse)')" 2>/dev/null || true
     if echo "$FEDERATE_RESULT" | grep -q '"error"'; then
       echo "ERROR: Federation failed. See output above."
       echo "You can federate manually: Portal Admin → Organization → Settings → Servers → Add server"
-      echo "  Services URL:    https://$DOMAIN/server"
-      echo "  Admin URL:       https://$SERVER_MACHINE:6443/arcgis"
+      echo "  Services URL: https://$DOMAIN/server"
+      echo "  Admin URL:    https://$DOMAIN/server"
       # Print recent Server logs to help diagnose
-      SERVER_LOG_DIR="$ESRI_BASE/arcgis/server/usr/logs/$SERVER_MACHINE/server"
-      if [[ -d "$SERVER_LOG_DIR" ]]; then
+      _SERVER_LOG_DIR=$(find "$ESRI_BASE/arcgis/server/usr/logs" -maxdepth 3 \
+        -type d -name "server" 2>/dev/null | head -1) || _SERVER_LOG_DIR=""
+      if [[ -n "$_SERVER_LOG_DIR" ]]; then
         echo ""
         echo "  --- Recent ArcGIS Server log entries ---"
-        ls -t "$SERVER_LOG_DIR"/*.log 2>/dev/null | head -1 \
+        ls -t "$_SERVER_LOG_DIR"/*.log 2>/dev/null | head -1 \
           | xargs -r tail -200 2>/dev/null \
           | grep -i "error\|exception\|federation\|security\|warn" | tail -40 || true
         echo "  --- End Server log ---"
@@ -1124,9 +1078,8 @@ except: print('    (could not parse)')" 2>/dev/null || true
       fi
     fi
 
-    fi  # end token-after-property-set check
-  fi
-fi
+  fi  # TOKEN check
+fi  # EXISTING_FEDERATION check
 
 # ==============================================================================
 # Step 15: Configure Data Store
