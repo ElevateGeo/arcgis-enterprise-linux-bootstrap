@@ -878,11 +878,16 @@ SERVER_SITE_RECREATED=0
 # ---------------------------------------------------------------------------
 server_admin_is_healthy() {
   local _info _tok _sec
-  _info=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
-    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
-  echo "$_info" | grep -q '"currentVersion"' || return 1
+
+  # On a secured site, /admin/info can return 499 without a token.
+  # Always generate a token first, then validate /admin/info using it.
   _tok=$(generate_server_token 2>/dev/null) || return 1
   [[ -n "$_tok" ]] || return 1
+
+  _info=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
+    "$SERVER_ADMIN_URL/info?f=json&token=$_tok" 2>/dev/null) || return 1
+  echo "$_info" | grep -q '"currentVersion"' || return 1
+
   # /admin/security/config must return a valid config (not an error).
   # A broken SecurityConfig causes this endpoint to return {"error": ...}.
   _sec=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
@@ -894,10 +899,19 @@ server_admin_is_healthy() {
 }
 
 server_site_exists() {
-  local _info
+  local _rest _info
+
+  # Prefer the unauthenticated REST probe if available.
+  _rest=$("${CURL_BASE[@]}" "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null) || _rest=""
+  echo "$_rest" | grep -q '"currentVersion"' && return 0
+
+  # Admin endpoint may require a token and respond with 499 if missing;
+  # that still indicates the admin endpoint is alive and the site exists.
   _info=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
-    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
-  echo "$_info" | grep -q '"currentVersion"'
+    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || _info=""
+  echo "$_info" | grep -q '"currentVersion"' && return 0
+  echo "$_info" | grep -q '"code"\s*:\s*499' && return 0
+  return 1
 }
 
 server_admin_diagnose() {
@@ -918,7 +932,7 @@ server_admin_diagnose() {
   }
 
   echo "  --- Server admin diagnostics ---" >&2
-  _curl_diag "/admin/info" "${CURL_BASE[@]}" \
+  _curl_diag "/admin/info (no token)" "${CURL_BASE[@]}" \
     -H "Referer: https://localhost:6443/arcgis/admin" \
     "$SERVER_ADMIN_URL/info?f=json"
 
@@ -931,6 +945,11 @@ server_admin_diagnose() {
 
   local _tok
   _tok=$(generate_server_token 2>/dev/null) || _tok=""
+  if [[ -n "${_tok:-}" ]]; then
+    _curl_diag "/admin/info (with token)" "${CURL_BASE[@]}" \
+      -H "Referer: https://localhost:6443/arcgis/admin" \
+      "$SERVER_ADMIN_URL/info?f=json&token=$_tok"
+  fi
   echo "  /admin/security/config (token present: $([[ -n "${_tok:-}" ]] && echo yes || echo no))" >&2
   if [[ -n "${_tok:-}" ]]; then
     _curl_diag "/admin/security/config" "${CURL_BASE[@]}" \
