@@ -1401,8 +1401,10 @@ if (( HAS_FEDERATION == 1 )); then
       FEDERATION_VALID=0
     else
       # If validate endpoint isn't available (older versions / hardening), it will
-      # return an error object. In that case, don't force re-federation.
-      if echo "${VALIDATE_JSON:-}" | python3 -c "
+      # return an error object. Only treat that as "valid" when it's clearly
+      # unsupported/not found; otherwise assume stale/broken federation.
+      if echo "${VALIDATE_JSON:-}" | grep -q '"error"'; then
+        if echo "${VALIDATE_JSON:-}" | python3 -c "
 import sys, json
 try:
   data=json.load(sys.stdin)
@@ -1414,7 +1416,10 @@ try:
 except Exception:
   sys.exit(1)
 " 2>/dev/null; then
-        FEDERATION_VALID=1
+          FEDERATION_VALID=1
+        else
+          FEDERATION_VALID=0
+        fi
       fi
     fi
   fi
@@ -1562,6 +1567,56 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
     exit 1
   fi
 
+  # Describe existing stores once for idempotency checks.
+  DS_DESCRIBE=""
+  if [[ -x ./describedatastore.sh ]]; then
+    DS_DESCRIBE=$(sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || true)
+  fi
+
+  datastore_store_already_configured() {
+    # Returns 0 if the given store appears configured/started already.
+    # This avoids calling configuredatastore.sh on an already-initialized store
+    # (which can return opaque errors like "Method argument cannot be null").
+    local _store="$1"
+    printf "%s" "${DS_DESCRIBE:-}" | python3 - "${_store}" <<'PY'
+import re, sys
+
+store = sys.argv[1] if len(sys.argv) > 1 else ''
+txt = sys.stdin.read() or ''
+
+def block(start_pat, end_pat=None):
+  m = re.search(start_pat, txt, flags=re.M)
+  if not m:
+    return ''
+  s = txt[m.start():]
+  if end_pat:
+    m2 = re.search(end_pat, s, flags=re.M)
+    if m2:
+      s = s[:m2.start()]
+  return s
+
+if store == 'relational':
+  sec = block(r'^Information for relational data store\b.*$', r'^Information for object store\b')
+  if not sec:
+    sys.exit(1)
+  status = re.search(r'^Data store status\.+\s*(\S+)\s*$', sec, flags=re.M)
+  owning = re.search(r'^Owning system URL\.+\s*(.+)\s*$', sec, flags=re.M)
+  status_val = (status.group(1).strip() if status else '').lower()
+  owning_val = (owning.group(1).strip() if owning else '').strip().strip('"')
+  sys.exit(0 if (status_val == 'started' and owning_val) else 1)
+
+if store == 'object':
+  sec = block(r'^Information for object store\b.*$')
+  if not sec:
+    sys.exit(1)
+  owning = re.search(r'^Owning system URL\.+\s*(.+)\s*$', sec, flags=re.M)
+  owning_val = (owning.group(1).strip() if owning else '').strip().strip('"')
+  sys.exit(0 if owning_val else 1)
+
+sys.exit(1)
+PY
+  }
+
   configure_datastore_store() {
     local _store="$1"
     local _attempt _out _rc
@@ -1578,10 +1633,21 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
     _h1=$(get_server_host_for_datastore 2>/dev/null) || _h1=""
     _h2=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
 
-    [[ -n "${_h1:-}" && "${_h1:-}" != "None" ]] && _refs+=("https://${_h1}:6443")
-    [[ -n "${_h2:-}" && "${_h2:-}" != "None" ]] && _refs+=("https://${_h2}:6443")
-    _refs+=("https://localhost:6443")
-    _refs+=("https://127.0.0.1:6443")
+    _add_variants() {
+      local h="$1"
+      [[ -z "${h:-}" || "${h:-}" == "None" ]] && return 0
+      # host-only
+      _refs+=("${h}")
+      # host:6443
+      _refs+=("${h}:6443")
+      # https://host:6443
+      _refs+=("https://${h}:6443")
+    }
+
+    _add_variants "${_h1}"
+    _add_variants "${_h2}"
+    _add_variants "localhost"
+    _add_variants "127.0.0.1"
 
     # De-duplicate while preserving order
     for _r in "${_refs[@]}"; do
@@ -1597,6 +1663,8 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
 
       # Ensure Data Store admin is up before each attempt.
       wait_for_datastore_admin 600 || restart_datastore
+
+      local _restarted_this_attempt=0
 
       for _hosting_ref in "${_uniq[@]}"; do
         echo "  Trying GIS Server reference: ${_hosting_ref}"
@@ -1616,8 +1684,11 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
         # If Data Store returns the common null-arg error, treat it as a transient
         # admin/API readiness issue; restart Data Store once and continue.
         if echo "${_out}" | grep -qi "Method argument cannot be null"; then
-          echo "  Detected Data Store admin error (null argument). Restarting Data Store before retry..."
-          restart_datastore
+          if (( _restarted_this_attempt == 0 )); then
+            echo "  Detected Data Store admin error (null argument). Restarting Data Store before retry..."
+            restart_datastore
+            _restarted_this_attempt=1
+          fi
         fi
       done
 
@@ -1636,18 +1707,30 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   # registration idempotently and tolerate "already registered" output.
   DS_REL_OK=0
   DS_OBJ_OK=0
+  REL_SKIPPED_CONFIGURED=0
+  OBJ_SKIPPED_CONFIGURED=0
 
   echo "Registering relational data store with Server (idempotent)..."
-  if ! configure_datastore_store relational; then
-    DS_REL_OK=1
-    echo "ERROR: Relational data store registration failed after retries."
+  if datastore_store_already_configured relational; then
+    echo "Relational data store already configured (per describedatastore), skipping configuration."
+    REL_SKIPPED_CONFIGURED=1
+  else
+    if ! configure_datastore_store relational; then
+      DS_REL_OK=1
+      echo "ERROR: Relational data store registration failed after retries."
+    fi
   fi
   sleep 10
 
   echo "Registering object store with Server (idempotent)..."
-  if ! configure_datastore_store object; then
-    DS_OBJ_OK=1
-    echo "ERROR: Object store registration failed after retries."
+  if datastore_store_already_configured object; then
+    echo "Object store already configured (per describedatastore), skipping configuration."
+    OBJ_SKIPPED_CONFIGURED=1
+  else
+    if ! configure_datastore_store object; then
+      DS_OBJ_OK=1
+      echo "ERROR: Object store registration failed after retries."
+    fi
   fi
 
   if (( DS_REL_OK != 0 || DS_OBJ_OK != 0 )); then
@@ -1690,6 +1773,31 @@ for s in data.get('servers',[]):
           -d "token=$PORTAL_TOKEN_HOSTING" \
           -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
         echo "  Hosting server result: $HOSTING_RESULT"
+
+        if echo "${HOSTING_RESULT:-}" | grep -q '"error"'; then
+          # If the role update fails and we skipped relational as "already configured",
+          # attempt a one-time relational configure + retry hosting promotion.
+          if (( REL_SKIPPED_CONFIGURED == 1 )); then
+            echo "WARNING: Hosting server role update failed; attempting one-time relational store reconfiguration then retry..." >&2
+            if configure_datastore_store relational; then
+              PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
+              if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
+                HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
+                  -H "Referer: https://localhost:7443/arcgis" \
+                  "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+                  -d "serverRole=HOSTING_SERVER" \
+                  -d "token=$PORTAL_TOKEN_HOSTING" \
+                  -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
+                echo "  Hosting server retry result: $HOSTING_RESULT"
+              fi
+            fi
+          fi
+
+          if echo "${HOSTING_RESULT:-}" | grep -q '"error"'; then
+            echo "ERROR: Failed to set hosting server role. Data Store may not be registered correctly." >&2
+            exit 1
+          fi
+        fi
       else
         echo "WARNING: Could not find federated server ID to set as hosting."
       fi
