@@ -886,7 +886,7 @@ server_admin_is_healthy() {
 
   _info=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
     "$SERVER_ADMIN_URL/info?f=json&token=$_tok" 2>/dev/null) || return 1
-  echo "$_info" | grep -q '"currentVersion"' || return 1
+  echo "$_info" | grep -qiE '"currentVersion"|"currentversion"' || return 1
 
   # /admin/security/config must return a valid config (not an error).
   # A broken SecurityConfig causes this endpoint to return {"error": ...}.
@@ -903,13 +903,13 @@ server_site_exists() {
 
   # Prefer the unauthenticated REST probe if available.
   _rest=$("${CURL_BASE[@]}" "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null) || _rest=""
-  echo "$_rest" | grep -q '"currentVersion"' && return 0
+  echo "$_rest" | grep -qiE '"currentVersion"|"currentversion"' && return 0
 
   # Admin endpoint may require a token and respond with 499 if missing;
   # that still indicates the admin endpoint is alive and the site exists.
   _info=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
     "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || _info=""
-  echo "$_info" | grep -q '"currentVersion"' && return 0
+  echo "$_info" | grep -qiE '"currentVersion"|"currentversion"' && return 0
   echo "$_info" | grep -q '"code"\s*:\s*499' && return 0
   return 1
 }
@@ -1089,7 +1089,13 @@ else
       break
     fi
     sleep 15; _elapsed=$((_elapsed + 15))
-    echo "  ... still waiting for Server admin (${_elapsed}s)"
+    if (( _elapsed % 60 == 0 )); then
+      _rest_probe=$("${CURL_BASE[@]}" "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
+      _tok_probe=$(generate_server_token 2>/dev/null || true)
+      _rest_ok=no
+      echo "${_rest_probe:-}" | grep -qiE '"currentVersion"|"currentversion"' && _rest_ok=ok
+      echo "  ... still waiting for Server admin (${_elapsed}s) [rest=${_rest_ok} token=$([[ -n "${_tok_probe:-}" ]] && echo ok || echo no)]"
+    fi
   done
   if ! server_admin_is_healthy; then
     echo "  ERROR: Server admin did not become healthy within 900s. Check Server logs." >&2
