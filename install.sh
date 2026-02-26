@@ -753,6 +753,74 @@ wait_for_server() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: wait for ArcGIS Data Store admin to be ready.
+# Prefer the explicit healthCheck endpoint when available.
+# ---------------------------------------------------------------------------
+wait_for_datastore_admin() {
+  local max_wait="${1:-600}"
+  local elapsed=0
+  local url_health="https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json"
+  local url_root="https://127.0.0.1:2443/arcgis/datastoreadmin/"
+
+  echo "Waiting for ArcGIS Data Store (admin) to be ready at ${url_health} ..."
+  while (( elapsed < max_wait )); do
+    # healthCheck returns JSON with status=success
+    if "${CURL_BASE[@]}" "${url_health}" 2>/dev/null | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"'; then
+      echo "ArcGIS Data Store (admin) is ready."
+      return 0
+    fi
+    # Fallback probe: at least the web app responds
+    if "${CURL_BASE[@]}" "${url_root}" 2>/dev/null | grep -qiE 'datastoreadmin|arcgis'; then
+      echo "ArcGIS Data Store (admin) is responding."
+      return 0
+    fi
+
+    sleep 10
+    elapsed=$((elapsed + 10))
+    (( elapsed % 30 == 0 )) && echo "  ... still waiting (${elapsed} s)"
+  done
+  echo "WARNING: ArcGIS Data Store (admin) did not respond within ${max_wait}s"
+  return 1
+}
+
+restart_datastore() {
+  echo "Restarting ArcGIS Data Store..."
+  if [[ -f "$ESRI_BASE/arcgis/datastore/stopdatastore.sh" ]]; then
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/datastore/stopdatastore.sh" > /dev/null 2>&1 || true
+  fi
+  local _sw=0
+  while pgrep -u "$ARCGIS_USER" -f "arcgis/datastore" > /dev/null 2>&1; do
+    (( _sw >= 120 )) && { pkill -9 -u "$ARCGIS_USER" -f "arcgis/datastore" 2>/dev/null || true; sleep 3; break; }
+    sleep 5; _sw=$((_sw+5))
+  done
+  if [[ -f "$ESRI_BASE/arcgis/datastore/startdatastore.sh" ]]; then
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/datastore/startdatastore.sh" > /dev/null 2>&1 || true
+  fi
+  # Data Store admin can take several minutes after restart.
+  wait_for_datastore_admin 900 || true
+}
+
+datastore_admin_diagnose() {
+  set +e
+  echo "  --- Data Store diagnostics ---" >&2
+  echo "  Admin healthCheck:" >&2
+  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json" 2>&1 | tail -40 >&2
+  echo "" >&2
+
+  local _log_dir _latest
+  _log_dir="$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore/logs"
+  if [[ -d "${_log_dir}" ]]; then
+    _latest=$(find "${_log_dir}" -type f \( -name "*.log" -o -name "*.log.*" \) 2>/dev/null | sort | tail -1)
+    if [[ -n "${_latest:-}" && -f "${_latest}" ]]; then
+      echo "  Latest log: ${_latest}" >&2
+      tail -200 "${_latest}" 2>/dev/null | grep -i "error\|exception\|warn\|fatal" | tail -60 >&2 || true
+    fi
+  fi
+  echo "  --- End Data Store diagnostics ---" >&2
+  set -e
+}
+
+# ---------------------------------------------------------------------------
 # Helper: generate a Portal admin token
 # ---------------------------------------------------------------------------
 generate_portal_token() {
@@ -797,6 +865,43 @@ generate_server_token() {
   _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
   if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
   echo "DEBUG: Server generateToken response: $_resp" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: determine the best Server host name for Data Store registration.
+#
+# Using 127.0.0.1 can lead to TLS/SAN mismatches or subtle registration issues
+# in some environments. Prefer the Server's own machineName from /admin/machines
+# (which matches its internal identity), then fall back to hostname -f.
+# ---------------------------------------------------------------------------
+get_server_host_for_datastore() {
+  local _tok _resp _name
+  _tok=$(generate_server_token 2>/dev/null) || _tok=""
+  if [[ -n "${_tok:-}" ]]; then
+    _resp=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
+      "https://127.0.0.1:6443/arcgis/admin/machines?f=json&token=${_tok}" 2>/dev/null) || _resp=""
+    _name=$(echo "${_resp:-}" | python3 -c "
+import sys, json
+try:
+  data=json.load(sys.stdin)
+  m=(data.get('machines') or [])
+  if not m:
+    print('')
+  else:
+    # machineName is typically a hostname (sometimes includes domain)
+    print((m[0].get('machineName') or '').strip())
+except Exception:
+  print('')
+" 2>/dev/null) || _name=""
+    if [[ -n "${_name:-}" && "${_name:-}" != "None" ]]; then
+      echo "${_name}"
+      return 0
+    fi
+  fi
+
+  _name=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
+  [[ -n "${_name:-}" ]] && { echo "${_name}"; return 0; }
   return 1
 }
 
@@ -1268,13 +1373,27 @@ if (( HAS_FEDERATION == 1 )); then
       -H "Referer: https://localhost:7443/arcgis" \
       "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
       -d "token=${_val_tok}" -d "f=json" 2>/dev/null) || VALIDATE_JSON=""
-    if echo "${VALIDATE_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"\s*:\s*true|\"status\"\s*:\s*\"error\""; then
+    # Validate can return either a structured status object or an error object.
+    # Treat decrypt-token or issuesFound=true as STALE even if it's inside "error".
+    if echo "${VALIDATE_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"[[:space:]]*:[[:space:]]*true|\"status\"[[:space:]]*:[[:space:]]*\"error\""; then
       FEDERATION_VALID=0
-    fi
-    # If the validate endpoint isn't available, it will return an error object.
-    # Don't treat that as stale federation; just fall back to existing behavior.
-    if echo "${VALIDATE_JSON:-}" | grep -q '"error"'; then
-      FEDERATION_VALID=1
+    else
+      # If validate endpoint isn't available (older versions / hardening), it will
+      # return an error object. In that case, don't force re-federation.
+      if echo "${VALIDATE_JSON:-}" | python3 -c "
+import sys, json
+try:
+  data=json.load(sys.stdin)
+  err=(data.get('error') or {})
+  msg=(err.get('message') or '')
+  # Heuristics for 'endpoint missing/unsupported'
+  unsupported=('not found' in msg.lower() or 'unsupported' in msg.lower() or 'does not exist' in msg.lower())
+  sys.exit(0 if unsupported else 1)
+except Exception:
+  sys.exit(1)
+" 2>/dev/null; then
+        FEDERATION_VALID=1
+      fi
     fi
   fi
 fi
@@ -1410,35 +1529,79 @@ echo ""
 if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   cd "$ESRI_BASE/arcgis/datastore/tools"
 
-  # Data Store can take a bit to initialize its admin endpoint after startup.
-  wait_for_service "https://127.0.0.1:2443/arcgis/datastoreadmin/" "ArcGIS Data Store (admin)" 300 || true
+  # Data Store can take a while to initialize its admin endpoint after startup.
+  # If it's not responsive, restart once before attempting configuration.
+  if ! wait_for_datastore_admin 900; then
+    restart_datastore
+  fi
+  if ! wait_for_datastore_admin 180; then
+    echo "ERROR: ArcGIS Data Store admin endpoint is not responding; cannot safely configure stores." >&2
+    datastore_admin_diagnose
+    exit 1
+  fi
 
   configure_datastore_store() {
     local _store="$1"
     local _attempt _out _rc
     local _hosting_ref
+
+    # Build an ordered list of Server refs to try.
     # Per Esri docs, configuredatastore.sh expects a GIS Server machine name
     # or URL in the format https://host:6443 (do not include /arcgis or /admin).
-    _hosting_ref="https://127.0.0.1:6443"
+    local _h1 _h2
+    local -a _refs
+    local -a _uniq
+    local _r _seen
+
+    _h1=$(get_server_host_for_datastore 2>/dev/null) || _h1=""
+    _h2=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
+
+    [[ -n "${_h1:-}" && "${_h1:-}" != "None" ]] && _refs+=("https://${_h1}:6443")
+    [[ -n "${_h2:-}" && "${_h2:-}" != "None" ]] && _refs+=("https://${_h2}:6443")
+    _refs+=("https://localhost:6443")
+    _refs+=("https://127.0.0.1:6443")
+
+    # De-duplicate while preserving order
+    for _r in "${_refs[@]}"; do
+      _seen=0
+      for _hosting_ref in "${_uniq[@]}"; do
+        [[ "${_hosting_ref}" == "${_r}" ]] && { _seen=1; break; }
+      done
+      (( _seen == 0 )) && _uniq+=("${_r}")
+    done
+
     for _attempt in 1 2 3; do
       echo "Configuring ${_store} store (attempt ${_attempt}/3)..."
-      _rc=0
-      _out=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-        "${_hosting_ref}" \
-        "$ADMIN_USER" \
-        "$ADMIN_PASS" \
-        "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-        --stores "${_store}" 2>&1) || _rc=$?
-      echo "${_out}"
 
-      # Success / idempotency patterns
-      (( _rc == 0 )) && return 0
-      echo "${_out}" | grep -qi "already registered\|already configured\|already been configured\|already exists" && return 0
+      # Ensure Data Store admin is up before each attempt.
+      wait_for_datastore_admin 600 || restart_datastore
 
-      # Retry after short backoff
+      for _hosting_ref in "${_uniq[@]}"; do
+        echo "  Trying GIS Server reference: ${_hosting_ref}"
+        _rc=0
+        _out=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+          "${_hosting_ref}" \
+          "$ADMIN_USER" \
+          "$ADMIN_PASS" \
+          "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+          --stores "${_store}" 2>&1) || _rc=$?
+        echo "${_out}"
+
+        # Success / idempotency patterns
+        (( _rc == 0 )) && return 0
+        echo "${_out}" | grep -qi "already registered\|already configured\|already been configured\|already exists" && return 0
+
+        # If Data Store returns the common null-arg error, treat it as a transient
+        # admin/API readiness issue; restart Data Store once and continue.
+        if echo "${_out}" | grep -qi "Method argument cannot be null"; then
+          echo "  Detected Data Store admin error (null argument). Restarting Data Store before retry..."
+          restart_datastore
+        fi
+      done
+
       if (( _attempt < 3 )); then
-        echo "WARNING: ${_store} store configuration failed (rc=${_rc}). Retrying in 60s..."
-        sleep 60
+        echo "WARNING: ${_store} store configuration failed (attempt ${_attempt}). Retrying in 90s..."
+        sleep 90
       fi
     done
     return 1
@@ -1507,6 +1670,22 @@ for s in data.get('servers',[]):
         echo "  Hosting server result: $HOSTING_RESULT"
       else
         echo "WARNING: Could not find federated server ID to set as hosting."
+      fi
+
+      # Post-step validation: surface federation issues immediately.
+      echo "Validating federated server sites..."
+      _VAL_JSON=$("${CURL_BASE[@]}" --max-time 180 -X POST \
+        -H "Referer: https://localhost:7443/arcgis" \
+        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
+        -d "token=$PORTAL_TOKEN_HOSTING" -d "f=json" 2>/dev/null) || _VAL_JSON=""
+      if echo "${_VAL_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"[[:space:]]*:[[:space:]]*true|\"status\"[[:space:]]*:[[:space:]]*\"error\""; then
+        echo "WARNING: Federation validation reports issues. Review Portal → Organization → Settings → Servers." >&2
+        echo "  Validate result: ${_VAL_JSON}" >&2
+      else
+        # If validate isn't supported, it may return an error object; don't fail.
+        if [[ -n "${_VAL_JSON:-}" ]]; then
+          echo "  Validation result: ${_VAL_JSON}"
+        fi
       fi
     else
       echo "WARNING: Could not get Portal token to set hosting server role."

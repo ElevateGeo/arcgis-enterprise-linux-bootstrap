@@ -26,7 +26,7 @@
 | 🌐 **Portal for ArcGIS** | Web GIS hub |
 | 🖥️ **ArcGIS GIS Server** | Map/feature services |
 | 💾 **ArcGIS Data Store** | Relational + object stores |
-| 🔌 **Web Adaptor** | Java / Tomcat 9 (auto-installed; Tomcat 10 is incompatible) |
+| 🔌 **Web Adaptor** | Java / Tomcat 10.1 (auto-installed; required for 12.x Web Adaptor WAR) |
 | 🔒 **HTTPS** | Let's Encrypt via Cloudflare DNS |
 | ⚡ **NGINX** | Reverse proxy with WebSocket support |
 | 📄 **Config** | `.env`-based (no secrets in scripts) |
@@ -209,8 +209,8 @@ The `install.sh` script follows [Esri's documented deployment order](https://ent
 | 1️⃣1️⃣ | Create Server site (`createsite.sh`) | [📖](https://enterprise.arcgis.com/en/server/12.0/deploy/linux/creating-a-new-site.htm) |
 | 1️⃣2️⃣ | Create Portal with JSON license (`-lf` flag) | [📖](https://enterprise.arcgis.com/en/portal/12.0/install/linux/create-a-single-machine-portal.htm) |
 | 1️⃣3️⃣ | Configure Web Adaptors | [📖](https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/configure-arcgis-web-adaptor-portal.htm) |
-| 1️⃣4️⃣ | Register relational & object data stores | [📖](https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm) |
-| 1️⃣5️⃣ | Federate Server with Portal | [📖](https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm) |
+| 1️⃣4️⃣ | Federate Server with Portal | [📖](https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm) |
+| 1️⃣5️⃣ | Register/configure relational & object data stores | [📖](https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm) |
 
 ---
 
