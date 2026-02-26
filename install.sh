@@ -256,19 +256,67 @@ fi
 
 echo "Using Tomcat 10 at: $TOMCAT_HOME"
 
-# Ensure the VM can resolve its own FQDN to localhost (127.0.0.1).
-# We specifically check if the domain is mapped to 127.0.0.1, not just "present in the file".
-# This prevents issues where the domain might be mapped to the private networking IP
-# (which can fail hairpinning) or the public IP (which usually fails hairpinning).
-if ! grep -q "127.0.0.1.*$DOMAIN" /etc/hosts 2>/dev/null; then
-  echo "Adding 127.0.0.1 $DOMAIN to /etc/hosts for local resolution..."
-  # If the domain is already there (e.g. on another IP), we append the localhost entry.
-  # Most resolvers prioritize /etc/hosts order, but having a distinct 127.0.0.1 entry 
-  # is usually sufficient for curl/local tools.
-  echo "127.0.0.1  $DOMAIN" >> /etc/hosts
-else
-  echo "Host logic: $DOMAIN is already mapped to 127.0.0.1 in /etc/hosts."
-fi
+# --------------------------------------------------------------------------------
+# /etc/hosts hygiene
+#
+# ArcGIS Server warns (and can behave badly) if the hostname entry in /etc/hosts
+# does not match the machine's primary IP. Also, for reverse-proxy deployments,
+# we often need the public FQDN to resolve locally to 127.0.0.1 to avoid hairpin
+# NAT problems during federation and other internal calls.
+# --------------------------------------------------------------------------------
+
+ensure_hostname_hosts_mapping() {
+  local _host _fqdn _ip
+  _host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+  _fqdn=$(hostname -f 2>/dev/null || echo "${_host}")
+  _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+  [[ -z "${_host:-}" || -z "${_ip:-}" ]] && return 0
+
+  # If already mapped correctly, do nothing.
+  if grep -Eq "^${_ip}[[:space:]]+${_fqdn}([[:space:]]|$)" /etc/hosts 2>/dev/null || \
+     grep -Eq "^${_ip}[[:space:]]+${_host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Fixing /etc/hosts: mapping hostname (${_host}/${_fqdn}) to ${_ip} ..."
+
+  # Rebuild hosts file to ensure the correct mapping appears before any stale ones.
+  # Keep localhost entries, drop any lines referencing the host/fqdn, then insert
+  # the correct mapping near the top.
+  local _tmp
+  _tmp=$(mktemp)
+  awk -v h="${_host}" -v f="${_fqdn}" -v ip="${_ip}" '
+    BEGIN { inserted=0 }
+    # Preserve the canonical localhost lines first
+    /^127\.0\.0\.1[[:space:]]/ {
+      print $0
+      next
+    }
+    # Insert the correct hostname mapping once, right after localhost entries
+    inserted==0 {
+      print ip "  " f " " h
+      inserted=1
+    }
+    # Drop any existing mappings for host/fqdn (to avoid Esri mismatch warning)
+    $0 ~ ("(^|[[:space:]])" h "([[:space:]]|$)") { next }
+    $0 ~ ("(^|[[:space:]])" f "([[:space:]]|$)") { next }
+    { print $0 }
+  ' /etc/hosts > "${_tmp}"
+  cat "${_tmp}" > /etc/hosts
+  rm -f "${_tmp}"
+}
+
+ensure_domain_localhost_mapping() {
+  # Ensure the public domain resolves to localhost for in-VM calls.
+  if ! grep -Eq "^127\.0\.0\.1[[:space:]]+${DOMAIN}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    echo "Adding 127.0.0.1 $DOMAIN to /etc/hosts for local resolution..."
+    echo "127.0.0.1  $DOMAIN" >> /etc/hosts
+  fi
+}
+
+ensure_hostname_hosts_mapping
+ensure_domain_localhost_mapping
 
 # ==============================================================================
 # Step 2: SSL Certificates (Cloudflare DNS validation)
@@ -785,13 +833,15 @@ SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store"
 # ---------------------------------------------------------------------------
 server_admin_is_healthy() {
   local _info _tok _sec
-  _info=$(curl -sk "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
+  _info=$(curl -sk -H "Referer: https://localhost:6443/arcgis/admin" \
+    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
   echo "$_info" | grep -q '"currentVersion"' || return 1
   _tok=$(generate_server_token 2>/dev/null) || return 1
   [[ -n "$_tok" ]] || return 1
   # /admin/security/config must return a valid config (not an error).
   # A broken SecurityConfig causes this endpoint to return {"error": ...}.
-  _sec=$(curl -sk "$SERVER_ADMIN_URL/security/config?f=json&token=$_tok" 2>/dev/null) || return 1
+  _sec=$(curl -sk -H "Referer: https://localhost:6443/arcgis/admin" \
+    "$SERVER_ADMIN_URL/security/config?f=json&token=$_tok" 2>/dev/null) || return 1
   echo "$_sec" | grep -q '"error"' && return 1
   # Must contain authenticationTier or allowedAdminAccessIPs — any real key
   echo "$_sec" | grep -qE '"authenticationTier"|"allowedAdminAccessIPs"|"virtualDirsSecurityEnabled"' || return 1
@@ -812,11 +862,9 @@ wipe_server_config_store() {
   done
 
   # Wipe Config Store
-  local _cs_bak="${ESRI_BASE}/arcgis/server/usr/config-store.bak.$(date +%s)"
   if [[ -d "$SERVER_CS" ]]; then
-    # remove content recursively instead of moving the folder to avoid permission issues
-    # or "device busy" errors if it's a mount point.
-    rm -rf "$SERVER_CS"/* "$SERVER_CS"/.* 2>/dev/null || true
+    # Use find -delete to safely remove dotfiles without touching '.'/'..'.
+    find "$SERVER_CS" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     echo "  Config-store wiped."
   fi
   mkdir -p "$SERVER_CS"
@@ -825,7 +873,7 @@ wipe_server_config_store() {
   # Wipe Server Directories (critical for clean createsite)
   local _dirs="$ESRI_BASE/arcgis/server/usr/directories"
   if [[ -d "$_dirs" ]]; then
-    rm -rf "$_dirs"/* "$_dirs"/.* 2>/dev/null || true
+    find "$_dirs" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     echo "  Server directories wiped."
   fi
   mkdir -p "$_dirs"
@@ -1047,6 +1095,7 @@ PREV_TOKEN=$(generate_portal_token 2>/dev/null) || PREV_TOKEN=""
 EXISTING_FEDERATION=""
 if [[ -n "${PREV_TOKEN:-}" ]]; then
   EXISTING_FEDERATION=$(curl -sk \
+    -H "Referer: https://localhost:7443/arcgis" \
     "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PREV_TOKEN" \
     2>/dev/null) || EXISTING_FEDERATION=""
 fi
@@ -1085,8 +1134,7 @@ else
     # ------------------------------------------------------------------
     # Step 14c: Federate.
     #
-    # We use the internal local URL for the 'adminUrl' to ensure Portal
-    # can communipublic URL for both 'url' and 'adminUrl', assuming local
+    # We use the public URL for both 'url' and 'adminUrl', assuming local
     # DNS resolution (via /etc/hosts) routes this to localhost/127.0.0.1.
     # This avoids ClassCastException issues caused by protocol mismatches
     # or unexpected URL patterns (e.g. using localhost directly).
@@ -1133,26 +1181,7 @@ else
     else
       echo "  Federation successful."
       sleep 10
-
-      # Set as hosting server
-      echo "  Setting Server as hosting server..."
-      SERVERS=$(curl -sk \
-        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$TOKEN" \
-        2>/dev/null) || SERVERS=""
-      FEDERATED_SERVER_ID=$(echo "$SERVERS" | python3 -c \
-        "import sys,json; s=json.load(sys.stdin).get('servers',[]); print(s[0]['id'] if s else '')" \
-        2>/dev/null) || FEDERATED_SERVER_ID=""
-
-      if [[ -n "$FEDERATED_SERVER_ID" ]]; then
-        HOSTING_RESULT=$(curl -sk -X POST \
-          "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
-          -d "serverRole=HOSTING_SERVER" \
-          -d "token=$TOKEN" \
-          -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
-        echo "  Hosting server result: $HOSTING_RESULT"
-      else
-        echo "  WARNING: Could not find federated server ID to set as hosting."
-      fi
+      echo "  Federation successful. (Hosting server role will be set after Data Store registration in Step 15.)"
     fi
 
   fi  # TOKEN check
@@ -1173,36 +1202,80 @@ echo ""
 if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   cd "$ESRI_BASE/arcgis/datastore/tools"
 
-  # Check if relational data store is already registered
-  DS_STATUS=$(sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || echo "")
-  if echo "$DS_STATUS" | grep -qi "relational"; then
-    echo "Relational data store already registered, skipping..."
+  # IMPORTANT:
+  # A Server site may have been recreated in Step 11 (config-store wipe + createsite).
+  # In that case, Data Store must be re-registered with the *new* Server site.
+  # describedatastore.sh output can be misleading for this purpose, so we attempt
+  # registration idempotently and tolerate "already registered" output.
+  DS_REL_OK=0
+  DS_OBJ_OK=0
+
+  echo "Registering relational data store with Server (idempotent)..."
+  DS_REL_OUT=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+    "https://localhost:6443/arcgis/admin" \
+    "$ADMIN_USER" \
+    "$ADMIN_PASS" \
+    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+    --stores relational 2>&1) || DS_REL_OK=$?
+  echo "$DS_REL_OUT"
+  if (( DS_REL_OK != 0 )) && ! echo "$DS_REL_OUT" | grep -qi "already registered"; then
+    echo "ERROR: Relational data store registration failed."
   else
-    echo "Registering relational data store with Server..."
-    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-      "https://localhost:6443/arcgis/admin" \
-      "$ADMIN_USER" \
-      "$ADMIN_PASS" \
-      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-      --stores relational 2>&1 || {
-        echo "ERROR: Relational data store registration failed."
-      }
-    sleep 10
+    DS_REL_OK=0
+  fi
+  sleep 10
+
+  echo "Registering object store with Server (idempotent)..."
+  DS_OBJ_OUT=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+    "https://localhost:6443/arcgis/admin" \
+    "$ADMIN_USER" \
+    "$ADMIN_PASS" \
+    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+    --stores object 2>&1) || DS_OBJ_OK=$?
+  echo "$DS_OBJ_OUT"
+  if (( DS_OBJ_OK != 0 )) && ! echo "$DS_OBJ_OUT" | grep -qi "already registered"; then
+    echo "ERROR: Object store registration failed."
+  else
+    DS_OBJ_OK=0
   fi
 
-  # Object store is required for the base deployment in 12.0
-  if echo "$DS_STATUS" | grep -qi "object"; then
-    echo "Object store already registered, skipping..."
+  # After Data Store registration, promote the federated Server to Hosting Server.
+  # Portal validation requires a managed database (ArcGIS Data Store) registered.
+  if (( DS_REL_OK == 0 && DS_OBJ_OK == 0 )); then
+    PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
+    if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
+      SERVERS_JSON=$(curl -sk \
+        -H "Referer: https://localhost:7443/arcgis" \
+        "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PORTAL_TOKEN_HOSTING" \
+        2>/dev/null) || SERVERS_JSON=""
+
+      FEDERATED_SERVER_ID=$(echo "$SERVERS_JSON" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+target='https://%s/server' % '${DOMAIN}'
+for s in data.get('servers',[]):
+    if s.get('url','') == target or s.get('adminUrl','') == target:
+        print(s.get('id',''))
+        break
+" 2>/dev/null) || FEDERATED_SERVER_ID=""
+
+      if [[ -n "${FEDERATED_SERVER_ID:-}" ]]; then
+        echo "Setting federated Server as hosting server..."
+        HOSTING_RESULT=$(curl -sk -X POST \
+          -H "Referer: https://localhost:7443/arcgis" \
+          "https://localhost:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+          -d "serverRole=HOSTING_SERVER" \
+          -d "token=$PORTAL_TOKEN_HOSTING" \
+          -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
+        echo "  Hosting server result: $HOSTING_RESULT"
+      else
+        echo "WARNING: Could not find federated server ID to set as hosting."
+      fi
+    else
+      echo "WARNING: Could not get Portal token to set hosting server role."
+    fi
   else
-    echo "Registering object store with Server..."
-    sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-      "https://localhost:6443/arcgis/admin" \
-      "$ADMIN_USER" \
-      "$ADMIN_PASS" \
-      "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-      --stores object 2>&1 || {
-        echo "ERROR: Object store registration failed."
-      }
+    echo "WARNING: Skipping hosting server promotion due to Data Store registration errors."
   fi
 else
   echo "ERROR: Data Store tools directory not found."
@@ -1226,6 +1299,7 @@ if [[ -n "$PORTAL_TOKEN" ]]; then
 
   # Check current properties to avoid unnecessary restart
   CURRENT_PROPS=$(curl -sk \
+    -H "Referer: https://localhost:7443/arcgis" \
     "https://localhost:7443/arcgis/portaladmin/system/properties?f=json&token=$PORTAL_TOKEN" \
     2>/dev/null) || CURRENT_PROPS=""
   CURRENT_WCU=$(echo "$CURRENT_PROPS" | python3 -c \
@@ -1238,6 +1312,7 @@ if [[ -n "$PORTAL_TOKEN" ]]; then
     echo "  Setting Portal privatePortalURL = https://$PORTAL_INTERNAL_HOST:7443/arcgis"
     CTX_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/system/properties/update" \
+      -H "Referer: https://localhost:7443/arcgis" \
       --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
       -d "token=$PORTAL_TOKEN" \
       -d "f=json" 2>/dev/null) || CTX_RESULT=""
@@ -1262,6 +1337,7 @@ SRV_TOK=$(generate_server_token 2>/dev/null) || SRV_TOK=""
 if [[ -n "$SRV_TOK" ]]; then
   CTX_RESULT=$(curl -sk -X POST \
     "https://localhost:6443/arcgis/admin/system/properties/update" \
+    -H "Referer: https://localhost:6443/arcgis/admin" \
     --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
     -d "token=$SRV_TOK" -d "f=json" 2>/dev/null) || CTX_RESULT=""
   echo "  Result: $CTX_RESULT"
@@ -1278,6 +1354,7 @@ fi
 PORTAL_TOKEN=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN=""
 if [[ -n "$PORTAL_TOKEN" ]]; then
   SERVERS_JSON=$(curl -sk \
+    -H "Referer: https://localhost:7443/arcgis" \
     "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PORTAL_TOKEN" \
     2>/dev/null) || SERVERS_JSON=""
   FED_ID=$(echo "$SERVERS_JSON" | python3 -c "
@@ -1296,6 +1373,7 @@ for s in data.get('servers',[]):
     echo "Updating federation services URL to https://$DOMAIN/server ..."
     UPD_RESULT=$(curl -sk -X POST \
       "https://localhost:7443/arcgis/portaladmin/federation/servers/$FED_ID/update" \
+      -H "Referer: https://localhost:7443/arcgis" \
       -d "url=https://$DOMAIN/server" \
       -d "adminUrl=$FED_ADMIN" \
       -d "token=$PORTAL_TOKEN" \
