@@ -1396,6 +1396,13 @@ if (( HAS_FEDERATION == 1 )); then
       -H "Referer: https://localhost:7443/arcgis" \
       "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
       -d "token=${_val_tok}" -d "f=json" 2>/dev/null) || VALIDATE_JSON=""
+    # Some Portal builds return HTML 405 for POST validate. If the response is not
+    # valid JSON, treat it as empty so we fall back to GET.
+    if [[ -n "${VALIDATE_JSON:-}" ]]; then
+      if ! echo "${VALIDATE_JSON:-}" | python3 -c "import sys,json; json.load(sys.stdin)" >/dev/null 2>&1; then
+        VALIDATE_JSON=""
+      fi
+    fi
     if [[ -z "${VALIDATE_JSON:-}" ]]; then
       VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 \
         -H "Referer: https://localhost:7443/arcgis" \
@@ -1723,7 +1730,7 @@ sys.exit(1)
           "$ADMIN_USER" \
           "$ADMIN_PASS" \
           "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-          --stores "${_store}" 2>&1) || _rc=$?
+          --stores "${_store}" --prompt no 2>&1) || _rc=$?
         echo "${_out}"
 
         # Success / idempotency patterns
@@ -1745,6 +1752,51 @@ sys.exit(1)
         echo "WARNING: ${_store} store configuration failed (attempt ${_attempt}). Retrying in 90s..."
         sleep 90
       fi
+    done
+    return 1
+  }
+
+  reregister_datastore_store() {
+    # For already-configured stores, use Esri's registerdatastore.sh to refresh
+    # registration with the hosting GIS Server site. This is safer than
+    # re-running configuredatastore.sh (which can fail with null-argument).
+    local _store="$1"
+    local _h1 _h2
+    local -a _hosts _urls _uniq
+    local _u _seen _rc _out
+
+    [[ -x ./registerdatastore.sh ]] || return 1
+
+    _h1=$(get_server_host_for_datastore 2>/dev/null) || _h1=""
+    _h2=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
+
+    _hosts=("${_h1}" "${_h2}" "${DOMAIN}" "localhost" "127.0.0.1")
+    for h in "${_hosts[@]}"; do
+      [[ -z "${h:-}" || "${h:-}" == "None" ]] && continue
+      # registerdatastore expects https://host:6443 (no /arcgis, no /admin)
+      _urls+=("https://${h}:6443")
+    done
+
+    # De-duplicate while preserving order
+    for _u in "${_urls[@]}"; do
+      _seen=0
+      for x in "${_uniq[@]}"; do
+        [[ "${x}" == "${_u}" ]] && { _seen=1; break; }
+      done
+      (( _seen == 0 )) && _uniq+=("${_u}")
+    done
+
+    for _u in "${_uniq[@]}"; do
+      echo "  Re-registering ${_store} store using Server URL: ${_u}"
+      _rc=0
+      _out=$(sudo -u "$ARCGIS_USER" ./registerdatastore.sh \
+        "${_u}" \
+        "$ADMIN_USER" \
+        "$ADMIN_PASS" \
+        --stores "${_store}" --prompt no 2>&1) || _rc=$?
+      echo "${_out}"
+      (( _rc == 0 )) && return 0
+      echo "${_out}" | grep -qi "already registered\|already.*registered" && return 0
     done
     return 1
   }
@@ -1825,19 +1877,39 @@ for s in data.get('servers',[]):
 
         if echo "${HOSTING_RESULT:-}" | grep -q '"error"'; then
           # If the role update fails and we skipped relational as "already configured",
-          # attempt a one-time relational configure + retry hosting promotion.
+          # prefer Esri's registerdatastore (re-register) and only fall back to
+          # configuredatastore if needed.
           if (( REL_SKIPPED_CONFIGURED == 1 )); then
-            echo "WARNING: Hosting server role update failed; attempting one-time relational store reconfiguration then retry..." >&2
-            if configure_datastore_store relational; then
-              PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
-              if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
-                HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
-                  -H "Referer: https://localhost:7443/arcgis" \
-                  "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
-                  -d "serverRole=HOSTING_SERVER" \
-                  -d "token=$PORTAL_TOKEN_HOSTING" \
-                  -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
-                echo "  Hosting server retry result: $HOSTING_RESULT"
+            if echo "${HOSTING_RESULT:-}" | grep -qi "requires the ArcGIS Server has an ArcGIS Data Store registered as a managed database"; then
+              echo "WARNING: Hosting server role update failed; attempting relational store re-registration then retry..." >&2
+              if reregister_datastore_store relational; then
+                sleep 15
+                PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
+                if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
+                  HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
+                    -H "Referer: https://localhost:7443/arcgis" \
+                    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+                    -d "serverRole=HOSTING_SERVER" \
+                    -d "token=$PORTAL_TOKEN_HOSTING" \
+                    -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
+                  echo "  Hosting server retry result: $HOSTING_RESULT"
+                fi
+              fi
+            fi
+
+            if echo "${HOSTING_RESULT:-}" | grep -q '"error"'; then
+              echo "WARNING: Hosting server role still failing; attempting one-time relational store reconfiguration then retry..." >&2
+              if configure_datastore_store relational; then
+                PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
+                if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
+                  HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
+                    -H "Referer: https://localhost:7443/arcgis" \
+                    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+                    -d "serverRole=HOSTING_SERVER" \
+                    -d "token=$PORTAL_TOKEN_HOSTING" \
+                    -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
+                  echo "  Hosting server retry result: $HOSTING_RESULT"
+                fi
               fi
             fi
           fi
@@ -1853,10 +1925,10 @@ for s in data.get('servers',[]):
 
       # Post-step validation: surface federation issues immediately.
       echo "Validating federated server sites..."
-      _VAL_JSON=$("${CURL_BASE[@]}" --max-time 180 -X POST \
+      _VAL_JSON=$("${CURL_BASE[@]}" --max-time 180 \
         -H "Referer: https://localhost:7443/arcgis" \
-        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
-        -d "token=$PORTAL_TOKEN_HOSTING" -d "f=json" 2>/dev/null) || _VAL_JSON=""
+        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate?token=$PORTAL_TOKEN_HOSTING&f=json" \
+        2>/dev/null) || _VAL_JSON=""
       if echo "${_VAL_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"[[:space:]]*:[[:space:]]*true|\"status\"[[:space:]]*:[[:space:]]*\"error\""; then
         echo "WARNING: Federation validation reports issues. Review Portal → Organization → Settings → Servers." >&2
         echo "  Validate result: ${_VAL_JSON}" >&2
