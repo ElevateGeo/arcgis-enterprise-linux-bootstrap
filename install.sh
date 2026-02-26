@@ -1105,7 +1105,8 @@ else
       "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
       -H "Referer: https://localhost:7443/arcgis" \
       -d "url=https://$DOMAIN/server" \
-      -d "adminUrl=https://$DOMAIN/server
+      -d "adminUrl=https://$DOMAIN/server" \
+      -d "username=$ADMIN_USER" \
       -d "password=$ADMIN_PASS" \
       -d "token=$TOKEN" \
       -d "f=json" 2>/dev/null) || FEDERATE_RESULT=""
