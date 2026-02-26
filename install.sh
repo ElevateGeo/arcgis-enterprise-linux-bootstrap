@@ -1256,11 +1256,39 @@ if echo "$EXISTING_FEDERATION" | python3 -c \
   HAS_FEDERATION=1
 fi
 
-if (( HAS_FEDERATION == 1 && SERVER_SITE_RECREATED == 0 )); then
-  echo "Server is already federated with Portal, skipping..."
+# If Portal thinks a server is federated, validate it. Stale federation commonly
+# shows up as "Could not decrypt token" when validating server sites.
+FEDERATION_VALID=1
+VALIDATE_JSON=""
+if (( HAS_FEDERATION == 1 )); then
+  _val_tok="$PREV_TOKEN"
+  [[ -z "${_val_tok:-}" ]] && _val_tok=$(generate_portal_token 2>/dev/null) || true
+  if [[ -n "${_val_tok:-}" ]]; then
+    VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 -X POST \
+      -H "Referer: https://localhost:7443/arcgis" \
+      "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
+      -d "token=${_val_tok}" -d "f=json" 2>/dev/null) || VALIDATE_JSON=""
+    if echo "${VALIDATE_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"\s*:\s*true|\"status\"\s*:\s*\"error\""; then
+      FEDERATION_VALID=0
+    fi
+    # If the validate endpoint isn't available, it will return an error object.
+    # Don't treat that as stale federation; just fall back to existing behavior.
+    if echo "${VALIDATE_JSON:-}" | grep -q '"error"'; then
+      FEDERATION_VALID=1
+    fi
+  fi
+fi
+
+if (( HAS_FEDERATION == 1 && SERVER_SITE_RECREATED == 0 && FEDERATION_VALID == 1 )); then
+  echo "Server is already federated with Portal (validated), skipping..."
 else
-  if (( HAS_FEDERATION == 1 && SERVER_SITE_RECREATED == 1 )); then
-    echo "Server was recreated in Step 11 — existing federation is stale. Unfederating then re-federating..."
+  if (( HAS_FEDERATION == 1 )); then
+    if (( SERVER_SITE_RECREATED == 1 )); then
+      echo "Server was recreated in Step 11 — existing federation is stale. Unfederating then re-federating..."
+    else
+      echo "Existing federation appears unhealthy/stale — unfederating then re-federating..."
+      [[ -n "${VALIDATE_JSON:-}" ]] && echo "  Validate result: ${VALIDATE_JSON}"
+    fi
     TOKEN_UNFED=$(generate_portal_token 2>/dev/null) || TOKEN_UNFED=""
     if [[ -n "${TOKEN_UNFED:-}" ]]; then
       # Unfederate all existing federated servers (single-machine base deployment expects one).
@@ -1382,6 +1410,40 @@ echo ""
 if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   cd "$ESRI_BASE/arcgis/datastore/tools"
 
+  # Data Store can take a bit to initialize its admin endpoint after startup.
+  wait_for_service "https://127.0.0.1:2443/arcgis/datastoreadmin/" "ArcGIS Data Store (admin)" 300 || true
+
+  configure_datastore_store() {
+    local _store="$1"
+    local _attempt _out _rc
+    local _hosting_ref
+    # Per Esri docs, configuredatastore.sh expects a GIS Server machine name
+    # or URL in the format https://host:6443 (do not include /arcgis or /admin).
+    _hosting_ref="https://127.0.0.1:6443"
+    for _attempt in 1 2 3; do
+      echo "Configuring ${_store} store (attempt ${_attempt}/3)..."
+      _rc=0
+      _out=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
+        "${_hosting_ref}" \
+        "$ADMIN_USER" \
+        "$ADMIN_PASS" \
+        "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
+        --stores "${_store}" 2>&1) || _rc=$?
+      echo "${_out}"
+
+      # Success / idempotency patterns
+      (( _rc == 0 )) && return 0
+      echo "${_out}" | grep -qi "already registered\|already configured\|already been configured\|already exists" && return 0
+
+      # Retry after short backoff
+      if (( _attempt < 3 )); then
+        echo "WARNING: ${_store} store configuration failed (rc=${_rc}). Retrying in 60s..."
+        sleep 60
+      fi
+    done
+    return 1
+  }
+
   # IMPORTANT:
   # A Server site may have been recreated in Step 11 (config-store wipe + createsite).
   # In that case, Data Store must be re-registered with the *new* Server site.
@@ -1391,32 +1453,27 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
   DS_OBJ_OK=0
 
   echo "Registering relational data store with Server (idempotent)..."
-  DS_REL_OUT=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-    "https://127.0.0.1:6443/arcgis/admin" \
-    "$ADMIN_USER" \
-    "$ADMIN_PASS" \
-    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-    --stores relational 2>&1) || DS_REL_OK=$?
-  echo "$DS_REL_OUT"
-  if (( DS_REL_OK != 0 )) && ! echo "$DS_REL_OUT" | grep -qi "already registered"; then
-    echo "ERROR: Relational data store registration failed."
-  else
-    DS_REL_OK=0
+  if ! configure_datastore_store relational; then
+    DS_REL_OK=1
+    echo "ERROR: Relational data store registration failed after retries."
   fi
   sleep 10
 
   echo "Registering object store with Server (idempotent)..."
-  DS_OBJ_OUT=$(sudo -u "$ARCGIS_USER" ./configuredatastore.sh \
-    "https://127.0.0.1:6443/arcgis/admin" \
-    "$ADMIN_USER" \
-    "$ADMIN_PASS" \
-    "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" \
-    --stores object 2>&1) || DS_OBJ_OK=$?
-  echo "$DS_OBJ_OUT"
-  if (( DS_OBJ_OK != 0 )) && ! echo "$DS_OBJ_OUT" | grep -qi "already registered"; then
-    echo "ERROR: Object store registration failed."
-  else
-    DS_OBJ_OK=0
+  if ! configure_datastore_store object; then
+    DS_OBJ_OK=1
+    echo "ERROR: Object store registration failed after retries."
+  fi
+
+  if (( DS_REL_OK != 0 || DS_OBJ_OK != 0 )); then
+    if [[ -x ./describedatastore.sh ]]; then
+      echo ""
+      echo "--- describedatastore.sh output (for troubleshooting) ---"
+      sudo -u "$ARCGIS_USER" ./describedatastore.sh 2>/dev/null || true
+      echo "--- end describedatastore.sh output ---"
+    fi
+    echo "ERROR: Data Store configuration incomplete; aborting (hosting server promotion and reverse-proxy updates depend on a healthy relational + object store)." >&2
+    exit 1
   fi
 
   # After Data Store registration, promote the federated Server to Hosting Server.
@@ -1454,8 +1511,6 @@ for s in data.get('servers',[]):
     else
       echo "WARNING: Could not get Portal token to set hosting server role."
     fi
-  else
-    echo "WARNING: Skipping hosting server promotion due to Data Store registration errors."
   fi
 else
   echo "ERROR: Data Store tools directory not found."
