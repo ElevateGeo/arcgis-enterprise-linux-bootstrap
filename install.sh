@@ -760,18 +760,31 @@ wait_for_datastore_admin() {
   local max_wait="${1:-600}"
   local elapsed=0
   local url_health="https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json"
+  local url_json="https://127.0.0.1:2443/arcgis/datastoreadmin/?f=json"
   local url_root="https://127.0.0.1:2443/arcgis/datastoreadmin/"
+  local _resp
 
   echo "Waiting for ArcGIS Data Store (admin) to be ready at ${url_health} ..."
   while (( elapsed < max_wait )); do
-    # healthCheck returns JSON with status=success
-    if "${CURL_BASE[@]}" "${url_health}" 2>/dev/null | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"'; then
+    # Some ArcGIS Data Store builds do NOT expose datastoreadmin/healthCheck.
+    # Treat 404 as "endpoint not available" and fall back to other probes.
+    _resp=$("${CURL_BASE[@]}" "${url_health}" 2>/dev/null) || _resp=""
+    if echo "${_resp}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"'; then
       echo "ArcGIS Data Store (admin) is ready."
       return 0
     fi
-    # Fallback probe: at least the web app responds
-    if "${CURL_BASE[@]}" "${url_root}" 2>/dev/null | grep -qiE 'datastoreadmin|arcgis'; then
+
+    # Probe the admin root as JSON (common REST pattern).
+    _resp=$("${CURL_BASE[@]}" "${url_json}" 2>/dev/null) || _resp=""
+    if echo "${_resp}" | grep -qiE '"currentVersion"|"release"|"build"|"machineName"|"status"'; then
       echo "ArcGIS Data Store (admin) is responding."
+      return 0
+    fi
+
+    # Last-resort probe: at least the web app responds with HTML.
+    _resp=$("${CURL_BASE[@]}" "${url_root}" 2>/dev/null) || _resp=""
+    if echo "${_resp}" | grep -qiE 'datastoreadmin|arcgis data store|generate token'; then
+      echo "ArcGIS Data Store (admin) is responding (HTML)."
       return 0
     fi
 
@@ -803,14 +816,23 @@ restart_datastore() {
 datastore_admin_diagnose() {
   set +e
   echo "  --- Data Store diagnostics ---" >&2
-  echo "  Admin healthCheck:" >&2
-  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json" 2>&1 | tail -40 >&2
+  echo "  Admin healthCheck (may 404 on some builds):" >&2
+  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json" 2>&1 | tail -60 >&2
+  echo "" >&2
+  echo "  Admin root JSON probe:" >&2
+  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/?f=json" 2>&1 | tail -60 >&2
   echo "" >&2
 
-  local _log_dir _latest
+  local _log_dir _latest _lck
   _log_dir="$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore/logs"
   if [[ -d "${_log_dir}" ]]; then
-    _latest=$(find "${_log_dir}" -type f \( -name "*.log" -o -name "*.log.*" \) 2>/dev/null | sort | tail -1)
+    # Prefer real log files; ignore lock files (*.lck).
+    _latest=$(find "${_log_dir}" -type f \( -name "*.log" -o -name "*.log.*" \) ! -name "*.lck" 2>/dev/null | sort | tail -1)
+    if [[ -z "${_latest:-}" ]]; then
+      # If only .lck exists, try the same path without the .lck suffix.
+      _lck=$(find "${_log_dir}" -type f -name "*.lck" 2>/dev/null | sort | tail -1)
+      [[ -n "${_lck:-}" ]] && _latest="${_lck%.lck}"
+    fi
     if [[ -n "${_latest:-}" && -f "${_latest}" ]]; then
       echo "  Latest log: ${_latest}" >&2
       tail -200 "${_latest}" 2>/dev/null | grep -i "error\|exception\|warn\|fatal" | tail -60 >&2 || true
