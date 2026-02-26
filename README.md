@@ -151,6 +151,22 @@ sudo ./install.sh
 
 > 🔄 The script is **idempotent** — safe to re-run. All steps check for prior completion.
 
+### 🧨 Wipe and Reinstall (destructive)
+
+If you’re stuck in a bad state and want a clean reinstall, you can wipe existing ArcGIS Enterprise components first:
+
+```bash
+sudo ./install.sh --wipe
+```
+
+For non-interactive automation (no prompt), add `--yes`:
+
+```bash
+sudo ./install.sh --wipe --yes
+```
+
+> ⚠️ **Destructive:** `--wipe` deletes the existing deployment under `/opt/esri/arcgis` (Portal/Server/Data Store/Web Adaptor install dirs) and removes Tomcat Web Adaptor deployments. This will remove your existing configuration/content unless you’ve backed it up.
+
 ### ⬆️ Upgrade Existing Installation
 
 1. Place new version installers in `/opt/esri/installers`

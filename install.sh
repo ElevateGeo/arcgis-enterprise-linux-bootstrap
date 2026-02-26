@@ -6,6 +6,82 @@ set -euo pipefail
 # Use IPv4 + timeouts for reliability in health checks and admin calls.
 CURL_BASE=(curl -4 -skS --connect-timeout 5 --max-time 30)
 
+# Base install location used throughout.
+ESRI_BASE="/opt/esri"
+
+usage() {
+  cat <<'USAGE'
+Usage: sudo ./install.sh [options]
+
+Options:
+  --wipe            Remove existing ArcGIS Enterprise components under /opt/esri/arcgis
+                    (Portal/Server/Data Store/Web Adaptor install dirs) before installing.
+                    DESTRUCTIVE: deletes existing deployment content and configuration.
+  --yes             Non-interactive confirmation for --wipe.
+  --help            Show this help.
+USAGE
+}
+
+WIPE_EXISTING=0
+WIPE_YES=0
+for arg in "$@"; do
+  case "$arg" in
+    --wipe) WIPE_EXISTING=1 ;;
+    --yes) WIPE_YES=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) ;;
+  esac
+done
+
+wipe_existing_enterprise() {
+  echo ""
+  echo "!!! WIPE MODE ENABLED !!!"
+  echo "This will DELETE the existing ArcGIS Enterprise deployment under: ${ESRI_BASE}/arcgis"
+  echo "This includes Portal content + hosted layers/data store associations." 
+  echo "If you need backups, stop now and run a proper backup (e.g., webgisdr + Data Store backups)."
+  echo ""
+
+  if (( WIPE_YES == 0 )); then
+    echo "To proceed, type WIPE and press Enter:"
+    read -r _confirm
+    if [[ "${_confirm}" != "WIPE" ]]; then
+      echo "Wipe cancelled."
+      exit 1
+    fi
+  fi
+
+  echo "Stopping services (best-effort)..."
+  systemctl stop arcgisportal 2>/dev/null || true
+  systemctl stop arcgisserver 2>/dev/null || true
+  systemctl stop arcgisdatastore 2>/dev/null || true
+  systemctl stop tomcat10 2>/dev/null || true
+
+  # Some installs use init.d wrappers.
+  /etc/init.d/arcgisportal stop 2>/dev/null || true
+  /etc/init.d/arcgisserver stop 2>/dev/null || true
+  /etc/init.d/arcgisdatastore stop 2>/dev/null || true
+
+  # Remove Tomcat Web Adaptor deployments so Step 9 won't falsely skip.
+  if [[ -d "/opt/tomcat10/webapps" ]]; then
+    echo "Removing Tomcat Web Adaptor deployments (portal/server)..."
+    rm -rf /opt/tomcat10/webapps/portal /opt/tomcat10/webapps/server \
+      /opt/tomcat10/webapps/portal.war /opt/tomcat10/webapps/server.war \
+      2>/dev/null || true
+  fi
+
+  echo "Removing ArcGIS Enterprise install directory: ${ESRI_BASE}/arcgis"
+  rm -rf "${ESRI_BASE}/arcgis" 2>/dev/null || true
+
+  # Clean up common service definitions so reinstall recreates them cleanly.
+  echo "Cleaning up ArcGIS service definitions (best-effort)..."
+  rm -f /etc/init.d/arcgisportal /etc/init.d/arcgisserver /etc/init.d/arcgisdatastore 2>/dev/null || true
+  rm -f /etc/systemd/system/arcgisportal.service /etc/systemd/system/arcgisserver.service /etc/systemd/system/arcgisdatastore.service 2>/dev/null || true
+  rm -f /lib/systemd/system/arcgisportal.service /lib/systemd/system/arcgisserver.service /lib/systemd/system/arcgisdatastore.service 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  echo "Wipe complete. Proceeding with install..."
+}
+
 # ArcGIS Enterprise 12.0 Linux Bootstrap - Full Automated Install
 # This script performs a complete single-machine deployment.
 #
@@ -40,6 +116,10 @@ echo "=============================================="
 if [[ $EUID -ne 0 ]]; then
   echo "ERROR: This script must be run as root (sudo)"
   exit 1
+fi
+
+if (( WIPE_EXISTING == 1 )); then
+  wipe_existing_enterprise
 fi
 
 # ---------- Load .env ----------
@@ -149,7 +229,6 @@ prompt_if_empty ADMIN_SECURITY_ANSWER "Security answer" "" "Blue"
 # License files — auto-detect from /opt/esri/licenses before prompting.
 # Portal 12.0+: JSON file for user types and apps
 # Server: .prvc provisioning file
-ESRI_BASE="/opt/esri"
 mkdir -p "$ESRI_BASE/licenses"
 if [[ -z "${PORTAL_LICENSE_FILE:-}" || ! -f "${PORTAL_LICENSE_FILE:-}" ]]; then
   FOUND_PORTAL_LIC=$(find "$ESRI_BASE/licenses" -name "ArcGIS_Enterprise_Portal*.json" 2>/dev/null | head -1)
