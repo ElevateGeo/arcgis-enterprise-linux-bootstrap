@@ -888,6 +888,37 @@ server_admin_is_healthy() {
   return 0
 }
 
+server_site_exists() {
+  local _info
+  _info=$(curl -sk -H "Referer: https://localhost:6443/arcgis/admin" \
+    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null) || return 1
+  echo "$_info" | grep -q '"currentVersion"'
+}
+
+server_admin_diagnose() {
+  echo "  --- Server admin diagnostics ---" >&2
+  echo "  /admin/info:" >&2
+  curl -sk -H "Referer: https://localhost:6443/arcgis/admin" \
+    "$SERVER_ADMIN_URL/info?f=json" 2>/dev/null >&2 || true
+  echo "" >&2
+  echo "  generateToken:" >&2
+  curl -sk -X POST "https://localhost:6443/arcgis/admin/generateToken" \
+    -H "Referer: https://localhost:6443/arcgis/admin" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
+    -d "expiration=60" -d "f=json" 2>/dev/null >&2 || true
+  echo "" >&2
+  local _tok
+  _tok=$(generate_server_token 2>/dev/null) || _tok=""
+  echo "  /admin/security/config (token present: $([[ -n "${_tok:-}" ]] && echo yes || echo no))" >&2
+  if [[ -n "${_tok:-}" ]]; then
+    curl -sk -H "Referer: https://localhost:6443/arcgis/admin" \
+      "$SERVER_ADMIN_URL/security/config?f=json&token=$_tok" 2>/dev/null >&2 || true
+  fi
+  echo "" >&2
+  echo "  --- End diagnostics ---" >&2
+}
+
 # ---------------------------------------------------------------------------
 # Wipe the config-store so createsite.sh starts from a clean slate.
 # Called when admin is known-broken regardless of whether /admin/info works.
@@ -935,6 +966,27 @@ wipe_server_config_store() {
 if server_admin_is_healthy; then
   echo "ArcGIS Server site exists and admin is healthy, skipping..."
 else
+  # If the site exists but admin isn't fully healthy yet, prefer waiting over wiping.
+  # Wiping a partially-initialized but valid site causes long loops and can break
+  # downstream Data Store registration.
+  if server_site_exists; then
+    echo "  Server site exists but admin is not fully healthy yet — waiting before taking destructive action..."
+    _elapsed=0
+    while (( _elapsed < 900 )); do
+      if server_admin_is_healthy; then
+        echo "  Server admin is healthy."
+        break
+      fi
+      sleep 15; _elapsed=$((_elapsed + 15))
+      (( _elapsed % 60 == 0 )) && echo "  ... still waiting for Server admin (${_elapsed}s)"
+    done
+
+    if ! server_admin_is_healthy; then
+      echo "  ERROR: Server admin did not become healthy within 900s." >&2
+      server_admin_diagnose
+      exit 1
+    fi
+  else
   # If the admin is not 100% healthy, we assume the site is broken or non-existent.
   # We FORCE a wipe of the config-store to ensure a clean slate for createsite.sh.
   # Previous attempts to detect "if site exists but broken" were flaky.
@@ -955,20 +1007,10 @@ else
   echo "  Using fresh Server config-store: $SERVER_CS"
   echo "  Using fresh Server directories:  $SERVER_DIRS"
 
-  # Give the admin endpoint a moment to be ready for createsite.sh.
-  # createsite.sh internally polls /arcgis/rest/info/healthCheck — wait for
-  # that to succeed before invoking it to avoid "Failed for healthcheck" errors.
-  echo "  Waiting for Server healthCheck before running createsite..."
-  _cs_wait=0
-  while (( _cs_wait < 120 )); do
-    _hc=$(curl -sk "https://localhost:6443/arcgis/rest/info/healthCheck?f=json" 2>/dev/null) || _hc=""
-    if echo "$_hc" | grep -q '"success"'; then
-      echo "  Server healthCheck passed."
-      break
-    fi
-    sleep 5; _cs_wait=$((_cs_wait + 5))
-    (( _cs_wait % 30 == 0 )) && echo "    ... still waiting for healthCheck (${_cs_wait}s)"
-  done
+  # Give Server a moment to finish starting before createsite.
+  # On a no-site instance, REST endpoints may not respond yet; createsite.sh
+  # has its own internal checks.
+  sleep 20
 
   # Now create (or recreate) the site.
   # IMPORTANT: use "|| _cs_rc=$?" not "|| true" so we capture the real exit
@@ -999,7 +1041,7 @@ else
   # Wait for admin to be fully operational (token generation must succeed)
   echo "  Waiting for Server admin to be fully ready after site creation..."
   _elapsed=0
-  while (( _elapsed < 300 )); do
+  while (( _elapsed < 900 )); do
     if server_admin_is_healthy; then
       echo "  Server admin is healthy."
       break
@@ -1008,10 +1050,12 @@ else
     echo "  ... still waiting for Server admin (${_elapsed}s)"
   done
   if ! server_admin_is_healthy; then
-    echo "  ERROR: Server admin did not become healthy within 300s. Check Server logs."
-    echo "  Aborting next steps because the Server site is not usable (Data Store + federation will fail)."
+    echo "  ERROR: Server admin did not become healthy within 900s. Check Server logs." >&2
+    server_admin_diagnose
+    echo "  Aborting next steps because the Server site is not usable (Data Store + federation will fail)." >&2
     exit 1
   fi
+  fi  # server_site_exists
 fi
 
 # ==============================================================================
