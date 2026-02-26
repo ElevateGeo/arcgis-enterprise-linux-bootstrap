@@ -89,6 +89,41 @@ prompt_if_empty() {
   fi
 }
 
+# ---------- .env upsert helper (update existing or append new) ----------
+upsert_env_var() {
+  local var_name="$1"
+  local value="$2"
+
+  # Basic single-quote escaping for safety
+  local escaped
+  escaped=$(printf "%s" "$value" | sed "s/'/'\"'\"'/g")
+
+  if [[ -f "$ENV_FILE" ]] && grep -q "^${var_name}=" "$ENV_FILE" 2>/dev/null; then
+    python3 - "$ENV_FILE" "$var_name" "$escaped" <<'PY'
+import sys
+
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+out = []
+replaced = False
+with open(path, 'r', encoding='utf-8') as f:
+    for line in f:
+        if line.startswith(key + '='):
+            out.append(f"{key}='{val}'\n")
+            replaced = True
+        else:
+            out.append(line)
+if not replaced:
+    out.append(f"{key}='{val}'\n")
+with open(path, 'w', encoding='utf-8') as f:
+    f.writelines(out)
+PY
+  else
+    echo "${var_name}='${escaped}'" >> "$ENV_FILE"
+  fi
+
+  export "$var_name=$value"
+}
+
 echo ""
 echo ">>> Collecting Configuration"
 echo ""
@@ -819,7 +854,12 @@ echo ""
 
 CREATESITE_TOOL="$ESRI_BASE/arcgis/server/tools/createsite/createsite.sh"
 SERVER_ADMIN_URL="https://localhost:6443/arcgis/admin"
-SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store"
+
+# Config-store and directories can be overridden (and persisted) via .env.
+# When we recreate the Server site, we will allocate fresh empty folders.
+SERVER_CS="${SERVER_CONFIG_STORE:-$ESRI_BASE/arcgis/server/usr/config-store}"
+SERVER_DIRS="${SERVER_DIRECTORIES:-$ESRI_BASE/arcgis/server/usr/directories}"
+SERVER_SITE_RECREATED=0
 
 # ---------------------------------------------------------------------------
 # Helper: test if Server admin is TRULY healthy.
@@ -853,6 +893,9 @@ server_admin_is_healthy() {
 # Called when admin is known-broken regardless of whether /admin/info works.
 # ---------------------------------------------------------------------------
 wipe_server_config_store() {
+  local _cs_path="$1"
+  local _dirs_path="$2"
+
   echo "  Stopping Server to wipe config-store..."
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" > /dev/null 2>&1 || true
   local _sw=0
@@ -862,22 +905,21 @@ wipe_server_config_store() {
   done
 
   # Wipe Config Store
-  if [[ -d "$SERVER_CS" ]]; then
+  if [[ -d "$_cs_path" ]]; then
     # Use find -delete to safely remove dotfiles without touching '.'/'..'.
-    find "$SERVER_CS" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    find "$_cs_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     echo "  Config-store wiped."
   fi
-  mkdir -p "$SERVER_CS"
-  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS"
+  mkdir -p "$_cs_path"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$_cs_path"
 
   # Wipe Server Directories (critical for clean createsite)
-  local _dirs="$ESRI_BASE/arcgis/server/usr/directories"
-  if [[ -d "$_dirs" ]]; then
-    find "$_dirs" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  if [[ -d "$_dirs_path" ]]; then
+    find "$_dirs_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     echo "  Server directories wiped."
   fi
-  mkdir -p "$_dirs"
-  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$_dirs"
+  mkdir -p "$_dirs_path"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$_dirs_path"
 
   echo "  Starting Server with fresh config-store and directories..."
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
@@ -897,7 +939,21 @@ else
   # We FORCE a wipe of the config-store to ensure a clean slate for createsite.sh.
   # Previous attempts to detect "if site exists but broken" were flaky.
   echo "  Server admin is not fully healthy (missing token or config) — wiping config-store to force fresh creation."
-  wipe_server_config_store
+  SERVER_SITE_RECREATED=1
+  wipe_server_config_store "$SERVER_CS" "$SERVER_DIRS"
+
+  # Allocate fresh empty folders for createsite so it never reuses stale content.
+  # This avoids createsite.sh failing with:
+  #   "configuration store location provided contains files that may be from a different version"
+  _ts=$(date +%s)
+  SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store.site.$_ts"
+  SERVER_DIRS="$ESRI_BASE/arcgis/server/usr/directories.site.$_ts"
+  mkdir -p "$SERVER_CS" "$SERVER_DIRS"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS" "$SERVER_DIRS"
+  upsert_env_var SERVER_CONFIG_STORE "$SERVER_CS"
+  upsert_env_var SERVER_DIRECTORIES "$SERVER_DIRS"
+  echo "  Using fresh Server config-store: $SERVER_CS"
+  echo "  Using fresh Server directories:  $SERVER_DIRS"
 
   # Give the admin endpoint a moment to be ready for createsite.sh.
   # createsite.sh internally polls /arcgis/rest/info/healthCheck — wait for
@@ -924,7 +980,7 @@ else
     _cs_out=$(sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
       -u "$ADMIN_USER" \
       -p "$ADMIN_PASS" \
-      -d "$ESRI_BASE/arcgis/server/usr/directories" \
+      -d "$SERVER_DIRS" \
       -c "$SERVER_CS" 2>&1) || _cs_rc=$?
     echo "$_cs_out"
     if (( _cs_rc != 0 )); then
@@ -953,6 +1009,8 @@ else
   done
   if ! server_admin_is_healthy; then
     echo "  ERROR: Server admin did not become healthy within 300s. Check Server logs."
+    echo "  Aborting next steps because the Server site is not usable (Data Store + federation will fail)."
+    exit 1
   fi
 fi
 
@@ -1100,10 +1158,40 @@ if [[ -n "${PREV_TOKEN:-}" ]]; then
     2>/dev/null) || EXISTING_FEDERATION=""
 fi
 
+HAS_FEDERATION=0
 if echo "$EXISTING_FEDERATION" | python3 -c \
     "import sys,json; s=json.load(sys.stdin).get('servers',[]); exit(0 if s else 1)" 2>/dev/null; then
+  HAS_FEDERATION=1
+fi
+
+if (( HAS_FEDERATION == 1 && SERVER_SITE_RECREATED == 0 )); then
   echo "Server is already federated with Portal, skipping..."
 else
+  if (( HAS_FEDERATION == 1 && SERVER_SITE_RECREATED == 1 )); then
+    echo "Server was recreated in Step 11 — existing federation is stale. Unfederating then re-federating..."
+    TOKEN_UNFED=$(generate_portal_token 2>/dev/null) || TOKEN_UNFED=""
+    if [[ -n "${TOKEN_UNFED:-}" ]]; then
+      # Unfederate all existing federated servers (single-machine base deployment expects one).
+      echo "$EXISTING_FEDERATION" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for s in data.get('servers', []):
+    sid = s.get('id')
+    if sid:
+        print(sid)
+" | while read -r sid; do
+        [[ -z "${sid:-}" ]] && continue
+        echo "  Unfederating server id: $sid"
+        curl -sk -X POST \
+          -H "Referer: https://localhost:7443/arcgis" \
+          "https://localhost:7443/arcgis/portaladmin/federation/servers/$sid/unfederate" \
+          -d "token=$TOKEN_UNFED" -d "f=json" 2>/dev/null || true
+      done
+    else
+      echo "WARNING: Could not get Portal token to unfederate. Proceeding to attempt federation anyway."
+    fi
+  fi
+
   TOKEN=$(generate_portal_token 2>/dev/null) || TOKEN=""
 
   if [[ -z "${TOKEN:-}" ]]; then
