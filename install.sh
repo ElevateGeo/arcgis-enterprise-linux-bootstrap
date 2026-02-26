@@ -1391,36 +1391,84 @@ if (( HAS_FEDERATION == 1 )); then
   _val_tok="$PREV_TOKEN"
   [[ -z "${_val_tok:-}" ]] && _val_tok=$(generate_portal_token 2>/dev/null) || true
   if [[ -n "${_val_tok:-}" ]]; then
+    # Try POST validate (preferred), then GET validate as a fallback.
     VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 -X POST \
       -H "Referer: https://localhost:7443/arcgis" \
       "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
       -d "token=${_val_tok}" -d "f=json" 2>/dev/null) || VALIDATE_JSON=""
-    # Validate can return either a structured status object or an error object.
-    # Treat decrypt-token or issuesFound=true as STALE even if it's inside "error".
-    if echo "${VALIDATE_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"[[:space:]]*:[[:space:]]*true|\"status\"[[:space:]]*:[[:space:]]*\"error\""; then
-      FEDERATION_VALID=0
-    else
-      # If validate endpoint isn't available (older versions / hardening), it will
-      # return an error object. Only treat that as "valid" when it's clearly
-      # unsupported/not found; otherwise assume stale/broken federation.
-      if echo "${VALIDATE_JSON:-}" | grep -q '"error"'; then
-        if echo "${VALIDATE_JSON:-}" | python3 -c "
+    if [[ -z "${VALIDATE_JSON:-}" ]]; then
+      VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 \
+        -H "Referer: https://localhost:7443/arcgis" \
+        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate?token=${_val_tok}&f=json" \
+        2>/dev/null) || VALIDATE_JSON=""
+    fi
+
+    # JSON-aware validation: treat any issuesFound/status=error/decrypt-token as invalid.
+    # If validate returns an error, treat as invalid unless clearly unsupported/not found.
+    if echo "${VALIDATE_JSON:-}" | python3 -c "
 import sys, json
+
+raw = sys.stdin.read() or ''
+raw_l = raw.lower()
+
+def has_decrypt(s: str) -> bool:
+  s = s.lower()
+  return ('decrypt token' in s) or ('could not decrypt' in s)
+
 try:
-  data=json.load(sys.stdin)
-  err=(data.get('error') or {})
-  msg=(err.get('message') or '')
-  # Heuristics for 'endpoint missing/unsupported'
-  unsupported=('not found' in msg.lower() or 'unsupported' in msg.lower() or 'does not exist' in msg.lower())
-  sys.exit(0 if unsupported else 1)
+  data = json.loads(raw)
 except Exception:
+  # Unknown/garbled response: treat as invalid so we don't silently skip.
+  sys.exit(2)
+
+err = data.get('error')
+if err:
+  msg = str(err.get('message') or '')
+  # Unsupported validate endpoint -> allow skip
+  unsupported = any(x in msg.lower() for x in ['not found','unsupported','does not exist'])
+  if unsupported:
+    sys.exit(0)
+  # Any other error -> invalid
   sys.exit(1)
-" 2>/dev/null; then
-          FEDERATION_VALID=1
-        else
-          FEDERATION_VALID=0
-        fi
-      fi
+
+if has_decrypt(raw_l):
+  sys.exit(1)
+
+# If the response doesn't contain any of the expected fields, it's not a
+# meaningful validation result; treat as unknown so we force re-federation.
+if not any(k in data for k in ['servers','results','issuesFound','status']):
+  sys.exit(2)
+
+# Common shapes:
+# - {'status':'success','issuesFound':false,...}
+# - {'servers':[{'issuesFound':true,'messages':[...]}]}
+if str(data.get('status','')).lower() == 'error':
+  sys.exit(1)
+if data.get('issuesFound') is True:
+  sys.exit(1)
+
+servers = data.get('servers') or data.get('results') or []
+if isinstance(servers, list):
+  for s in servers:
+    if not isinstance(s, dict):
+      continue
+    if s.get('issuesFound') is True:
+      sys.exit(1)
+    if str(s.get('status','')).lower() == 'error':
+      sys.exit(1)
+    msgs = s.get('messages') or s.get('message') or ''
+    if isinstance(msgs, list):
+      if any(has_decrypt(str(m)) for m in msgs):
+        sys.exit(1)
+    else:
+      if has_decrypt(str(msgs)):
+        sys.exit(1)
+
+sys.exit(0)
+"; then
+      FEDERATION_VALID=1
+    else
+      FEDERATION_VALID=0
     fi
   fi
 fi
@@ -1578,16 +1626,17 @@ if [[ -d "$ESRI_BASE/arcgis/datastore/tools" ]]; then
     # This avoids calling configuredatastore.sh on an already-initialized store
     # (which can return opaque errors like "Method argument cannot be null").
     local _store="$1"
-    printf "%s" "${DS_DESCRIBE:-}" | python3 - "${_store}" <<'PY'
+    # NOTE: Do not use a heredoc with python '-' here; '-' consumes stdin for the
+    # script itself, which would discard the describedatastore text.
+    printf "%s" "${DS_DESCRIBE:-}" | python3 -c '
 import re, sys
-
-store = sys.argv[1] if len(sys.argv) > 1 else ''
-txt = sys.stdin.read() or ''
+store = sys.argv[1] if len(sys.argv) > 1 else ""
+txt = sys.stdin.read() or ""
 
 def block(start_pat, end_pat=None):
   m = re.search(start_pat, txt, flags=re.M)
   if not m:
-    return ''
+    return ""
   s = txt[m.start():]
   if end_pat:
     m2 = re.search(end_pat, s, flags=re.M)
@@ -1595,26 +1644,26 @@ def block(start_pat, end_pat=None):
       s = s[:m2.start()]
   return s
 
-if store == 'relational':
-  sec = block(r'^Information for relational data store\b.*$', r'^Information for object store\b')
+if store == "relational":
+  sec = block(r"^Information for relational data store\b.*$", r"^Information for object store\b")
   if not sec:
     sys.exit(1)
-  status = re.search(r'^Data store status\.+\s*(\S+)\s*$', sec, flags=re.M)
-  owning = re.search(r'^Owning system URL\.+\s*(.+)\s*$', sec, flags=re.M)
-  status_val = (status.group(1).strip() if status else '').lower()
-  owning_val = (owning.group(1).strip() if owning else '').strip().strip('"')
-  sys.exit(0 if (status_val == 'started' and owning_val) else 1)
+  status = re.search(r"^Data store status\.+\s*(\S+)\s*$", sec, flags=re.M)
+  owning = re.search(r"^Owning system URL\.+\s*(.+)\s*$", sec, flags=re.M)
+  status_val = (status.group(1).strip() if status else "").lower()
+  owning_val = (owning.group(1).strip() if owning else "").strip().strip("\"")
+  sys.exit(0 if (status_val == "started" and owning_val) else 1)
 
-if store == 'object':
-  sec = block(r'^Information for object store\b.*$')
+if store == "object":
+  sec = block(r"^Information for object store\b.*$")
   if not sec:
     sys.exit(1)
-  owning = re.search(r'^Owning system URL\.+\s*(.+)\s*$', sec, flags=re.M)
-  owning_val = (owning.group(1).strip() if owning else '').strip().strip('"')
+  owning = re.search(r"^Owning system URL\.+\s*(.+)\s*$", sec, flags=re.M)
+  owning_val = (owning.group(1).strip() if owning else "").strip().strip("\"")
   sys.exit(0 if owning_val else 1)
 
 sys.exit(1)
-PY
+' "${_store}"
   }
 
   configure_datastore_store() {
