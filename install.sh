@@ -1580,6 +1580,14 @@ create_server_site() {
   # Site creation method (Esri supported): REST admin createNewSite.
   # createsite.sh is a wrapper but has been observed to crash in some envs.
   SERVER_SITE_CREATE_METHOD="${SERVER_SITE_CREATE_METHOD:-rest}"
+
+  # FORCE FQDN usage for site creation calls (Esri Best Practice)
+  # Even if we detected 127.0.0.1 was the first to respond during wait_for_server.
+  local _fqdn
+  _fqdn=$(hostname -f)
+  SERVER_ADMIN_URL="https://${_fqdn}:6443/arcgis/admin"
+  echo "  Using Server Admin URL: $SERVER_ADMIN_URL"
+
   if [[ "${SERVER_SITE_CREATE_METHOD}" == "createsite" && -f "$CREATESITE_TOOL" ]]; then
     echo "Creating ArcGIS Server site using createsite.sh (explicitly requested)..."
     chmod +x "$CREATESITE_TOOL"
@@ -1599,7 +1607,7 @@ create_server_site() {
     # validate cleanup mode as part of the config store connection object.
     _cfg_json=$(python3 - <<PY
 import json
-  print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM", "cleanupMode": "NONE"}))
+print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM", "cleanupMode": "NONE"}))
 PY
 ) || _cfg_json=""
     _dirs_json=$(python3 - <<PY
