@@ -246,13 +246,19 @@ fi
 
 echo "Found installer at: $SETUP_SCRIPT"
 
-# Only run installer if components are missing
-if [[ ! -d "$ESRI_BASE/arcgis/server" || ! -d "$ESRI_BASE/arcgis/portal" || $WIPE_EXISTING -eq 1 ]]; then
+# Only run installer if components are missing or EMPTY
+# Check specifically for a known binary (startserver.sh) to confirm successful install
+if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/portal/startportal.sh" || $WIPE_EXISTING -eq 1 ]]; then
   echo "Running Setup..."
+  
+  # Ensure strict permissions on the install dir before starting
+  mkdir -p "$ESRI_BASE/arcgis"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$ESRI_BASE/arcgis"
+  
   # Note: Builder installs all components. Takes time.
   sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis" -a "$SERVER_LIC"
 else
-  echo "ArcGIS components appear installed, checking authorization..."
+  echo "ArcGIS components appear installed (start scripts found), checking authorization..."
   
   # Check for authorizeSoftware tool in standard locations
   # Enterprise Builder installs server to server/ and portal to portal/
