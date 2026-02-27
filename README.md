@@ -88,11 +88,29 @@ Download from [My Esri](https://my.esri.com/) and place in `/opt/esri/licenses`:
 
 ## ⚙️ Configuration
 
+### ✅ Machine FQDN (Esri DIAG024)
+
+Esri requires the VM's hostname to resolve to the VM's **primary (non-loopback) IP** using an `/etc/hosts` entry in this format:
+
+`<IP> <FQDN> <Machine_name>`
+
+This **machine FQDN** does not need to match your public reverse-proxy URL. A common pattern is:
+
+- **Public URL (reverse proxy):** `DOMAIN=gis.example.com`
+- **Machine identity (hostname/FQDN):** `MACHINE_FQDN=arcgis.example.com`
+
+The script will enforce this when `MACHINE_FQDN` is set.
+
 Create a `.env` file (or the script will prompt and save automatically):
 
 ```env
 # 🌐 Domain and SSL
 DOMAIN='gis.example.com'
+
+# 🖥️ VM hostname (Esri DIAG024) — should resolve to the VM's PRIMARY private IP
+# Example: arcgis.example.com (different from DOMAIN is OK)
+MACHINE_FQDN='arcgis.example.com'
+
 EMAIL='admin@example.com'
 CF_API_TOKEN='your_cloudflare_api_token'
 
@@ -125,6 +143,20 @@ SERVER_LICENSE_FILE='/opt/esri/licenses/server.prvc'
 ```
 
 > 💡 If any value is missing, the script will prompt you interactively and save it to `.env`.
+
+### 🔎 Verify hostname/FQDN on the VM
+
+Run these on the VM before installing:
+
+```bash
+hostname
+hostname -f || true
+getent hosts "$(hostname -s)" || true
+ip -4 route get 1.1.1.1 || true
+grep -nE '(^127\.0\.0\.1|^127\.0\.1\.1|localhost|arcgis)' /etc/hosts || true
+```
+
+You want `hostname -f` to return your machine FQDN (for example `arcgis.example.com`), not `localhost`.
 
 ---
 

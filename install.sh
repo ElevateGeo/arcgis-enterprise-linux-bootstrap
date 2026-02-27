@@ -293,6 +293,7 @@ echo ""
 echo ">>> Configuration Summary"
 echo ""
 echo "  Domain:        $DOMAIN"
+echo "  Machine FQDN:  ${MACHINE_FQDN:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")}"
 echo "  Email:         $EMAIL"
 echo "  Admin User:    $ADMIN_USER"
 echo "  Portal Lic:    $PORTAL_LICENSE_FILE"
@@ -425,6 +426,18 @@ ensure_hostname_hosts_mapping() {
   _host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
   _fqdn=$(hostname -f 2>/dev/null || echo "${_host}")
 
+  # If user provides an explicit machine FQDN, prefer it (Esri DIAG024).
+  if [[ -n "${MACHINE_FQDN:-}" ]]; then
+    _fqdn="${MACHINE_FQDN}"
+    if command -v hostnamectl >/dev/null 2>&1; then
+      _cur=$(hostnamectl --static 2>/dev/null || true)
+      if [[ -n "${_cur:-}" && "${_cur}" != "${MACHINE_FQDN}" ]]; then
+        echo "Setting system hostname to MACHINE_FQDN=${MACHINE_FQDN} (per Esri requirement)..."
+        hostnamectl set-hostname "${MACHINE_FQDN}" || true
+      fi
+    fi
+  fi
+
   # Prefer the OS routing decision for the primary IPv4 address.
   if command -v ip >/dev/null 2>&1; then
     _ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
@@ -459,29 +472,41 @@ ensure_hostname_hosts_mapping() {
   echo "Fixing /etc/hosts: mapping hostname (${_host}/${_fqdn}) to ${_ip} ..."
 
   # Rebuild hosts file to ensure the correct mapping appears before any stale ones.
-  # Keep localhost entries, drop any lines referencing the host/fqdn, then insert
-  # the correct mapping near the top.
+  # IMPORTANT (Esri DIAG024): loopback lines must NOT include the machine hostname;
+  # the machine hostname/FQDN must map to the machine's primary (non-loopback) IP.
   local _tmp
   _tmp=$(mktemp)
   awk -v h="${_host}" -v f="${_fqdn}" -v ip="${_ip}" '
-    BEGIN { inserted=0 }
-    # Preserve the canonical localhost lines first
-    /^127\.0\.0\.1[[:space:]]/ {
-      print $0
-      next
-    }
-    # Insert the correct hostname mapping once, right after localhost entries
-    inserted==0 {
-      print ip "  " f " " h
-      inserted=1
-    }
-    # Drop any existing mappings for host/fqdn (to avoid Esri mismatch warning)
+    BEGIN { printed_local=0; inserted=0 }
+
+    # Drop any existing mappings for host/fqdn (anywhere, including loopback)
     $0 ~ ("(^|[[:space:]])" h "([[:space:]]|$)") { next }
     $0 ~ ("(^|[[:space:]])" f "([[:space:]]|$)") { next }
+
+    # Canonical IPv4 localhost (never include machine hostname)
+    /^127\.0\.0\.1[[:space:]]/ {
+      if (printed_local==0) {
+        print "127.0.0.1\tlocalhost"
+        printed_local=1
+        if (inserted==0) {
+          print ip "\t" f "\t" h
+          inserted=1
+        }
+      }
+      next
+    }
+
+    # Ubuntu often has 127.0.1.1 <hostname>; remove it to avoid host->loopback.
+    /^127\.0\.1\.1[[:space:]]/ { next }
+
     { print $0 }
+
     END {
+      if (printed_local==0) {
+        print "127.0.0.1\tlocalhost"
+      }
       if (inserted==0) {
-        print ip "  " f " " h
+        print ip "\t" f "\t" h
       }
     }
   ' /etc/hosts > "${_tmp}"
@@ -1003,9 +1028,9 @@ wait_for_service() {
       fi
 
       # Ready if:
-      # - endpoint returns HTTP 200 (even if body is small/unexpected), OR
+      # - endpoint returns any 2xx/3xx (service is up; some endpoints redirect), OR
       # - body matches known-success patterns.
-      if [[ "${_code:-}" == "200" ]] || ( [[ -n "${_resp:-}" ]] && echo "$_resp" | grep -qiE '\"status\"[[:space:]]*:[[:space:]]*\"success\"|\"currentVersion\"|<html|arcgis' ); then
+      if [[ "${_code:-}" =~ ^[23][0-9][0-9]$ ]] || ( [[ -n "${_resp:-}" ]] && echo "$_resp" | grep -qiE '\"status\"[[:space:]]*:[[:space:]]*\"success\"|\"currentVersion\"|<html|arcgis' ); then
         LAST_READY_URL="$_u"
         LAST_READY_HOST=$(url_extract_host "$_u" 2>/dev/null || true)
         LAST_READY_BASE=$(url_extract_base "$_u" 2>/dev/null || true)
@@ -1337,10 +1362,8 @@ fi
 #  these calls return immediately if the service is already up.)
 wait_for_server || true
 
-# Portal is not configured until Step 12 (createportal.sh). Per Esri flow,
-# only ensure the web app is responding here (portaladmin/healthCheck can
-# legitimately fail/time out before Portal creation).
-wait_for_service "$(portal_base)/arcgis/home" "Portal for ArcGIS" 600 PORTAL_HOST || true
+# Per Esri install flow, Portal is configured in Step 12 (createportal.sh).
+# Do not block Server site creation (Step 11) on Portal HTTP readiness.
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
@@ -1569,6 +1592,7 @@ create_server_site() {
     echo "Creating ArcGIS Server site via REST API (createNewSite)..."
     local _cfg_json _dirs_json
     local _site_resp _status_url
+    
     _cfg_json=$(python3 - <<PY
 import json
 print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM"}))
@@ -1588,12 +1612,18 @@ print(json.dumps(dirs))
 PY
 ) || _dirs_json=""
 
+    # ArcGIS Server requires cleanupMode to be one of:
+    #   NONE | TIME_ELAPSED_SINCE_LAST_MODIFIED
+    # Your server returns a 500 when cleanupMode is missing/invalid, so we
+    # always send cleanupMode=NONE.
+
     _site_resp=$("${CURL_BASE[@]}" -X POST "$SERVER_ADMIN_URL/createNewSite" \
       -H "Referer: https://localhost:6443/arcgis/admin" \
       --data-urlencode "username=$ADMIN_USER" \
       --data-urlencode "password=$ADMIN_PASS" \
       --data-urlencode "configStoreConnection=${_cfg_json}" \
       --data-urlencode "directories=${_dirs_json}" \
+      --data-urlencode "cleanupMode=NONE" \
       --data-urlencode "f=json" 2>/dev/null) || _site_resp=""
 
     if [[ -n "${_site_resp:-}" ]]; then
@@ -1601,6 +1631,12 @@ PY
       echo "${_site_resp}"
     else
       echo "WARNING: createNewSite returned no response (check Server logs)." >&2
+    fi
+
+    # Fail fast on explicit REST error; do not wait 900s only to conclude no-site.
+    if echo "${_site_resp:-}" | grep -q '"status"[[:space:]]*:[[:space:]]*"error"'; then
+      echo "ERROR: createNewSite returned status=error. Cannot proceed." >&2
+      exit 1
     fi
 
     _status_url=$(python3 -c 'import json,sys
