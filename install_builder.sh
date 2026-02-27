@@ -255,12 +255,19 @@ else
   echo "ArcGIS components appear installed, checking authorization..."
   
   # Check for authorizeSoftware tool in standard locations
+  # Enterprise Builder installs server to server/ and portal to portal/
   AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/null | head -1)
 
   if [[ -z "$AUTH_TOOL" ]]; then
     echo "WARNING: Could not find authorizeSoftware tool. Installation might be incomplete."
-    echo "Listing $ESRI_BASE/arcgis:"
-    ls -F "$ESRI_BASE/arcgis" 2>/dev/null || echo "(empty)"
+    echo "This is unexpected. Checking detailed contents of $ESRI_BASE/arcgis:"
+    ls -R "$ESRI_BASE/arcgis" | head -50 2>/dev/null
+    
+    # Try to find authorization script inside specific subfolders if possible
+    if [[ -d "$ESRI_BASE/arcgis/server/tools" ]]; then
+        echo "Listing $ESRI_BASE/arcgis/server/tools:"
+        ls -F "$ESRI_BASE/arcgis/server/tools"
+    fi
   else
     echo "Found authorization tool at: $AUTH_TOOL"
     if ! sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -s | grep -q "Congratulations"; then
@@ -275,9 +282,15 @@ fi
 # ==============================================================================
 echo ">>> Step 4: Deploying Web Adaptors"
 WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
+
+# Fallback: Check installer extract if installed war is missing (Web Adaptor might be separate)
+if [[ -z "$WA_WAR" && -d "$EXTRACT_DIR" ]]; then
+    WA_WAR=$(find "$EXTRACT_DIR" -name "arcgis.war" 2>/dev/null | head -1)
+fi
+
 if [[ -z "$WA_WAR" ]]; then
-  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis. Installation may have failed or varied."
-  find "$ESRI_BASE/arcgis" -maxdepth 3 -name "webadaptor*" 
+  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis or $EXTRACT_DIR."
+  echo "Installation may have failed or Web Adaptor component is missing."
   exit 1
 fi
 
