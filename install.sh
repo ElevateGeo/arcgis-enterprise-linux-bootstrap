@@ -424,14 +424,25 @@ ensure_hostname_hosts_mapping() {
   local _host _fqdn _ip
   _host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
   _fqdn=$(hostname -f 2>/dev/null || echo "${_host}")
-  _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+  # Prefer the OS routing decision for the primary IPv4 address.
+  if command -v ip >/dev/null 2>&1; then
+    _ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  fi
+  [[ -z "${_ip:-}" ]] && _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
   [[ -z "${_host:-}" || -z "${_ip:-}" ]] && return 0
 
-  # If the system isn't configured with an FQDN yet, synthesize one so the
-  # /etc/hosts line matches Esri's required format: <IP> <FQDN> <Machine_name>.
+  # If the system isn't configured with an FQDN yet, try to use the public
+  # DOMAIN if it matches "<hostname>.<suffix>". Otherwise synthesize a stable
+  # local FQDN so the /etc/hosts line matches Esri's required format:
+  #   <IP> <FQDN> <Machine_name>
   if [[ -z "${_fqdn:-}" || "${_fqdn}" == "${_host}" ]]; then
-    _fqdn="${_host}.localdomain"
+    if [[ -n "${DOMAIN:-}" && "${DOMAIN}" == "${_host}."* ]]; then
+      _fqdn="${DOMAIN}"
+    else
+      _fqdn="${_host}.localdomain"
+    fi
   fi
 
   # If already mapped correctly, do nothing.
@@ -951,6 +962,7 @@ wait_for_service() {
   local elapsed=0
   local -a _hosts _urls
   local _u _resp _req_host
+  local _out _code
   local _rc
   local _last_err=""
   local _last_rc=""
@@ -970,15 +982,24 @@ wait_for_service() {
   echo "Waiting for $name to be ready at $url ..."
   while (( elapsed < max_wait )); do
     for _u in "${_urls[@]}"; do
-      _resp=$("${CURL_BASE[@]}" "$_u" 2>&1); _rc=$?
+      _out=$("${CURL_BASE[@]}" -w "\n__HTTP_CODE:%{http_code}\n" "$_u" 2>&1); _rc=$?
       if (( _rc != 0 )); then
         _last_rc="${_rc}"
         _last_url="${_u}"
         # Keep only the last few lines; curl errors can be verbose.
-        _last_err=$(echo "${_resp:-}" | tail -6)
+        _last_err=$(echo "${_out:-}" | tail -6)
         _resp=""
+        _code=""
+      else
+        _code=$(echo "${_out}" | awk -F: '/^__HTTP_CODE:/{gsub(/\r/,"",$2); print $2; exit}')
+        # Drop the injected HTTP_CODE trailer line
+        _resp=$(echo "${_out}" | sed '$d')
       fi
-      if [[ -n "${_resp:-}" ]] && echo "$_resp" | grep -qiE '"status"[[:space:]]*:[[:space:]]*"success"|"currentVersion"|<html|arcgis'; then
+
+      # Ready if:
+      # - endpoint returns HTTP 200 (even if body is small/unexpected), OR
+      # - body matches known-success patterns.
+      if [[ "${_code:-}" == "200" ]] || ( [[ -n "${_resp:-}" ]] && echo "$_resp" | grep -qiE '\"status\"[[:space:]]*:[[:space:]]*\"success\"|\"currentVersion\"|<html|arcgis' ); then
         LAST_READY_URL="$_u"
         LAST_READY_HOST=$(url_extract_host "$_u" 2>/dev/null || true)
         LAST_READY_BASE=$(url_extract_base "$_u" 2>/dev/null || true)
@@ -1011,8 +1032,10 @@ wait_for_server() {
   local rest_url
   rest_url="$(server_base)/arcgis/rest/info?f=json"
 
-  # Wait up to 4 min for a clean start (also learns the reachable host)
-  wait_for_service "${rest_url}" "ArcGIS Server" 240 SERVER_HOST && return 0
+  # Wait up to 8 min for a clean start (also learns the reachable host)
+  # ArcGIS Server can take several minutes to finish certificate import and
+  # other first-boot tasks even after the port starts listening.
+  wait_for_service "${rest_url}" "ArcGIS Server" 480 SERVER_HOST && return 0
 
   # Still not up — the process may be running but stuck (broken security
   # init state). Force a restart.
@@ -1024,8 +1047,8 @@ wait_for_server() {
     sleep 5; _sw=$((_sw+5))
   done
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
-  echo "  Restarted. Waiting up to 5 min for Server..."
-  if wait_for_service "${rest_url}" "ArcGIS Server" 300 SERVER_HOST; then
+  echo "  Restarted. Waiting up to 8 min for Server..."
+  if wait_for_service "${rest_url}" "ArcGIS Server" 480 SERVER_HOST; then
     return 0
   fi
 
@@ -1307,7 +1330,7 @@ fi
 # (Server was already waited on in Step 10 if it was just started;
 #  these calls return immediately if the service is already up.)
 wait_for_server || true
-wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 PORTAL_HOST || true
+wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 600 PORTAL_HOST || true
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
