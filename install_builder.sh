@@ -259,15 +259,18 @@ else
   AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/null | head -1)
 
   if [[ -z "$AUTH_TOOL" ]]; then
-    echo "WARNING: Could not find authorizeSoftware tool. Installation might be incomplete."
-    echo "This is unexpected. Checking detailed contents of $ESRI_BASE/arcgis:"
-    ls -R "$ESRI_BASE/arcgis" | head -50 2>/dev/null
-    
-    # Try to find authorization script inside specific subfolders if possible
-    if [[ -d "$ESRI_BASE/arcgis/server/tools" ]]; then
-        echo "Listing $ESRI_BASE/arcgis/server/tools:"
-        ls -F "$ESRI_BASE/arcgis/server/tools"
+    # Try creating directory if missing slightly, or just authorize manually if running builder?
+    # Builder usually does auth. If it failed, maybe we need to run it again.
+    echo "WARNING: authorizeSoftware not found. Checking if Setup/install logs have errors."
+    LOG_DIR="$ESRI_BASE/arcgis/usr/logs"
+    if [[ -d "$LOG_DIR" ]]; then
+        ls -lt "$LOG_DIR" | head -5
     fi
+    
+    # Check if server directory is empty
+    echo "Checking server directory content:"
+    ls -la "$ESRI_BASE/arcgis/server" 2>/dev/null
+    ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
   else
     echo "Found authorization tool at: $AUTH_TOOL"
     if ! sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -s | grep -q "Congratulations"; then
@@ -285,11 +288,23 @@ WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
 
 # Fallback: Check installer extract if installed war is missing (Web Adaptor might be separate)
 if [[ -z "$WA_WAR" && -d "$EXTRACT_DIR" ]]; then
-    WA_WAR=$(find "$EXTRACT_DIR" -name "arcgis.war" 2>/dev/null | head -1)
+    # Web Adaptor installer is usually separate inside the Builder extract
+    # Pattern: extract/WebAdaptor/Setup
+    WA_SETUP=$(find "$EXTRACT_DIR" -name "Setup" | grep "WebAdaptor" | head -1)
+    if [[ -n "$WA_SETUP" ]]; then
+        echo "Web Adaptor WAR missing, but installer found at $WA_SETUP. Installing Web Adaptor..."
+        sudo -u "$ARCGIS_USER" "$WA_SETUP" -m silent -l yes -d "$ESRI_BASE/arcgis/webadaptor"
+        WA_WAR="$ESRI_BASE/arcgis/webadaptor/java/arcgis.war"
+    fi
 fi
 
 if [[ -z "$WA_WAR" ]]; then
-  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis or $EXTRACT_DIR."
+  # Try one last check
+  WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
+fi
+
+if [[ -z "$WA_WAR" ]]; then
+  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis or install it."
   echo "Installation may have failed or Web Adaptor component is missing."
   exit 1
 fi
