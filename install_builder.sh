@@ -95,8 +95,16 @@ SERVER_LIC=$(find "$ESRI_BASE/licenses" -name "*.prvc" | head -1)
 
 if [[ -z "$PORTAL_LIC" || -z "$SERVER_LIC" ]]; then
   echo "ERROR: Missing licenses in $ESRI_BASE/licenses"
+  echo "DEBUG: Listing $ESRI_BASE/licenses:"
+  ls -l "$ESRI_BASE/licenses" 2>/dev/null || echo "  (directory not found or empty)"
   exit 1
 fi
+
+echo "DEBUG: Found Portal License: $PORTAL_LIC"
+echo "DEBUG: Found Server License: $SERVER_LIC"
+
+# ==============================================================================
+# Step 1: System Prep
 
 # ==============================================================================
 # Step 1: System Prep
@@ -219,7 +227,7 @@ BUILDER_TAR=$(find "$INSTALLERS" -name "ArcGIS_Enterprise_Builder_Linux_*.tar.gz
 [[ -z "$BUILDER_TAR" ]] && echo "ERROR: Builder installer not found." && exit 1
 
 EXTRACT_DIR="$ESRI_BASE/builder_extract"
-if [[ ! -d "$EXTRACT_DIR/EnterpriseBuilder" ]]; then
+if [[ ! -f "$EXTRACT_DIR/EnterpriseBuilder/Setup" ]]; then
   echo "Extracting $(basename "$BUILDER_TAR")..."
   mkdir -p "$EXTRACT_DIR"
   chown "$ARCGIS_USER:$ARCGIS_USER" "$EXTRACT_DIR"
@@ -237,17 +245,34 @@ if [[ -z "$SETUP_SCRIPT" ]]; then
 fi
 
 echo "Found installer at: $SETUP_SCRIPT"
-echo "Running Setup..."
-# Note: Builder installs all components. Takes time.
-sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis"
+
+# Only run installer if components are missing
+if [[ ! -d "$ESRI_BASE/arcgis/server" || ! -d "$ESRI_BASE/arcgis/portal" || WIPE_EXISTING -eq 1 ]]; then
+  echo "Running Setup..."
+  # Note: Builder installs all components. Takes time.
+  sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis" -a "$SERVER_LIC"
+else
+  echo "ArcGIS components appear installed, checking authorization..."
+  if ! sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/tools/authorizeSoftware" -s | grep -q "Congratulations"; then
+    echo "Applying license to ArcGIS Server..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/tools/authorizeSoftware" -f "$SERVER_LIC" -e "$EMAIL"
+  fi
+fi
 
 # ==============================================================================
 # Step 4: Web Adaptor Deployment
 # ==============================================================================
 echo ">>> Step 4: Deploying Web Adaptors"
-WA_SRC=$(find "$ESRI_BASE/arcgis" -maxdepth 1 -name "webadaptor*" | head -1)
-cp "$WA_SRC/java/arcgis.war" "$TOMCAT_HOME/webapps/server.war"
-cp "$WA_SRC/java/arcgis.war" "$TOMCAT_HOME/webapps/portal.war"
+WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
+if [[ -z "$WA_WAR" ]]; then
+  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis. Installation may have failed or varied."
+  find "$ESRI_BASE/arcgis" -maxdepth 3 -name "webadaptor*" 
+  exit 1
+fi
+
+echo "Found Web Adaptor WAR: $WA_WAR"
+cp "$WA_WAR" "$TOMCAT_HOME/webapps/server.war"
+cp "$WA_WAR" "$TOMCAT_HOME/webapps/portal.war"
 sleep 15 # Wait for Tomcat
 
 # ==============================================================================
