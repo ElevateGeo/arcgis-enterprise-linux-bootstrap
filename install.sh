@@ -1218,34 +1218,39 @@ datastore_admin_diagnose() {
 # Helper: generate a Portal admin token
 # ---------------------------------------------------------------------------
 generate_portal_token() {
-  local _resp _token
-
-  # Try portaladmin/generateToken first (admin-scoped), then sharing/rest as fallback.
-  # Use client=referer for robustness against IP changes/NAT loopbacks.
+  local _resp _token _attempt
   local _h _ep
   local -a _hosts
-  mapfile -t _hosts < <(get_local_host_candidates "${PORTAL_HOST}")
-  for _h in "${_hosts[@]}"; do
-    for _ep in \
-      "https://$(format_host_for_url "${_h}"):7443/arcgis/portaladmin/generateToken" \
-      "https://$(format_host_for_url "${_h}"):7443/arcgis/sharing/rest/generateToken"; do
-    _resp=$("${CURL_BASE[@]}" --post301 --post302 -L -X POST "${_ep}" \
-      -H "Referer: https://localhost:7443/arcgis" \
-      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-      -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
-      -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
-    _token=$(echo "$_resp" | python3 -c "
+
+  # Retry up to 3 times with a small delay for transient startup issues.
+  for _attempt in 1 2 3; do
+    mapfile -t _hosts < <(get_local_host_candidates "${PORTAL_HOST}")
+    for _h in "${_hosts[@]}"; do
+      for _ep in \
+        "https://$(format_host_for_url "${_h}"):7443/arcgis/portaladmin/generateToken" \
+        "https://$(format_host_for_url "${_h}"):7443/arcgis/sharing/rest/generateToken"; do
+        
+        _resp=$("${CURL_BASE[@]}" --post301 --post302 -L -X POST "${_ep}" \
+          -H "Referer: https://localhost:7443/arcgis" \
+          -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+          -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
+          -d "expiration=120" -d "f=json" 2>/dev/null) || _resp=""
+          
+        _token=$(echo "$_resp" | python3 -c "
 import sys,json
 try:
   t=json.load(sys.stdin).get('token','')
   print(t if t else '')
 except: pass" 2>/dev/null) || _token=""
-    if [[ -n "$_token" && "$_token" != "None" ]]; then
-      PORTAL_HOST="${_h}"
-      echo "$_token"
-      return 0
-    fi
+        
+        if [[ -n "$_token" && "$_token" != "None" ]]; then
+          PORTAL_HOST="${_h}"
+          echo "$_token"
+          return 0
+        fi
+      done
     done
+    sleep 5
   done
 
   echo "DEBUG: Portal generateToken last response: $_resp" >&2
@@ -2256,6 +2261,12 @@ sys.exit(1)
 
       # Ensure Data Store admin is up before each attempt.
       wait_for_datastore_admin 600 || restart_datastore
+
+      # Export AGSDATASTORE_HOST if detected, to help the tool find the local service.
+      # If wait_for_datastore_admin succeeded, DATASTORE_HOST holds the reachable host.
+      if [[ -n "${DATASTORE_HOST:-}" ]]; then
+        export AGSDATASTORE_HOST="${DATASTORE_HOST}"
+      fi
 
       local _restarted_this_attempt=0
 
