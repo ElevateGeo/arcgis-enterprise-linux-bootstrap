@@ -61,10 +61,11 @@ wipe_existing_enterprise() {
          "$TOMCAT_HOME/webapps/portal.war" "$TOMCAT_HOME/webapps/server.war" 2>/dev/null || true
 
   # Cleanup InstallAnywhere registry to prevent "phantom" installs
-  echo "Removing installer registry (legacy cleanup)..."
-  rm -f /var/.com.zerog.registry.xml 2>/dev/null || true
-  rm -f "$ESRI_BASE/arcgis/.com.zerog.registry.xml" 2>/dev/null || true
-  rm -f "/home/$ARCGIS_USER/.com.zerog.registry.xml" 2>/dev/null || true
+  # Previous installs (manual or Builder) leave .com.zerog.registry.xml in multiple locations.
+  # If these are not removed, the Builder will skip components it thinks are "already installed".
+  echo "Removing ALL InstallAnywhere registry entries (system-wide)..."
+  find / -name ".com.zerog.registry.xml" -delete 2>/dev/null || true
+  find / -name "com.zerog.iap.xml" -delete 2>/dev/null || true
 
   echo "Wipe complete."
 }
