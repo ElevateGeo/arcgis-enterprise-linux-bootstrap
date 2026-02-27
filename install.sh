@@ -1603,21 +1603,21 @@ create_server_site() {
     local _op_meta
     
     # Build the request payloads exactly as JSON strings.
-    # Include cleanupMode in configStoreConnection because some Server builds
-    # validate cleanup mode as part of the config store connection object.
+    # Include cleanupMode in configStoreConnection is INCORRECT based on logs.
+    # The server log showed the validator failed on the global property.
     _cfg_json=$(python3 - <<PY
 import json
-print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM", "cleanupMode": "NONE"}))
+print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM"}))
 PY
 ) || _cfg_json=""
     _dirs_json=$(python3 - <<PY
 import json
 dirs = {
   "directories": [
-    {"name":"arcgiscache","physicalPath":"${SERVER_DIRS}/arcgiscache","directoryType":"CACHE"},
-    {"name":"arcgisjobs","physicalPath":"${SERVER_DIRS}/arcgisjobs","directoryType":"JOBS"},
-    {"name":"arcgisoutput","physicalPath":"${SERVER_DIRS}/arcgisoutput","directoryType":"OUTPUT"},
-    {"name":"arcgissystem","physicalPath":"${SERVER_DIRS}/arcgissystem","directoryType":"SYSTEM"},
+    {"name":"arcgiscache","physicalPath":"${SERVER_DIRS}/arcgiscache","directoryType":"CACHE","cleanupMode":"NONE","maxFileAge":0},
+    {"name":"arcgisjobs","physicalPath":"${SERVER_DIRS}/arcgisjobs","directoryType":"JOBS","cleanupMode":"TIME_ELAPSED_SINCE_LAST_MODIFIED","maxFileAge":360},
+    {"name":"arcgisoutput","physicalPath":"${SERVER_DIRS}/arcgisoutput","directoryType":"OUTPUT","cleanupMode":"TIME_ELAPSED_SINCE_LAST_MODIFIED","maxFileAge":10},
+    {"name":"arcgissystem","physicalPath":"${SERVER_DIRS}/arcgissystem","directoryType":"SYSTEM","cleanupMode":"NONE","maxFileAge":0}
   ]
 }
 print(json.dumps(dirs))
@@ -1633,15 +1633,19 @@ PY
 
     # ArcGIS Server requires cleanupMode to be one of:
     #   NONE | TIME_ELAPSED_SINCE_LAST_MODIFIED
-    # Your server errors if cleanupMode is missing/invalid, so we send NONE.
-
+    # The 'directories' parameter MUST include valid cleanupMode in every object.
+    # The 'configStoreConnection' must NOT include it (reverted).
+    # The TOP-LEVEL form parameter 'cleanupMode' is NOT standard for createNewSite but we leave it just in case.
+    
+    # CRITICAL FIX: The error "Cleanup Mode should be one of..." usually comes from the
+    # directory validation logic if the JSON objects inside "directories" are missing it.
+    
     _site_resp=$("${CURL_BASE[@]}" -X POST "$SERVER_ADMIN_URL/createNewSite" \
       -H "Referer: https://localhost:6443/arcgis/admin" \
       --data-urlencode "username=$ADMIN_USER" \
       --data-urlencode "password=$ADMIN_PASS" \
       --data-urlencode "configStoreConnection=${_cfg_json}" \
       --data-urlencode "directories=${_dirs_json}" \
-      --data-urlencode "cleanupMode=NONE" \
       --data-urlencode "f=json" 2>/dev/null) || _site_resp=""
 
     if [[ -n "${_site_resp:-}" ]]; then
