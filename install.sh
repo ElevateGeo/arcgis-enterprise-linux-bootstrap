@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Curl defaults can prefer IPv6 for localhost (::1). ArcGIS Server on some
-# installs listens only on IPv4, which makes curl appear to "return nothing".
-# Use IPv4 + timeouts for reliability in health checks and admin calls.
-CURL_BASE=(curl -4 -skS --connect-timeout 5 --max-time 30)
+# ArcGIS components can bind to IPv4 loopback, IPv6 loopback, or both depending
+# on OS/network settings. We prefer explicit 127.0.0.1 URLs, but some installs
+# end up listening only on ::1. Use timeouts, and make probes try alternate
+# loopback addresses when needed.
+CURL_BASE=(curl -skS --connect-timeout 5 --max-time 30)
 
 # Base install location used throughout.
 ESRI_BASE="/opt/esri"
+
+# Default internal targets. In some environments ArcGIS binds only to the
+# hostname's primary IP (or 127.0.1.1) rather than 127.0.0.1. We will
+# auto-discover a reachable local target during Step 10/11 and then reuse it.
+SERVER_HOST_DEFAULT="127.0.0.1"
+PORTAL_HOST_DEFAULT="127.0.0.1"
+DATASTORE_HOST_DEFAULT="127.0.0.1"
+
+SERVER_HOST="${SERVER_HOST:-$SERVER_HOST_DEFAULT}"
+PORTAL_HOST="${PORTAL_HOST:-$PORTAL_HOST_DEFAULT}"
+DATASTORE_HOST="${DATASTORE_HOST:-$DATASTORE_HOST_DEFAULT}"
+
+LAST_READY_URL=""
+LAST_READY_HOST=""
+LAST_READY_BASE=""
 
 usage() {
   cat <<'USAGE'
@@ -70,6 +86,12 @@ wipe_existing_enterprise() {
   fi
 
   echo "Removing ArcGIS Enterprise install directory: ${ESRI_BASE}/arcgis"
+  # Remove component directories explicitly first in case /opt/esri/arcgis is a
+  # symlink/bind-mount or partially recreated.
+  rm -rf "${ESRI_BASE}/arcgis/server" 2>/dev/null || true
+  rm -rf "${ESRI_BASE}/arcgis/portal" 2>/dev/null || true
+  rm -rf "${ESRI_BASE}/arcgis/datastore" 2>/dev/null || true
+  rm -rf "${ESRI_BASE}/arcgis/webadaptor"* 2>/dev/null || true
   rm -rf "${ESRI_BASE}/arcgis" 2>/dev/null || true
 
   # Clean up common service definitions so reinstall recreates them cleanly.
@@ -77,7 +99,21 @@ wipe_existing_enterprise() {
   rm -f /etc/init.d/arcgisportal /etc/init.d/arcgisserver /etc/init.d/arcgisdatastore 2>/dev/null || true
   rm -f /etc/systemd/system/arcgisportal.service /etc/systemd/system/arcgisserver.service /etc/systemd/system/arcgisdatastore.service 2>/dev/null || true
   rm -f /lib/systemd/system/arcgisportal.service /lib/systemd/system/arcgisserver.service /lib/systemd/system/arcgisdatastore.service 2>/dev/null || true
+  systemctl disable --now arcgisportal 2>/dev/null || true
+  systemctl disable --now arcgisserver 2>/dev/null || true
+  systemctl disable --now arcgisdatastore 2>/dev/null || true
+  systemctl reset-failed arcgisportal arcgisserver arcgisdatastore 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
+
+  # Ensure wipe actually succeeded; if it didn't, the installer will skip and
+  # we end up in a broken half-wiped state.
+  if [[ -e "${ESRI_BASE}/arcgis/server" || -e "${ESRI_BASE}/arcgis/portal" || -e "${ESRI_BASE}/arcgis/datastore" ]]; then
+    echo "ERROR: Wipe did not fully remove existing components under ${ESRI_BASE}/arcgis" >&2
+    echo "       Check for bind mounts/symlinks, permissions, or a running process preventing deletion." >&2
+    echo "       Remaining paths:" >&2
+    ls -ld "${ESRI_BASE}/arcgis" "${ESRI_BASE}/arcgis/server" "${ESRI_BASE}/arcgis/portal" "${ESRI_BASE}/arcgis/datastore" 2>/dev/null >&2 || true
+    exit 1
+  fi
 
   echo "Wipe complete. Proceeding with install..."
 }
@@ -782,18 +818,159 @@ fi
 # Helper functions — defined here so Step 10 and onwards can use them
 # ==============================================================================
 
-# wait_for_service URL NAME [MAX_SECONDS]
+format_host_for_url() {
+  local h="$1"
+  h="${h#[}"
+  h="${h%]}"
+  if [[ "$h" == *":"* ]]; then
+    echo "[$h]"
+  else
+    echo "$h"
+  fi
+}
+
+server_base() { echo "https://$(format_host_for_url "${SERVER_HOST}"):6443"; }
+portal_base() { echo "https://$(format_host_for_url "${PORTAL_HOST}"):7443"; }
+datastore_base() { echo "https://$(format_host_for_url "${DATASTORE_HOST}"):2443"; }
+
+url_replace_host() {
+  # url_replace_host URL NEW_HOST
+  python3 - "$1" "$2" <<'PY'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+url = sys.argv[1]
+new_host = sys.argv[2]
+p = urlsplit(url)
+netloc = p.netloc
+port = ''
+
+if netloc.startswith('['):
+    if ']' in netloc:
+        after = netloc.split(']', 1)[1]
+        if after.startswith(':'):
+            port = after[1:]
+else:
+    if ':' in netloc:
+        _, port = netloc.rsplit(':', 1)
+
+nh = new_host.strip().strip('[]')
+if ':' in nh:
+    nh = f'[{nh}]'
+if port:
+    nh = f'{nh}:{port}'
+
+print(urlunsplit((p.scheme, nh, p.path, p.query, p.fragment)))
+PY
+}
+
+url_extract_host() {
+  # url_extract_host URL -> prints host without brackets
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+p = urlsplit(sys.argv[1])
+netloc = p.netloc
+if netloc.startswith('['):
+    h = netloc.split(']')[0][1:]
+else:
+    h = netloc.rsplit(':', 1)[0] if ':' in netloc else netloc
+print(h)
+PY
+}
+
+url_extract_base() {
+  # url_extract_base URL -> prints scheme://netloc
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+p = urlsplit(sys.argv[1])
+print(f"{p.scheme}://{p.netloc}")
+PY
+}
+
+get_local_host_candidates() {
+  # get_local_host_candidates REQUESTED_HOST -> prints unique candidates, one per line
+  local requested="${1:-}"
+  local req="${requested#[}"
+  req="${req%]}"
+
+  local primary_ip
+  primary_ip=$(hostname -I 2>/dev/null | awk '{print $1}') || primary_ip=""
+
+  local h_fqdn h_short h_any
+  h_fqdn=$(hostname -f 2>/dev/null || true)
+  h_short=$(hostname -s 2>/dev/null || true)
+  h_any=$(hostname 2>/dev/null || true)
+
+  local -a out
+  out=()
+  declare -A seen
+  seen=()
+
+  _add_host() {
+    local h="$1"
+    [[ -z "${h:-}" ]] && return 0
+    h="${h#[}"
+    h="${h%]}"
+    if [[ -z "${seen[$h]+x}" ]]; then
+      seen[$h]=1
+      out+=("$h")
+    fi
+  }
+
+  _add_host "$req"
+  _add_host "127.0.0.1"
+  _add_host "localhost"
+  _add_host "::1"
+  _add_host "127.0.1.1"
+  _add_host "$h_fqdn"
+  _add_host "$h_short"
+  _add_host "$h_any"
+  _add_host "$primary_ip"
+
+  printf '%s\n' "${out[@]}"
+}
+
+# wait_for_service URL NAME [MAX_SECONDS] [HOST_VAR_NAME]
 wait_for_service() {
   local url="$1"
   local name="$2"
   local max_wait="${3:-300}"  # default 5 minutes
+  local host_var_name="${4:-}"
   local elapsed=0
+  local -a _hosts _urls
+  local _u _resp _req_host
+  LAST_READY_URL=""; LAST_READY_HOST=""; LAST_READY_BASE=""
+
+  _req_host=$(url_extract_host "$url" 2>/dev/null || true)
+  mapfile -t _hosts < <(get_local_host_candidates "${_req_host:-}")
+
+  _urls=()
+  local _h
+  for _h in "${_hosts[@]}"; do
+    _u=$(url_replace_host "$url" "$_h" 2>/dev/null || true)
+    [[ -n "${_u:-}" ]] && _urls+=("$_u")
+  done
+
   echo "Waiting for $name to be ready at $url ..."
   while (( elapsed < max_wait )); do
-    if "${CURL_BASE[@]}" "$url" 2>/dev/null | grep -q "status.*success\|currentVersion\|html\|arcgis"; then
-      echo "$name is ready."
-      return 0
-    fi
+    for _u in "${_urls[@]}"; do
+      _resp=$("${CURL_BASE[@]}" "$_u" 2>/dev/null) || _resp=""
+      if echo "$_resp" | grep -qiE '"status"[[:space:]]*:[[:space:]]*"success"|"currentVersion"|<html|arcgis'; then
+        LAST_READY_URL="$_u"
+        LAST_READY_HOST=$(url_extract_host "$_u" 2>/dev/null || true)
+        LAST_READY_BASE=$(url_extract_base "$_u" 2>/dev/null || true)
+        if [[ -n "${host_var_name:-}" && -n "${LAST_READY_HOST:-}" ]]; then
+          printf -v "${host_var_name}" '%s' "${LAST_READY_HOST}"
+        fi
+        if [[ "${LAST_READY_URL:-}" != "${url:-}" ]]; then
+          echo "  Using reachable endpoint: ${LAST_READY_URL}"
+        fi
+        echo "$name is ready."
+        return 0
+      fi
+    done
     sleep 10
     elapsed=$((elapsed + 10))
     (( elapsed % 30 == 0 )) && echo "  ... still waiting ($elapsed s)"
@@ -806,16 +983,11 @@ wait_for_service() {
 # If the process is alive but port 6443 is not responding (broken init state
 # from a prior failed run), force a stop/start cycle before giving up.
 wait_for_server() {
-  # Fast path: already responding
-  if "${CURL_BASE[@]}" \
-      "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null \
-      | grep -q "currentVersion"; then
-    echo "ArcGIS Server is ready."
-    return 0
-  fi
+  local rest_url
+  rest_url="$(server_base)/arcgis/rest/info?f=json"
 
-  # Wait up to 4 min for a clean start
-  wait_for_service "https://127.0.0.1:6443/arcgis/rest/info?f=json" "ArcGIS Server" 240 && return 0
+  # Wait up to 4 min for a clean start (also learns the reachable host)
+  wait_for_service "${rest_url}" "ArcGIS Server" 240 SERVER_HOST && return 0
 
   # Still not up — the process may be running but stuck (broken security
   # init state). Force a restart.
@@ -828,7 +1000,38 @@ wait_for_server() {
   done
   sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" > /dev/null 2>&1 || true
   echo "  Restarted. Waiting up to 5 min for Server..."
-  wait_for_service "https://127.0.0.1:6443/arcgis/rest/info?f=json" "ArcGIS Server" 300
+  if wait_for_service "${rest_url}" "ArcGIS Server" 300 SERVER_HOST; then
+    return 0
+  fi
+
+  # Diagnostics (best-effort) to help root-cause startup issues.
+  set +e
+  echo "  --- ArcGIS Server startup diagnostics ---" >&2
+  if command -v ss >/dev/null 2>&1; then
+    echo "  Listening sockets (6443/6080):" >&2
+    ss -ltnp 2>/dev/null | grep -E ':(6443|6080)\b' >&2 || echo "  (no listeners on 6443/6080)" >&2
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    echo "  Host resolution (getent hosts localhost/hostname):" >&2
+    getent hosts localhost 2>/dev/null >&2 || true
+    getent hosts "$(hostname -s 2>/dev/null || hostname 2>/dev/null)" 2>/dev/null >&2 || true
+    getent hosts "$(hostname -f 2>/dev/null || hostname 2>/dev/null)" 2>/dev/null >&2 || true
+  fi
+  command -v systemctl >/dev/null 2>&1 && systemctl status arcgisserver --no-pager -l 2>/dev/null | tail -120 >&2 || true
+  command -v journalctl >/dev/null 2>&1 && journalctl -u arcgisserver --no-pager -n 120 2>/dev/null >&2 || true
+
+  local _slog_dir _slog
+  _slog_dir="$ESRI_BASE/arcgis/server/usr/logs"
+  if [[ -d "${_slog_dir}" ]]; then
+    _slog=$(find "${_slog_dir}" -type f \( -name "*.log" -o -name "*.log.*" \) ! -name "*.lck" 2>/dev/null | sort | tail -1)
+    if [[ -n "${_slog:-}" && -f "${_slog}" ]]; then
+      echo "  Latest Server log: ${_slog}" >&2
+      tail -250 "${_slog}" 2>/dev/null | grep -i "error\|exception\|fatal\|warn\|bind\|port" | tail -120 >&2 || true
+    fi
+  fi
+  echo "  --- End diagnostics ---" >&2
+  set -e
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -838,34 +1041,38 @@ wait_for_server() {
 wait_for_datastore_admin() {
   local max_wait="${1:-600}"
   local elapsed=0
-  local url_health="https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json"
-  local url_json="https://127.0.0.1:2443/arcgis/datastoreadmin/?f=json"
-  local url_root="https://127.0.0.1:2443/arcgis/datastoreadmin/"
-  local _resp
+  local _resp _h
+  local -a _hosts
+  mapfile -t _hosts < <(get_local_host_candidates "${DATASTORE_HOST}")
 
-  echo "Waiting for ArcGIS Data Store (admin) to be ready at ${url_health} ..."
+  echo "Waiting for ArcGIS Data Store (admin) to be ready at $(datastore_base)/arcgis/datastoreadmin/healthCheck?f=json ..."
   while (( elapsed < max_wait )); do
-    # Some ArcGIS Data Store builds do NOT expose datastoreadmin/healthCheck.
-    # Treat 404 as "endpoint not available" and fall back to other probes.
-    _resp=$("${CURL_BASE[@]}" "${url_health}" 2>/dev/null) || _resp=""
-    if echo "${_resp}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"'; then
-      echo "ArcGIS Data Store (admin) is ready."
-      return 0
-    fi
+    for _h in "${_hosts[@]}"; do
+      # Some ArcGIS Data Store builds do NOT expose datastoreadmin/healthCheck.
+      # Treat 404 as "endpoint not available" and fall back to other probes.
+      _resp=$("${CURL_BASE[@]}" "https://$(format_host_for_url "${_h}"):2443/arcgis/datastoreadmin/healthCheck?f=json" 2>/dev/null) || _resp=""
+      if echo "${_resp}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"'; then
+        DATASTORE_HOST="${_h}"
+        echo "ArcGIS Data Store (admin) is ready."
+        return 0
+      fi
 
-    # Probe the admin root as JSON (common REST pattern).
-    _resp=$("${CURL_BASE[@]}" "${url_json}" 2>/dev/null) || _resp=""
-    if echo "${_resp}" | grep -qiE '"currentVersion"|"release"|"build"|"machineName"|"status"'; then
-      echo "ArcGIS Data Store (admin) is responding."
-      return 0
-    fi
+      # Probe the admin root as JSON (common REST pattern).
+      _resp=$("${CURL_BASE[@]}" "https://$(format_host_for_url "${_h}"):2443/arcgis/datastoreadmin/?f=json" 2>/dev/null) || _resp=""
+      if echo "${_resp}" | grep -qiE '"currentVersion"|"release"|"build"|"machineName"|"status"'; then
+        DATASTORE_HOST="${_h}"
+        echo "ArcGIS Data Store (admin) is responding."
+        return 0
+      fi
 
-    # Last-resort probe: at least the web app responds with HTML.
-    _resp=$("${CURL_BASE[@]}" "${url_root}" 2>/dev/null) || _resp=""
-    if echo "${_resp}" | grep -qiE 'datastoreadmin|arcgis data store|generate token'; then
-      echo "ArcGIS Data Store (admin) is responding (HTML)."
-      return 0
-    fi
+      # Last-resort probe: at least the web app responds with HTML.
+      _resp=$("${CURL_BASE[@]}" "https://$(format_host_for_url "${_h}"):2443/arcgis/datastoreadmin/" 2>/dev/null) || _resp=""
+      if echo "${_resp}" | grep -qiE 'datastoreadmin|arcgis data store|generate token'; then
+        DATASTORE_HOST="${_h}"
+        echo "ArcGIS Data Store (admin) is responding (HTML)."
+        return 0
+      fi
+    done
 
     sleep 10
     elapsed=$((elapsed + 10))
@@ -896,10 +1103,10 @@ datastore_admin_diagnose() {
   set +e
   echo "  --- Data Store diagnostics ---" >&2
   echo "  Admin healthCheck (may 404 on some builds):" >&2
-  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/healthCheck?f=json" 2>&1 | tail -60 >&2
+  "${CURL_BASE[@]}" "$(datastore_base)/arcgis/datastoreadmin/healthCheck?f=json" 2>&1 | tail -60 >&2
   echo "" >&2
   echo "  Admin root JSON probe:" >&2
-  "${CURL_BASE[@]}" "https://127.0.0.1:2443/arcgis/datastoreadmin/?f=json" 2>&1 | tail -60 >&2
+  "${CURL_BASE[@]}" "$(datastore_base)/arcgis/datastoreadmin/?f=json" 2>&1 | tail -60 >&2
   echo "" >&2
 
   local _log_dir _latest _lck
@@ -929,11 +1136,14 @@ generate_portal_token() {
 
   # Try portaladmin/generateToken first (admin-scoped), then sharing/rest as fallback.
   # Use client=referer for robustness against IP changes/NAT loopbacks.
-  local _ep
-  for _ep in \
-    "https://127.0.0.1:7443/arcgis/portaladmin/generateToken" \
-    "https://127.0.0.1:7443/arcgis/sharing/rest/generateToken"; do
-    _resp=$("${CURL_BASE[@]}" --post301 --post302 -L -X POST "$_ep" \
+  local _h _ep
+  local -a _hosts
+  mapfile -t _hosts < <(get_local_host_candidates "${PORTAL_HOST}")
+  for _h in "${_hosts[@]}"; do
+    for _ep in \
+      "https://$(format_host_for_url "${_h}"):7443/arcgis/portaladmin/generateToken" \
+      "https://$(format_host_for_url "${_h}"):7443/arcgis/sharing/rest/generateToken"; do
+    _resp=$("${CURL_BASE[@]}" --post301 --post302 -L -X POST "${_ep}" \
       -H "Referer: https://localhost:7443/arcgis" \
       -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
       -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
@@ -944,7 +1154,12 @@ try:
   t=json.load(sys.stdin).get('token','')
   print(t if t else '')
 except: pass" 2>/dev/null) || _token=""
-    if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+    if [[ -n "$_token" && "$_token" != "None" ]]; then
+      PORTAL_HOST="${_h}"
+      echo "$_token"
+      return 0
+    fi
+    done
   done
 
   echo "DEBUG: Portal generateToken last response: $_resp" >&2
@@ -957,14 +1172,24 @@ except: pass" 2>/dev/null) || _token=""
 generate_server_token() {
   local _resp _token
   # Use client=referer to avoid IP mismatches (e.g. 127.0.0.1 vs ::1)
-  _resp=$("${CURL_BASE[@]}" -X POST "https://127.0.0.1:6443/arcgis/admin/generateToken" \
-    -H "Referer: https://localhost:6443/arcgis/admin" \
-    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
-    -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
-    -d "expiration=60" \
-    -d "f=json" 2>/dev/null) || _resp=""
-  _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
-  if [[ -n "$_token" && "$_token" != "None" ]]; then echo "$_token"; return 0; fi
+  local _h _ep
+  local -a _hosts
+  mapfile -t _hosts < <(get_local_host_candidates "${SERVER_HOST}")
+  for _h in "${_hosts[@]}"; do
+    _ep="https://$(format_host_for_url "${_h}"):6443/arcgis/admin/generateToken"
+    _resp=$("${CURL_BASE[@]}" -X POST "${_ep}" \
+      -H "Referer: https://localhost:6443/arcgis/admin" \
+      -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+      -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
+      -d "expiration=60" \
+      -d "f=json" 2>/dev/null) || _resp=""
+    _token=$(echo "$_resp" | python3 -c "import sys,json; t=json.load(sys.stdin).get('token',''); print(t if t else '')" 2>/dev/null) || _token=""
+    if [[ -n "$_token" && "$_token" != "None" ]]; then
+      SERVER_HOST="${_h}"
+      echo "$_token"
+      return 0
+    fi
+  done
   echo "DEBUG: Server generateToken response: $_resp" >&2
   return 1
 }
@@ -981,7 +1206,7 @@ get_server_host_for_datastore() {
   _tok=$(generate_server_token 2>/dev/null) || _tok=""
   if [[ -n "${_tok:-}" ]]; then
     _resp=$("${CURL_BASE[@]}" -H "Referer: https://localhost:6443/arcgis/admin" \
-      "https://127.0.0.1:6443/arcgis/admin/machines?f=json&token=${_tok}" 2>/dev/null) || _resp=""
+      "$(server_base)/arcgis/admin/machines?f=json&token=${_tok}" 2>/dev/null) || _resp=""
     _name=$(echo "${_resp:-}" | python3 -c "
 import sys, json
 try:
@@ -1050,7 +1275,7 @@ fi
 # (Server was already waited on in Step 10 if it was just started;
 #  these calls return immediately if the service is already up.)
 wait_for_server || true
-wait_for_service "https://127.0.0.1:7443/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 || true
+wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 300 PORTAL_HOST || true
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
@@ -1064,7 +1289,7 @@ echo ">>> Step 11: Creating ArcGIS Server Site"
 echo ""
 
 CREATESITE_TOOL="$ESRI_BASE/arcgis/server/tools/createsite/createsite.sh"
-SERVER_ADMIN_URL="https://127.0.0.1:6443/arcgis/admin"
+SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
 
 # Config-store and directories can be overridden (and persisted) via .env.
 # When we recreate the Server site, we will allocate fresh empty folders.
@@ -1108,7 +1333,7 @@ server_site_exists() {
   local _rest _info
 
   # Prefer the unauthenticated REST probe if available.
-  _rest=$("${CURL_BASE[@]}" "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null) || _rest=""
+  _rest=$("${CURL_BASE[@]}" "$(server_base)/arcgis/rest/info?f=json" 2>/dev/null) || _rest=""
   echo "$_rest" | grep -qiE '"currentVersion"|"currentversion"' && return 0
 
   # Admin endpoint may require a token and respond with 499 if missing;
@@ -1143,7 +1368,7 @@ server_admin_diagnose() {
     "$SERVER_ADMIN_URL/info?f=json"
 
   _curl_diag "generateToken" "${CURL_BASE[@]}" -X POST \
-    "https://127.0.0.1:6443/arcgis/admin/generateToken" \
+    "$(server_base)/arcgis/admin/generateToken" \
     -H "Referer: https://localhost:6443/arcgis/admin" \
     -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
     -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
@@ -1207,40 +1432,21 @@ wipe_server_config_store() {
   wait_for_server || echo "  WARNING: Server did not come up within expected time after wipe."
 }
 
-# Determine Server state and act accordingly:
-#   Healthy  = /admin/info + token generation both succeed  → skip
-#   Degraded = /admin/info succeeds but token fails          → wipe + recreate
-#   Down     = /admin/info fails (no site or admin unreachable) → create (or wipe+create)
-if server_admin_is_healthy; then
-  echo "ArcGIS Server site exists and admin is healthy, skipping..."
-else
-  # If the site exists but admin isn't fully healthy yet, prefer waiting over wiping.
-  # Wiping a partially-initialized but valid site causes long loops and can break
-  # downstream Data Store registration.
-  if server_site_exists; then
-    echo "  Server site exists but admin is not fully healthy yet — waiting before taking destructive action..."
-    _elapsed=0
-    while (( _elapsed < 900 )); do
-      if server_admin_is_healthy; then
-        echo "  Server admin is healthy."
-        break
-      fi
-      sleep 15; _elapsed=$((_elapsed + 15))
-      (( _elapsed % 60 == 0 )) && echo "  ... still waiting for Server admin (${_elapsed}s)"
-    done
 
-    if ! server_admin_is_healthy; then
-      echo "  ERROR: Server admin did not become healthy within 900s." >&2
-      server_admin_diagnose
-      exit 1
-    fi
+create_server_site() {
+  # create_server_site DO_WIPE(0|1)
+  local do_wipe="${1:-0}"
+
+  if (( do_wipe == 1 )); then
+    echo "  Server site exists but admin remains unhealthy — wiping config-store to force fresh recreation."
+    SERVER_SITE_RECREATED=1
+    wipe_server_config_store "$SERVER_CS" "$SERVER_DIRS"
+    # wipe_server_config_store restarts Server; re-learn the reachable host.
+    wait_for_server || true
+    SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
   else
-  # If the admin is not 100% healthy, we assume the site is broken or non-existent.
-  # We FORCE a wipe of the config-store to ensure a clean slate for createsite.sh.
-  # Previous attempts to detect "if site exists but broken" were flaky.
-  echo "  Server admin is not fully healthy (missing token or config) — wiping config-store to force fresh creation."
-  SERVER_SITE_RECREATED=1
-  wipe_server_config_store "$SERVER_CS" "$SERVER_DIRS"
+    echo "  No existing Server site detected — creating a new site..."
+  fi
 
   # Allocate fresh empty folders for createsite so it never reuses stale content.
   # This avoids createsite.sh failing with:
@@ -1256,13 +1462,9 @@ else
   echo "  Using fresh Server directories:  $SERVER_DIRS"
 
   # Give Server a moment to finish starting before createsite.
-  # On a no-site instance, REST endpoints may not respond yet; createsite.sh
-  # has its own internal checks.
   sleep 20
 
   # Now create (or recreate) the site.
-  # IMPORTANT: use "|| _cs_rc=$?" not "|| true" so we capture the real exit
-  # code without triggering set -e (which would kill the script).
   _cs_rc=0
   if [[ -f "$CREATESITE_TOOL" ]]; then
     echo "Creating ArcGIS Server site using createsite.sh..."
@@ -1296,7 +1498,7 @@ else
     fi
     sleep 15; _elapsed=$((_elapsed + 15))
     if (( _elapsed % 60 == 0 )); then
-      _rest_probe=$("${CURL_BASE[@]}" "https://127.0.0.1:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
+      _rest_probe=$("${CURL_BASE[@]}" "$(server_base)/arcgis/rest/info?f=json" 2>/dev/null || true)
       _tok_probe=$(generate_server_token 2>/dev/null || true)
       _rest_ok=no
       echo "${_rest_probe:-}" | grep -qiE '"currentVersion"|"currentversion"' && _rest_ok=ok
@@ -1309,7 +1511,41 @@ else
     echo "  Aborting next steps because the Server site is not usable (Data Store + federation will fail)." >&2
     exit 1
   fi
-  fi  # server_site_exists
+}
+
+# Determine Server state and act accordingly:
+#   Healthy  = /admin/info + token generation both succeed → skip
+#   Unhealthy site exists → wait; then wipe+recreate
+#   No site yet → create
+
+if ! wait_for_server; then
+  echo "ERROR: ArcGIS Server REST endpoint is not reachable on any local address. Cannot create site." >&2
+  echo "       Fix ArcGIS Server startup/binding first, then rerun." >&2
+  exit 1
+fi
+SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
+
+if server_admin_is_healthy; then
+  echo "ArcGIS Server site exists and admin is healthy, skipping..."
+else
+  if server_site_exists; then
+    echo "  Server site exists but admin is not fully healthy yet — waiting before taking destructive action..."
+    _elapsed=0
+    while (( _elapsed < 900 )); do
+      if server_admin_is_healthy; then
+        echo "  Server admin is healthy."
+        break
+      fi
+      sleep 15; _elapsed=$((_elapsed + 15))
+      (( _elapsed % 60 == 0 )) && echo "  ... still waiting for Server admin (${_elapsed}s)"
+    done
+
+    if ! server_admin_is_healthy; then
+      create_server_site 1
+    fi
+  else
+    create_server_site 0
+  fi
 fi
 
 # ==============================================================================
@@ -1322,7 +1558,7 @@ echo ""
 echo ">>> Step 12: Creating Portal"
 echo ""
 
-PORTAL_ADMIN_URL="https://127.0.0.1:7443/arcgis/portaladmin"
+PORTAL_ADMIN_URL="$(portal_base)/arcgis/portaladmin"
 PORTAL_INFO=$(${CURL_BASE[@]} "$PORTAL_ADMIN_URL?f=json" 2>/dev/null || echo "")
 if echo "$PORTAL_INFO" | grep -q "currentVersion"; then
   echo "Portal already configured, skipping..."
@@ -1424,6 +1660,33 @@ HOOK_EOF
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 echo "  Certbot deploy hook installed: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
 
+# If ArcGIS binds to a non-127.0.0.1 local address (common when hostname is
+# mapped to the primary IP), update the reverse-proxy upstreams so NGINX can
+# reach Portal/Server reliably.
+if [[ -f "/etc/nginx/sites-available/arcgis" ]]; then
+  _PORTAL_UP="https://$(format_host_for_url "${PORTAL_HOST}"):7443"
+  _SERVER_UP="https://$(format_host_for_url "${SERVER_HOST}"):6443"
+  python3 - "$_PORTAL_UP" "$_SERVER_UP" <<'PY'
+import sys
+
+portal_up = sys.argv[1]
+server_up = sys.argv[2]
+path = '/etc/nginx/sites-available/arcgis'
+
+with open(path, 'r', encoding='utf-8') as f:
+    txt = f.read()
+
+txt2 = txt.replace('https://127.0.0.1:7443', portal_up)
+txt2 = txt2.replace('https://127.0.0.1:6443', server_up)
+
+if txt2 != txt:
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(txt2)
+PY
+
+  nginx -t && systemctl reload nginx
+fi
+
 # ==============================================================================
 # Step 14: Federate Server with Portal
 #
@@ -1444,7 +1707,8 @@ echo ""
 echo ">>> Step 14: Federating Server with Portal"
 echo ""
 
-wait_for_service "https://127.0.0.1:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 PORTAL_HOST || true
+PORTAL_ADMIN_URL="$(portal_base)/arcgis/portaladmin"
 
 # Check if already federated — idempotency gate
 PREV_TOKEN=$(generate_portal_token 2>/dev/null) || PREV_TOKEN=""
@@ -1452,7 +1716,7 @@ EXISTING_FEDERATION=""
 if [[ -n "${PREV_TOKEN:-}" ]]; then
   EXISTING_FEDERATION=$("${CURL_BASE[@]}" \
     -H "Referer: https://localhost:7443/arcgis" \
-    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers?f=json&token=$PREV_TOKEN" \
+    "${PORTAL_ADMIN_URL}/federation/servers?f=json&token=$PREV_TOKEN" \
     2>/dev/null) || EXISTING_FEDERATION=""
 fi
 
@@ -1473,7 +1737,7 @@ if (( HAS_FEDERATION == 1 )); then
     # Try POST validate (preferred), then GET validate as a fallback.
     VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 -X POST \
       -H "Referer: https://localhost:7443/arcgis" \
-      "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate" \
+      "${PORTAL_ADMIN_URL}/federation/servers/validate" \
       -d "token=${_val_tok}" -d "f=json" 2>/dev/null) || VALIDATE_JSON=""
     # Some Portal builds return HTML 405 for POST validate. If the response is not
     # valid JSON, treat it as empty so we fall back to GET.
@@ -1485,7 +1749,7 @@ if (( HAS_FEDERATION == 1 )); then
     if [[ -z "${VALIDATE_JSON:-}" ]]; then
       VALIDATE_JSON=$("${CURL_BASE[@]}" --max-time 180 \
         -H "Referer: https://localhost:7443/arcgis" \
-        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate?token=${_val_tok}&f=json" \
+        "${PORTAL_ADMIN_URL}/federation/servers/validate?token=${_val_tok}&f=json" \
         2>/dev/null) || VALIDATE_JSON=""
     fi
 
@@ -1584,7 +1848,7 @@ for s in data.get('servers', []):
         echo "  Unfederating server id: $sid"
         "${CURL_BASE[@]}" --max-time 300 -X POST \
           -H "Referer: https://localhost:7443/arcgis" \
-          "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$sid/unfederate" \
+          "${PORTAL_ADMIN_URL}/federation/servers/$sid/unfederate" \
           -d "token=$TOKEN_UNFED" -d "f=json" 2>/dev/null || true
       done
     else
@@ -1638,7 +1902,7 @@ for s in data.get('servers', []):
     else
 
     FEDERATE_RESULT=$("${CURL_BASE[@]}" --max-time 300 -X POST \
-      "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/federate" \
+      "${PORTAL_ADMIN_URL}/federation/servers/federate" \
       -H "Referer: https://localhost:7443/arcgis" \
       -d "url=https://$DOMAIN/server" \
       -d "adminUrl=https://$DOMAIN/server" \
@@ -1929,9 +2193,10 @@ sys.exit(1)
   if (( DS_REL_OK == 0 && DS_OBJ_OK == 0 )); then
     PORTAL_TOKEN_HOSTING=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN_HOSTING=""
     if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
+      PORTAL_ADMIN_URL="$(portal_base)/arcgis/portaladmin"
       SERVERS_JSON=$("${CURL_BASE[@]}" \
         -H "Referer: https://localhost:7443/arcgis" \
-        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers?f=json&token=$PORTAL_TOKEN_HOSTING" \
+        "${PORTAL_ADMIN_URL}/federation/servers?f=json&token=$PORTAL_TOKEN_HOSTING" \
         2>/dev/null) || SERVERS_JSON=""
 
       FEDERATED_SERVER_ID=$(echo "$SERVERS_JSON" | python3 -c "
@@ -1948,7 +2213,7 @@ for s in data.get('servers',[]):
         echo "Setting federated Server as hosting server..."
         HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
           -H "Referer: https://localhost:7443/arcgis" \
-          "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+          "${PORTAL_ADMIN_URL}/federation/servers/$FEDERATED_SERVER_ID/update" \
           -d "serverRole=HOSTING_SERVER" \
           -d "token=$PORTAL_TOKEN_HOSTING" \
           -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
@@ -1967,7 +2232,7 @@ for s in data.get('servers',[]):
                 if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
                   HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
                     -H "Referer: https://localhost:7443/arcgis" \
-                    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+                    "${PORTAL_ADMIN_URL}/federation/servers/$FEDERATED_SERVER_ID/update" \
                     -d "serverRole=HOSTING_SERVER" \
                     -d "token=$PORTAL_TOKEN_HOSTING" \
                     -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
@@ -1983,7 +2248,7 @@ for s in data.get('servers',[]):
                 if [[ -n "${PORTAL_TOKEN_HOSTING:-}" ]]; then
                   HOSTING_RESULT=$("${CURL_BASE[@]}" -X POST \
                     -H "Referer: https://localhost:7443/arcgis" \
-                    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FEDERATED_SERVER_ID/update" \
+                    "${PORTAL_ADMIN_URL}/federation/servers/$FEDERATED_SERVER_ID/update" \
                     -d "serverRole=HOSTING_SERVER" \
                     -d "token=$PORTAL_TOKEN_HOSTING" \
                     -d "f=json" 2>/dev/null) || HOSTING_RESULT=""
@@ -2006,7 +2271,7 @@ for s in data.get('servers',[]):
       echo "Validating federated server sites..."
       _VAL_JSON=$("${CURL_BASE[@]}" --max-time 180 \
         -H "Referer: https://localhost:7443/arcgis" \
-        "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/validate?token=$PORTAL_TOKEN_HOSTING&f=json" \
+        "${PORTAL_ADMIN_URL}/federation/servers/validate?token=$PORTAL_TOKEN_HOSTING&f=json" \
         2>/dev/null) || _VAL_JSON=""
       if echo "${_VAL_JSON:-}" | grep -qiE "decrypt token|could not decrypt|\"issuesFound\"[[:space:]]*:[[:space:]]*true|\"status\"[[:space:]]*:[[:space:]]*\"error\""; then
         echo "WARNING: Federation validation reports issues. Review Portal → Organization → Settings → Servers." >&2
@@ -2040,11 +2305,12 @@ echo ""
 PORTAL_TOKEN=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN=""
 if [[ -n "$PORTAL_TOKEN" ]]; then
   PORTAL_INTERNAL_HOST=$(hostname -f 2>/dev/null || echo "localhost")
+  PORTAL_ADMIN_URL="$(portal_base)/arcgis/portaladmin"
 
   # Check current properties to avoid unnecessary restart
   CURRENT_PROPS=$("${CURL_BASE[@]}" \
     -H "Referer: https://localhost:7443/arcgis" \
-    "https://127.0.0.1:7443/arcgis/portaladmin/system/properties?f=json&token=$PORTAL_TOKEN" \
+    "${PORTAL_ADMIN_URL}/system/properties?f=json&token=$PORTAL_TOKEN" \
     2>/dev/null) || CURRENT_PROPS=""
   CURRENT_WCU=$(echo "$CURRENT_PROPS" | python3 -c \
     "import sys,json; p=json.load(sys.stdin); print(p.get('WebContextURL',''))" 2>/dev/null) || CURRENT_WCU=""
@@ -2055,7 +2321,7 @@ if [[ -n "$PORTAL_TOKEN" ]]; then
     echo "  Setting Portal WebContextURL = https://$DOMAIN/portal"
     echo "  Setting Portal privatePortalURL = https://$PORTAL_INTERNAL_HOST:7443/arcgis"
     CTX_RESULT=$("${CURL_BASE[@]}" -X POST \
-      "https://127.0.0.1:7443/arcgis/portaladmin/system/properties/update" \
+      "${PORTAL_ADMIN_URL}/system/properties/update" \
       -H "Referer: https://localhost:7443/arcgis" \
       --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/portal\",\"privatePortalURL\":\"https://$PORTAL_INTERNAL_HOST:7443/arcgis\"}" \
       -d "token=$PORTAL_TOKEN" \
@@ -2067,7 +2333,7 @@ if [[ -n "$PORTAL_TOKEN" ]]; then
       echo "  Portal reverse proxy properties configured."
       echo "  Waiting for Portal to restart..."
       sleep 30
-      wait_for_service "https://127.0.0.1:7443/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 || true
+      wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal" 300 PORTAL_HOST || true
     fi
   fi
 else
@@ -2080,7 +2346,7 @@ echo "Setting Server WebContextURL to https://$DOMAIN/server ..."
 SRV_TOK=$(generate_server_token 2>/dev/null) || SRV_TOK=""
 if [[ -n "$SRV_TOK" ]]; then
   CTX_RESULT=$("${CURL_BASE[@]}" -X POST \
-    "https://127.0.0.1:6443/arcgis/admin/system/properties/update" \
+    "$(server_base)/arcgis/admin/system/properties/update" \
     -H "Referer: https://localhost:6443/arcgis/admin" \
     --data-urlencode "properties={\"WebContextURL\":\"https://$DOMAIN/server\"}" \
     -d "token=$SRV_TOK" -d "f=json" 2>/dev/null) || CTX_RESULT=""
@@ -2097,9 +2363,10 @@ fi
 # --- 16c: Update federation services URL to public reverse-proxy URL ---
 PORTAL_TOKEN=$(generate_portal_token 2>/dev/null) || PORTAL_TOKEN=""
 if [[ -n "$PORTAL_TOKEN" ]]; then
+  PORTAL_ADMIN_URL="$(portal_base)/arcgis/portaladmin"
   SERVERS_JSON=$("${CURL_BASE[@]}" \
     -H "Referer: https://localhost:7443/arcgis" \
-    "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers?f=json&token=$PORTAL_TOKEN" \
+    "${PORTAL_ADMIN_URL}/federation/servers?f=json&token=$PORTAL_TOKEN" \
     2>/dev/null) || SERVERS_JSON=""
   FED_ID=$(echo "$SERVERS_JSON" | python3 -c "
 import sys,json
@@ -2116,7 +2383,7 @@ for s in data.get('servers',[]):
     echo ""
     echo "Updating federation services URL to https://$DOMAIN/server ..."
     UPD_RESULT=$("${CURL_BASE[@]}" -X POST \
-      "https://127.0.0.1:7443/arcgis/portaladmin/federation/servers/$FED_ID/update" \
+      "${PORTAL_ADMIN_URL}/federation/servers/$FED_ID/update" \
       -H "Referer: https://localhost:7443/arcgis" \
       -d "url=https://$DOMAIN/server" \
       -d "adminUrl=$FED_ADMIN" \
