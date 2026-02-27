@@ -60,6 +60,12 @@ wipe_existing_enterprise() {
   rm -rf "$TOMCAT_HOME/webapps/portal" "$TOMCAT_HOME/webapps/server" \
          "$TOMCAT_HOME/webapps/portal.war" "$TOMCAT_HOME/webapps/server.war" 2>/dev/null || true
 
+  # Cleanup InstallAnywhere registry to prevent "phantom" installs
+  echo "Removing installer registry (legacy cleanup)..."
+  rm -f /var/.com.zerog.registry.xml 2>/dev/null || true
+  rm -f "$ESRI_BASE/arcgis/.com.zerog.registry.xml" 2>/dev/null || true
+  rm -f "/home/$ARCGIS_USER/.com.zerog.registry.xml" 2>/dev/null || true
+
   echo "Wipe complete."
 }
 
@@ -257,7 +263,9 @@ if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/
   
   # Note: Builder installs all components. Takes time.
   # Builder Setup does NOT support -a flag directly.
-  sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis"
+  # Use 'bash -c' to ensure correct environment (HOME, CWD) for the installer.
+  echo "Invoking installer as $ARCGIS_USER (forcing clean env)..."
+  sudo -u "$ARCGIS_USER" bash -c "cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\""
 fi
 
 echo "Checking authorization status..."
