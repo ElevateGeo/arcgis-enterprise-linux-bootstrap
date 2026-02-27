@@ -256,26 +256,37 @@ if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/
   chown -R "$ARCGIS_USER:$ARCGIS_USER" "$ESRI_BASE/arcgis"
   
   # Note: Builder installs all components. Takes time.
-  sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis" -a "$SERVER_LIC"
-else
-  echo "ArcGIS components appear installed (start scripts found), checking authorization..."
-  
-  # Check for authorizeSoftware tool in standard locations
-  # Enterprise Builder installs server to server/ and portal to portal/
-  AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/null | head -1)
+  # Builder Setup does NOT support -a flag directly.
+  sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis"
+fi
 
-  if [[ -z "$AUTH_TOOL" ]]; then
-    # Try creating directory if missing slightly, or just authorize manually if running builder?
-    # Builder usually does auth. If it failed, maybe we need to run it again.
-    echo "WARNING: authorizeSoftware not found. Checking if Setup/install logs have errors."
-    LOG_DIR="$ESRI_BASE/arcgis/usr/logs"
-    if [[ -d "$LOG_DIR" ]]; then
-        ls -lt "$LOG_DIR" | head -5
-    fi
-    
-    # Check if server directory is empty
-    echo "Checking server directory content:"
-    ls -la "$ESRI_BASE/arcgis/server" 2>/dev/null
+echo "Checking authorization status..."
+# Check for authorizeSoftware tool in standard locations
+# Enterprise Builder installs server to server/ and portal to portal/
+AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/null | head -1)
+
+if [[ -z "$AUTH_TOOL" ]]; then
+  echo "WARNING: authorizeSoftware not found."
+  echo "Checking if Setup/install logs have errors..."
+  LOG_DIR="$ESRI_BASE/arcgis/usr/logs"
+  if [[ -d "$LOG_DIR" ]]; then
+      ls -lt "$LOG_DIR" | head -5
+  fi
+  
+  # Check if server directory is empty
+  echo "Checking server directory content:"
+  ls -la "$ESRI_BASE/arcgis/server" 2>/dev/null
+else
+  echo "Found authorization tool at: $AUTH_TOOL"
+  # Check if already authorized, or force re-authorization
+  if ! sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -s | grep -q "Congratulations"; then
+      echo "Applying license to ArcGIS Server..."
+      # Create proper ecp registration file if needed, or just pass prvc
+      sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -f "$SERVER_LIC" -e "$EMAIL"
+  else
+      echo "ArcGIS Server is already authorized."
+  fi
+fi
     ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
   else
     echo "Found authorization tool at: $AUTH_TOOL"
