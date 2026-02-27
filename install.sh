@@ -1592,10 +1592,14 @@ create_server_site() {
     echo "Creating ArcGIS Server site via REST API (createNewSite)..."
     local _cfg_json _dirs_json
     local _site_resp _status_url
+    local _op_meta
     
+    # Build the request payloads exactly as JSON strings.
+    # Include cleanupMode in configStoreConnection because some Server builds
+    # validate cleanup mode as part of the config store connection object.
     _cfg_json=$(python3 - <<PY
 import json
-print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM"}))
+  print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM", "cleanupMode": "NONE"}))
 PY
 ) || _cfg_json=""
     _dirs_json=$(python3 - <<PY
@@ -1612,10 +1616,16 @@ print(json.dumps(dirs))
 PY
 ) || _dirs_json=""
 
+    # Show the server-declared operation metadata (parameters) for createNewSite.
+    _op_meta=$(${CURL_BASE[@]} "$SERVER_ADMIN_URL/createNewSite?f=json" 2>/dev/null || true)
+    if [[ -n "${_op_meta:-}" ]]; then
+      echo "createNewSite operation metadata (f=json):"
+      echo "${_op_meta}"
+    fi
+
     # ArcGIS Server requires cleanupMode to be one of:
     #   NONE | TIME_ELAPSED_SINCE_LAST_MODIFIED
-    # Your server returns a 500 when cleanupMode is missing/invalid, so we
-    # always send cleanupMode=NONE.
+    # Your server errors if cleanupMode is missing/invalid, so we send NONE.
 
     _site_resp=$("${CURL_BASE[@]}" -X POST "$SERVER_ADMIN_URL/createNewSite" \
       -H "Referer: https://localhost:6443/arcgis/admin" \
