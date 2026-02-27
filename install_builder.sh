@@ -247,15 +247,26 @@ fi
 echo "Found installer at: $SETUP_SCRIPT"
 
 # Only run installer if components are missing
-if [[ ! -d "$ESRI_BASE/arcgis/server" || ! -d "$ESRI_BASE/arcgis/portal" || WIPE_EXISTING -eq 1 ]]; then
+if [[ ! -d "$ESRI_BASE/arcgis/server" || ! -d "$ESRI_BASE/arcgis/portal" || $WIPE_EXISTING -eq 1 ]]; then
   echo "Running Setup..."
   # Note: Builder installs all components. Takes time.
   sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis" -a "$SERVER_LIC"
 else
   echo "ArcGIS components appear installed, checking authorization..."
-  if ! sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/tools/authorizeSoftware" -s | grep -q "Congratulations"; then
-    echo "Applying license to ArcGIS Server..."
-    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/tools/authorizeSoftware" -f "$SERVER_LIC" -e "$EMAIL"
+  
+  # Check for authorizeSoftware tool in standard locations
+  AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/null | head -1)
+
+  if [[ -z "$AUTH_TOOL" ]]; then
+    echo "WARNING: Could not find authorizeSoftware tool. Installation might be incomplete."
+    echo "Listing $ESRI_BASE/arcgis:"
+    ls -F "$ESRI_BASE/arcgis" 2>/dev/null || echo "(empty)"
+  else
+    echo "Found authorization tool at: $AUTH_TOOL"
+    if ! sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -s | grep -q "Congratulations"; then
+        echo "Applying license to ArcGIS Server..."
+        sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -f "$SERVER_LIC" -e "$EMAIL"
+    fi
   fi
 fi
 
