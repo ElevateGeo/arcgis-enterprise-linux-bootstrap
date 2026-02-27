@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ArcGIS components can bind to IPv4 loopback, IPv6 loopback, or both depending
-# on OS/network settings. We prefer explicit 127.0.0.1 URLs, but some installs
-# end up listening only on ::1. Use timeouts, and make probes try alternate
-# loopback addresses when needed.
-CURL_BASE=(curl -skS --connect-timeout 5 --max-time 30)
+# on OS/network settings. Additionally, some environments set http_proxy/https_proxy
+# which can break local calls (curl will try to proxy https://127.0.0.1:6443).
+# Bypass proxies for these internal REST/admin calls.
+CURL_BASE=(curl -skS --noproxy '*' --connect-timeout 5 --max-time 30)
 
 # Base install location used throughout.
 ESRI_BASE="/opt/esri"
@@ -428,9 +428,14 @@ ensure_hostname_hosts_mapping() {
 
   [[ -z "${_host:-}" || -z "${_ip:-}" ]] && return 0
 
+  # If the system isn't configured with an FQDN yet, synthesize one so the
+  # /etc/hosts line matches Esri's required format: <IP> <FQDN> <Machine_name>.
+  if [[ -z "${_fqdn:-}" || "${_fqdn}" == "${_host}" ]]; then
+    _fqdn="${_host}.localdomain"
+  fi
+
   # If already mapped correctly, do nothing.
-  if grep -Eq "^${_ip}[[:space:]]+${_fqdn}([[:space:]]|$)" /etc/hosts 2>/dev/null || \
-     grep -Eq "^${_ip}[[:space:]]+${_host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+  if grep -Eq "^${_ip}[[:space:]]+${_fqdn}[[:space:]]+${_host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
     return 0
   fi
 
@@ -457,6 +462,11 @@ ensure_hostname_hosts_mapping() {
     $0 ~ ("(^|[[:space:]])" h "([[:space:]]|$)") { next }
     $0 ~ ("(^|[[:space:]])" f "([[:space:]]|$)") { next }
     { print $0 }
+    END {
+      if (inserted==0) {
+        print ip "  " f " " h
+      }
+    }
   ' /etc/hosts > "${_tmp}"
   cat "${_tmp}" > /etc/hosts
   rm -f "${_tmp}"
@@ -628,8 +638,8 @@ chown -R "$ARCGIS_USER:$ARCGIS_USER" "$ESRI_BASE"
 
 # Set system limits for arcgis user (required by Esri)
 cat > /etc/security/limits.d/arcgis.conf <<EOF
-$ARCGIS_USER soft nofile 65535
-$ARCGIS_USER hard nofile 65535
+$ARCGIS_USER soft nofile 65536
+$ARCGIS_USER hard nofile 65536
 $ARCGIS_USER soft nproc  25059
 $ARCGIS_USER hard nproc  25059
 EOF
@@ -941,6 +951,10 @@ wait_for_service() {
   local elapsed=0
   local -a _hosts _urls
   local _u _resp _req_host
+  local _rc
+  local _last_err=""
+  local _last_rc=""
+  local _last_url=""
   LAST_READY_URL=""; LAST_READY_HOST=""; LAST_READY_BASE=""
 
   _req_host=$(url_extract_host "$url" 2>/dev/null || true)
@@ -956,8 +970,15 @@ wait_for_service() {
   echo "Waiting for $name to be ready at $url ..."
   while (( elapsed < max_wait )); do
     for _u in "${_urls[@]}"; do
-      _resp=$("${CURL_BASE[@]}" "$_u" 2>/dev/null) || _resp=""
-      if echo "$_resp" | grep -qiE '"status"[[:space:]]*:[[:space:]]*"success"|"currentVersion"|<html|arcgis'; then
+      _resp=$("${CURL_BASE[@]}" "$_u" 2>&1); _rc=$?
+      if (( _rc != 0 )); then
+        _last_rc="${_rc}"
+        _last_url="${_u}"
+        # Keep only the last few lines; curl errors can be verbose.
+        _last_err=$(echo "${_resp:-}" | tail -6)
+        _resp=""
+      fi
+      if [[ -n "${_resp:-}" ]] && echo "$_resp" | grep -qiE '"status"[[:space:]]*:[[:space:]]*"success"|"currentVersion"|<html|arcgis'; then
         LAST_READY_URL="$_u"
         LAST_READY_HOST=$(url_extract_host "$_u" 2>/dev/null || true)
         LAST_READY_BASE=$(url_extract_base "$_u" 2>/dev/null || true)
@@ -976,6 +997,10 @@ wait_for_service() {
     (( elapsed % 30 == 0 )) && echo "  ... still waiting ($elapsed s)"
   done
   echo "WARNING: $name did not respond within ${max_wait}s"
+  if [[ -n "${_last_url:-}" ]]; then
+    echo "  Last curl attempt: ${_last_url} (rc=${_last_rc:-?})" >&2
+    [[ -n "${_last_err:-}" ]] && printf '  Last curl error:\n%s\n' "${_last_err}" >&2
+  fi
   return 1
 }
 
@@ -1007,9 +1032,16 @@ wait_for_server() {
   # Diagnostics (best-effort) to help root-cause startup issues.
   set +e
   echo "  --- ArcGIS Server startup diagnostics ---" >&2
+  echo "  Proxy environment (if any):" >&2
+  env | grep -iE '^(http|https|no)_proxy=' >&2 || echo "  (no proxy env vars)" >&2
   if command -v ss >/dev/null 2>&1; then
     echo "  Listening sockets (6443/6080):" >&2
     ss -ltnp 2>/dev/null | grep -E ':(6443|6080)\b' >&2 || echo "  (no listeners on 6443/6080)" >&2
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    echo "  Curl verbose probe (bypassing proxies):" >&2
+    curl -vk --noproxy '*' --connect-timeout 3 --max-time 10 "https://127.0.0.1:6443/arcgis/rest/info?f=json" -o /dev/null 2>&1 | tail -80 >&2 || true
+    curl -vk --noproxy '*' --connect-timeout 3 --max-time 10 "https://[::1]:6443/arcgis/rest/info?f=json" -o /dev/null 2>&1 | tail -80 >&2 || true
   fi
   if command -v getent >/dev/null 2>&1; then
     echo "  Host resolution (getent hosts localhost/hostname):" >&2
