@@ -428,6 +428,12 @@ ensure_hostname_hosts_mapping() {
   # Prefer the OS routing decision for the primary IPv4 address.
   if command -v ip >/dev/null 2>&1; then
     _ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    if [[ -z "${_ip:-}" ]]; then
+      _defdev=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
+      if [[ -n "${_defdev:-}" ]]; then
+        _ip=$(ip -4 -o addr show dev "${_defdev}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+      fi
+    fi
   fi
   [[ -z "${_ip:-}" ]] && _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
@@ -1330,7 +1336,11 @@ fi
 # (Server was already waited on in Step 10 if it was just started;
 #  these calls return immediately if the service is already up.)
 wait_for_server || true
-wait_for_service "$(portal_base)/arcgis/portaladmin/healthCheck?f=json" "Portal for ArcGIS" 600 PORTAL_HOST || true
+
+# Portal is not configured until Step 12 (createportal.sh). Per Esri flow,
+# only ensure the web app is responding here (portaladmin/healthCheck can
+# legitimately fail/time out before Portal creation).
+wait_for_service "$(portal_base)/arcgis/home" "Portal for ArcGIS" 600 PORTAL_HOST || true
 
 # ==============================================================================
 # Step 11: Create ArcGIS Server Site
@@ -1346,11 +1356,35 @@ echo ""
 CREATESITE_TOOL="$ESRI_BASE/arcgis/server/tools/createsite/createsite.sh"
 SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
 
-# Config-store and directories can be overridden (and persisted) via .env.
-# When we recreate the Server site, we will allocate fresh empty folders.
-SERVER_CS="${SERVER_CONFIG_STORE:-$ESRI_BASE/arcgis/server/usr/config-store}"
-SERVER_DIRS="${SERVER_DIRECTORIES:-$ESRI_BASE/arcgis/server/usr/directories}"
+# Per Esri docs, default paths under server/usr are the supported layout.
+# We keep these stable and explicitly wipe them when recreating the site.
+SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store"
+SERVER_DIRS="$ESRI_BASE/arcgis/server/usr/directories"
 SERVER_SITE_RECREATED=0
+
+server_has_site() {
+  # Returns 0 if a Server site exists (even if credentials are wrong), 1 if no site.
+  # This is more reliable than /rest/info because REST can respond pre-site.
+  local _out
+  _out=$(${CURL_BASE[@]} -X POST "$(server_base)/arcgis/admin/generateToken" \
+    -H "Referer: https://localhost:6443/arcgis/admin" \
+    -d "username=$ADMIN_USER" -d "password=$ADMIN_PASS" \
+    -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
+    -d "expiration=1" -d "f=json" 2>/dev/null) || _out=""
+
+  echo "${_out}" | grep -q '"token"' && return 0
+
+  # No-site signature in your logs:
+  # "Local machine 'LOCALHOST' is not participating in any Site..."
+  echo "${_out}" | grep -qi "not participating in any Site" && return 1
+
+  # If the endpoint exists and returns any other structured error (invalid creds,
+  # missing referer, etc.), the site is present.
+  echo "${_out}" | grep -q '"status"[[:space:]]*:[[:space:]]*"error"' && return 0
+  echo "${_out}" | grep -q '"error"' && return 0
+
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Helper: test if Server admin is TRULY healthy.
@@ -1501,46 +1535,93 @@ create_server_site() {
     SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
   else
     echo "  No existing Server site detected — creating a new site..."
+    # Ensure a clean slate even for first creation; failed createsite attempts
+    # can leave partial state behind.
+    wipe_server_config_store "$SERVER_CS" "$SERVER_DIRS"
+    wait_for_server || true
+    SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
   fi
 
-  # Allocate fresh empty folders for createsite so it never reuses stale content.
-  # This avoids createsite.sh failing with:
-  #   "configuration store location provided contains files that may be from a different version"
-  _ts=$(date +%s)
-  SERVER_CS="$ESRI_BASE/arcgis/server/usr/config-store.site.$_ts"
-  SERVER_DIRS="$ESRI_BASE/arcgis/server/usr/directories.site.$_ts"
+  # Ensure default supported folders exist and are owned correctly.
   mkdir -p "$SERVER_CS" "$SERVER_DIRS"
   chown -R "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_CS" "$SERVER_DIRS"
-  upsert_env_var SERVER_CONFIG_STORE "$SERVER_CS"
-  upsert_env_var SERVER_DIRECTORIES "$SERVER_DIRS"
-  echo "  Using fresh Server config-store: $SERVER_CS"
-  echo "  Using fresh Server directories:  $SERVER_DIRS"
+  mkdir -p "$SERVER_DIRS/arcgiscache" "$SERVER_DIRS/arcgisjobs" "$SERVER_DIRS/arcgisoutput" "$SERVER_DIRS/arcgissystem"
+  chown -R "$ARCGIS_USER:$ARCGIS_USER" "$SERVER_DIRS"
+  echo "  Server config-store: $SERVER_CS"
+  echo "  Server directories:  $SERVER_DIRS"
 
   # Give Server a moment to finish starting before createsite.
   sleep 20
 
   # Now create (or recreate) the site.
-  _cs_rc=0
-  if [[ -f "$CREATESITE_TOOL" ]]; then
-    echo "Creating ArcGIS Server site using createsite.sh..."
+  # Site creation method (Esri supported): REST admin createNewSite.
+  # createsite.sh is a wrapper but has been observed to crash in some envs.
+  SERVER_SITE_CREATE_METHOD="${SERVER_SITE_CREATE_METHOD:-rest}"
+  if [[ "${SERVER_SITE_CREATE_METHOD}" == "createsite" && -f "$CREATESITE_TOOL" ]]; then
+    echo "Creating ArcGIS Server site using createsite.sh (explicitly requested)..."
     chmod +x "$CREATESITE_TOOL"
-    _cs_out=$(sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
+    sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
       -u "$ADMIN_USER" \
       -p "$ADMIN_PASS" \
       -d "$SERVER_DIRS" \
-      -c "$SERVER_CS" 2>&1) || _cs_rc=$?
-    echo "$_cs_out"
-    if (( _cs_rc != 0 )); then
-      echo "  WARNING: createsite.sh exited with code $_cs_rc — will still wait for health check."
-    fi
+      -c "$SERVER_CS" || true
   else
-    echo "Creating ArcGIS Server site via REST API..."
-    "${CURL_BASE[@]}" -X POST "$SERVER_ADMIN_URL/createNewSite" \
-      -d "username=$ADMIN_USER" \
-      -d "password=$ADMIN_PASS" \
-      -d "configStoreConnection={\"connectionString\":\"$SERVER_CS\",\"type\":\"FILESYSTEM\"}" \
-      -d "directories={\"directories\":[{\"name\":\"arcgiscache\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgiscache\",\"directoryType\":\"CACHE\"},{\"name\":\"arcgisjobs\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgisjobs\",\"directoryType\":\"JOBS\"},{\"name\":\"arcgisoutput\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgisoutput\",\"directoryType\":\"OUTPUT\"},{\"name\":\"arcgissystem\",\"physicalPath\":\"$ESRI_BASE/arcgis/server/usr/directories/arcgissystem\",\"directoryType\":\"SYSTEM\"}]}" \
-      -d "f=json" || true
+    echo "Creating ArcGIS Server site via REST API (createNewSite)..."
+    local _cfg_json _dirs_json
+    local _site_resp _status_url
+    _cfg_json=$(python3 - <<PY
+import json
+print(json.dumps({"connectionString": "${SERVER_CS}", "type": "FILESYSTEM"}))
+PY
+) || _cfg_json=""
+    _dirs_json=$(python3 - <<PY
+import json
+dirs = {
+  "directories": [
+    {"name":"arcgiscache","physicalPath":"${SERVER_DIRS}/arcgiscache","directoryType":"CACHE"},
+    {"name":"arcgisjobs","physicalPath":"${SERVER_DIRS}/arcgisjobs","directoryType":"JOBS"},
+    {"name":"arcgisoutput","physicalPath":"${SERVER_DIRS}/arcgisoutput","directoryType":"OUTPUT"},
+    {"name":"arcgissystem","physicalPath":"${SERVER_DIRS}/arcgissystem","directoryType":"SYSTEM"},
+  ]
+}
+print(json.dumps(dirs))
+PY
+) || _dirs_json=""
+
+    _site_resp=$("${CURL_BASE[@]}" -X POST "$SERVER_ADMIN_URL/createNewSite" \
+      -H "Referer: https://localhost:6443/arcgis/admin" \
+      --data-urlencode "username=$ADMIN_USER" \
+      --data-urlencode "password=$ADMIN_PASS" \
+      --data-urlencode "configStoreConnection=${_cfg_json}" \
+      --data-urlencode "directories=${_dirs_json}" \
+      --data-urlencode "f=json" 2>/dev/null) || _site_resp=""
+
+    if [[ -n "${_site_resp:-}" ]]; then
+      echo "createNewSite response:"
+      echo "${_site_resp}"
+    else
+      echo "WARNING: createNewSite returned no response (check Server logs)." >&2
+    fi
+
+    _status_url=$(python3 -c 'import json,sys
+try:
+  obj=json.load(sys.stdin)
+  print((obj.get("statusUrl") or "").strip())
+except Exception:
+  print("")
+' <<<"${_site_resp:-}" 2>/dev/null) || _status_url=""
+
+    if [[ -n "${_status_url:-}" ]]; then
+      echo "Waiting for site creation job to complete (${_status_url})..."
+      _elapsed=0
+      while (( _elapsed < 900 )); do
+        _job=$(${CURL_BASE[@]} "${_status_url}&f=json" 2>/dev/null || true)
+        echo "${_job:-}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"success"' && { echo "  Site creation job: success."; break; }
+        echo "${_job:-}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"error"' && { echo "  Site creation job: error."; echo "${_job}"; break; }
+        sleep 10; _elapsed=$((_elapsed+10))
+        (( _elapsed % 60 == 0 )) && echo "  ... still waiting for site creation job (${_elapsed}s)"
+      done
+    fi
   fi
 
   # Wait for admin to be fully operational (token generation must succeed)
@@ -1583,7 +1664,7 @@ SERVER_ADMIN_URL="$(server_base)/arcgis/admin"
 if server_admin_is_healthy; then
   echo "ArcGIS Server site exists and admin is healthy, skipping..."
 else
-  if server_site_exists; then
+  if server_has_site; then
     echo "  Server site exists but admin is not fully healthy yet — waiting before taking destructive action..."
     _elapsed=0
     while (( _elapsed < 900 )); do
