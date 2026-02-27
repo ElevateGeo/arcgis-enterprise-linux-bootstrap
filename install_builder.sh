@@ -219,16 +219,27 @@ BUILDER_TAR=$(find "$INSTALLERS" -name "ArcGIS_Enterprise_Builder_Linux_*.tar.gz
 [[ -z "$BUILDER_TAR" ]] && echo "ERROR: Builder installer not found." && exit 1
 
 EXTRACT_DIR="$ESRI_BASE/builder_extract"
-if [[ ! -f "$EXTRACT_DIR/Builder/Setup" ]]; then
+if [[ ! -d "$EXTRACT_DIR/EnterpriseBuilder" ]]; then
   echo "Extracting $(basename "$BUILDER_TAR")..."
   mkdir -p "$EXTRACT_DIR"
   chown "$ARCGIS_USER:$ARCGIS_USER" "$EXTRACT_DIR"
   sudo -u "$ARCGIS_USER" tar -xzf "$BUILDER_TAR" -C "$EXTRACT_DIR"
 fi
 
+# Find the Setup script dynamically (handles varying extract folder names)
+SETUP_SCRIPT=$(find "$EXTRACT_DIR" -maxdepth 3 -name "Setup" -type f | head -1)
+
+if [[ -z "$SETUP_SCRIPT" ]]; then
+  echo "ERROR: Could not find 'Setup' script in $EXTRACT_DIR"
+  echo "Contents of $EXTRACT_DIR:"
+  ls -R "$EXTRACT_DIR"
+  exit 1
+fi
+
+echo "Found installer at: $SETUP_SCRIPT"
 echo "Running Setup..."
 # Note: Builder installs all components. Takes time.
-sudo -u "$ARCGIS_USER" "$EXTRACT_DIR/Builder/Setup" -m silent -l yes -d "$ESRI_BASE/arcgis"
+sudo -u "$ARCGIS_USER" "$SETUP_SCRIPT" -m silent -l yes -d "$ESRI_BASE/arcgis"
 
 # ==============================================================================
 # Step 4: Web Adaptor Deployment
