@@ -345,28 +345,36 @@ ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
 # Step 4: Web Adaptor Deployment
 # ==============================================================================
 echo ">>> Step 4: Deploying Web Adaptors"
-WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
 
-# Fallback: Check installer extract if installed war is missing (Web Adaptor might be separate)
+# Check the standard Builder-installed path first, then fall back to a broad search.
+# NOTE: do not use grep in a $() pipeline with set -o pipefail — a no-match exits the script.
+WA_WAR=""
+for _candidate in \
+    "$ESRI_BASE/arcgis/webadaptor/java/arcgis.war" \
+    "$ESRI_BASE/arcgis/webadaptor12.0/java/arcgis.war"
+  do
+  [[ -f "$_candidate" ]] && WA_WAR="$_candidate" && break
+done
+
+if [[ -z "$WA_WAR" ]]; then
+  WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1 || true)
+fi
+
+# Fallback: run the Web Adaptor sub-installer from the Builder extract.
 if [[ -z "$WA_WAR" && -d "$EXTRACT_DIR" ]]; then
-    # Web Adaptor installer is usually separate inside the Builder extract
-    # Pattern: extract/WebAdaptor/Setup
-    WA_SETUP=$(find "$EXTRACT_DIR" -name "Setup" | grep "WebAdaptor" | head -1)
-    if [[ -n "$WA_SETUP" ]]; then
-        echo "Web Adaptor WAR missing, but installer found at $WA_SETUP. Installing Web Adaptor..."
-        sudo -u "$ARCGIS_USER" "$WA_SETUP" -m silent -l yes -d "$ESRI_BASE/arcgis/webadaptor"
-        WA_WAR="$ESRI_BASE/arcgis/webadaptor/java/arcgis.war"
-    fi
+  # Use find+head only — avoid grep in pipeline (pipefail exits on no match)
+  WA_SETUP=$(find "$EXTRACT_DIR" -maxdepth 4 -name "Setup" -path "*WebAdaptor*" 2>/dev/null | head -1 || true)
+  if [[ -n "$WA_SETUP" ]]; then
+    echo "Web Adaptor WAR missing; running sub-installer from $WA_SETUP..."
+    sudo -u "$ARCGIS_USER" "$WA_SETUP" -m silent -l yes -d "$ESRI_BASE/arcgis/webadaptor"
+    WA_WAR="$ESRI_BASE/arcgis/webadaptor/java/arcgis.war"
+  fi
 fi
 
 if [[ -z "$WA_WAR" ]]; then
-  # Try one last check
-  WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1)
-fi
-
-if [[ -z "$WA_WAR" ]]; then
-  echo "ERROR: Could not find arcgis.war in $ESRI_BASE/arcgis or install it."
-  echo "Installation may have failed or Web Adaptor component is missing."
+  echo "ERROR: Could not find arcgis.war anywhere under $ESRI_BASE/arcgis."
+  echo "Listing $ESRI_BASE/arcgis to help diagnose:"
+  find "$ESRI_BASE/arcgis" -name "*.war" 2>/dev/null || true
   exit 1
 fi
 
@@ -380,8 +388,16 @@ sleep 15 # Wait for Tomcat
 # ==============================================================================
 echo ">>> Step 5: Configuring Enterprise Site (createsite)"
 
-CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "createsite.sh" | grep "enterprise/tools" | head -1)
-[[ -z "$CONFIG_TOOL" ]] && echo "ERROR: Configuration tool not found." && exit 1
+# The Enterprise Builder's createsite.sh lives under server/tools/createsite/.
+# Do NOT use grep in the pipeline — pipefail exits silently on no match.
+CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "createsite.sh" 2>/dev/null | head -1 || true)
+if [[ -z "$CONFIG_TOOL" ]]; then
+  echo "ERROR: createsite.sh not found under $ESRI_BASE/arcgis"
+  echo "Available tools:"
+  find "$ESRI_BASE/arcgis" -name "*.sh" -maxdepth 5 2>/dev/null | head -20 || true
+  exit 1
+fi
+echo "Using configuration tool: $CONFIG_TOOL"
 
 # Configure using public FQDN (via NGINX proxy to Tomcat)
 WA_SERVER="https://$DOMAIN/server"
