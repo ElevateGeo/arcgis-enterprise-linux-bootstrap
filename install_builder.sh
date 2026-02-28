@@ -63,9 +63,26 @@ wipe_existing_enterprise() {
   # Cleanup InstallAnywhere registry to prevent "phantom" installs
   # Previous installs (manual or Builder) leave .com.zerog.registry.xml in multiple locations.
   # If these are not removed, the Builder will skip components it thinks are "already installed".
-  echo "Removing ALL InstallAnywhere registry entries (system-wide)..."
-  find / -name ".com.zerog.registry.xml" -delete 2>/dev/null || true
-  find / -name "com.zerog.iap.xml" -delete 2>/dev/null || true
+  # Remove ArcGIS init.d / systemd service definitions.
+  # CheckPreviousInstallation (InstallAnywhere custom action) inspects these to
+  # determine if a prior install exists — even if /opt/esri/arcgis is gone.
+  echo "Removing ArcGIS service definitions..."
+  rm -f /etc/init.d/arcgisportal /etc/init.d/arcgisserver /etc/init.d/arcgisdatastore 2>/dev/null || true
+  rm -f /etc/systemd/system/arcgisportal.service \
+        /etc/systemd/system/arcgisserver.service \
+        /etc/systemd/system/arcgisdatastore.service 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  # Remove all InstallAnywhere registry entries.
+  # Search targeted directories rather than `find /` (avoids /proc /sys hangs).
+  echo "Removing InstallAnywhere registry entries..."
+  for _dir in /home /root /opt /var /tmp /etc; do
+    find "$_dir" -name ".com.zerog.registry.xml" -delete 2>/dev/null || true
+    find "$_dir" -name "com.zerog.iap.xml" -delete 2>/dev/null || true
+  done
+
+  # Also wipe any Esri user-level property files that record install state.
+  rm -f /home/"$ARCGIS_USER"/.ESRI* /home/"$ARCGIS_USER"/.esri* 2>/dev/null || true
 
   echo "Wipe complete."
 }
