@@ -338,15 +338,8 @@ else
       echo "ArcGIS Server is already authorized."
   fi
 fi
-    ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
-  else
-    echo "Found authorization tool at: $AUTH_TOOL"
-    if ! sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -s | grep -q "Congratulations"; then
-        echo "Applying license to ArcGIS Server..."
-        sudo -u "$ARCGIS_USER" "$AUTH_TOOL" -f "$SERVER_LIC" -e "$EMAIL"
-    fi
-  fi
-fi
+
+ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
 
 # ==============================================================================
 # Step 4: Web Adaptor Deployment
