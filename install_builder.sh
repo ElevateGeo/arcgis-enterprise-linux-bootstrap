@@ -330,47 +330,42 @@ ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
 echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxies natively)"
 
 # ==============================================================================
-# Step 5: Configure Site
+# Step 5: Configure Enterprise Deployment (configurebasedeployment)
 # ==============================================================================
-echo ">>> Step 5: Configuring Enterprise Site (createsite)"
+# The Enterprise Builder ships its own configuration tool:
+#   server/tools/configurebasedeployment/configurebasedeployment.sh
+# This is the correct tool for an Enterprise (Portal + Server + DataStore)
+# deployment. It configures all components together in one pass.
+# 'createsite.sh' is the standalone ArcGIS Server-only tool — not for use here.
+# ==============================================================================
+echo ">>> Step 5: Configuring Enterprise Deployment (configurebasedeployment)"
 
-# The Enterprise Builder's createsite.sh lives under server/tools/createsite/.
-# Do NOT use grep in the pipeline — pipefail exits silently on no match.
-CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "createsite.sh" 2>/dev/null | head -1 || true)
+CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "configurebasedeployment.sh" 2>/dev/null | head -1 || true)
 if [[ -z "$CONFIG_TOOL" ]]; then
-  echo "ERROR: createsite.sh not found under $ESRI_BASE/arcgis"
+  echo "ERROR: configurebasedeployment.sh not found under $ESRI_BASE/arcgis"
   echo "Available tools:"
-  find "$ESRI_BASE/arcgis" -name "*.sh" -maxdepth 5 2>/dev/null | head -20 || true
+  find "$ESRI_BASE/arcgis/server/tools" -maxdepth 3 2>/dev/null || true
   exit 1
 fi
 echo "Using configuration tool: $CONFIG_TOOL"
 
-# Public URLs via NGINX proxy to native ArcGIS ports (set in Step 2).
-# /portal/ -> :7443/arcgis/   /server/ -> :6443/arcgis/
-WA_SERVER="https://$DOMAIN/server"
-WA_PORTAL="https://$DOMAIN/portal"
-
-echo "Configuring site using public URLs:"
-echo "  Portal: $WA_PORTAL"
-echo "  Server: $WA_SERVER"
-
-cat > "$ESRI_BASE/createsite.properties" <<EOF
-WA_URL=$WA_PORTAL
-WA_URL_SERVER=$WA_SERVER
+PROPS_FILE="$ESRI_BASE/configurebasedeployment.properties"
+cat > "$PROPS_FILE" <<EOF
 PORTAL_ADMIN_USERNAME=$ADMIN_USER
 PORTAL_ADMIN_PASSWORD=$ADMIN_PASS
+PORTAL_ADMIN_EMAIL=$EMAIL
 PORTAL_ADMIN_FIRSTNAME=$ADMIN_FIRST
 PORTAL_ADMIN_LASTNAME=$ADMIN_LAST
-PORTAL_ADMIN_EMAIL=$EMAIL
 PORTAL_SECURITY_QUESTION_INDEX=1
 PORTAL_SECURITY_ANSWER=Blue
 PORTAL_LICENSE_FILE_PATH=$PORTAL_LIC
 SERVER_LICENSE_FILE_PATH=$SERVER_LIC
-DATA_STORE_TYPES=relational
+DATA_STORE_TYPES=RELATIONAL
 EOF
-chown "$ARCGIS_USER" "$ESRI_BASE/createsite.properties"
+chown "$ARCGIS_USER:$ARCGIS_USER" "$PROPS_FILE"
+chmod 600 "$PROPS_FILE"
 
-echo "Running configuration tool..."
-sudo -u "$ARCGIS_USER" "$CONFIG_TOOL" -f "$ESRI_BASE/createsite.properties"
+echo "Running configurebasedeployment..."
+sudo -u "$ARCGIS_USER" "$CONFIG_TOOL" -f "$PROPS_FILE"
 
 echo "DONE."
