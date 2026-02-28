@@ -269,6 +269,29 @@ if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/
   sudo -u "$ARCGIS_USER" bash -c "cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\""
 fi
 
+echo "Post-install directory structure:"
+ls "$ESRI_BASE/arcgis" 2>/dev/null
+
+echo "Server directory contents:"
+ls -la "$ESRI_BASE/arcgis/server" 2>/dev/null
+
+# Read installer logs from the hidden .Setup directory
+SETUP_LOG_DIR="$ESRI_BASE/arcgis/server/.Setup"
+if [[ -d "$SETUP_LOG_DIR" ]]; then
+  echo "--- Server installer logs ($SETUP_LOG_DIR) ---"
+  ls -la "$SETUP_LOG_DIR"
+  for f in "$SETUP_LOG_DIR"/*.log "$SETUP_LOG_DIR"/*.txt; do
+    [[ -f "$f" ]] || continue
+    echo "\n=== $(basename $f) ==="
+    tail -80 "$f"
+  done
+fi
+
+# Also check /tmp for any ia_ prefixed install logs (InstallAnywhere temp)
+echo "--- Recent InstallAnywhere temp logs in /tmp ---"
+find /tmp -name "ia_*" -newer "$SETUP_SCRIPT" 2>/dev/null | while read f; do
+  echo "=== $f ==="; tail -30 "$f"; done || true
+
 echo "Checking authorization status..."
 # Check for authorizeSoftware tool in standard locations
 # Enterprise Builder installs server to server/ and portal to portal/
@@ -276,15 +299,9 @@ AUTH_TOOL=$(find "$ESRI_BASE/arcgis" -name "authorizeSoftware" -type f 2>/dev/nu
 
 if [[ -z "$AUTH_TOOL" ]]; then
   echo "WARNING: authorizeSoftware not found."
-  echo "Checking if Setup/install logs have errors..."
-  LOG_DIR="$ESRI_BASE/arcgis/usr/logs"
-  if [[ -d "$LOG_DIR" ]]; then
-      ls -lt "$LOG_DIR" | head -5
-  fi
-  
-  # Check if server directory is empty
-  echo "Checking server directory content:"
-  ls -la "$ESRI_BASE/arcgis/server" 2>/dev/null
+  echo "Installation of ArcGIS Server appears to have been silently skipped."
+  echo "Cannot continue — Server component is not installed." >&2
+  exit 1
 else
   echo "Found authorization tool at: $AUTH_TOOL"
   # Check if already authorized, or force re-authorization
