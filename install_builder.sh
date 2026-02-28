@@ -136,7 +136,7 @@ echo "DEBUG: Found Server License: $SERVER_LIC"
 echo ">>> Step 1: System Preparation"
 
 apt-get update -qq
-apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk tar unzip curl jq libtcnative-1
+apt-get install -y nginx certbot python3-certbot-dns-cloudflare tar unzip curl jq
 
 # User
 id -u "$ARCGIS_USER" &>/dev/null || useradd -m -s /bin/bash "$ARCGIS_USER"
@@ -170,39 +170,17 @@ echo "127.0.0.1 localhost" >> /etc/hosts
 echo "$HOST_IP $FQDN $HOSTNAME" >> /etc/hosts
 
 # ==============================================================================
-# Step 2: Tomcat 10 & NGINX Setup
+# Step 2: NGINX Setup
 # ==============================================================================
-echo ">>> Step 2: Web Server Setup (Tomcat + NGINX)"
+# The ArcGIS Enterprise Builder does NOT require a Java Web Adaptor or Tomcat.
+# NGINX proxies directly to the native ArcGIS services:
+#   /portal/ -> Portal for ArcGIS (HTTPS :7443, context /arcgis/)
+#   /server/ -> ArcGIS Server     (HTTPS :6443, context /arcgis/)
+# NGINX terminates the public TLS cert; proxy_ssl_verify off accepts ArcGIS
+# self-signed internal certs.
+# ==============================================================================
+echo ">>> Step 2: Web Server Setup (NGINX)"
 
-if [[ ! -d "$TOMCAT_HOME" ]]; then
-  curl -fsSL "https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.34/bin/apache-tomcat-10.1.34.tar.gz" -o /tmp/tomcat.tar.gz
-  mkdir -p "$TOMCAT_HOME"
-  tar -xzf /tmp/tomcat.tar.gz -C "$TOMCAT_HOME" --strip-components=1
-  id -u "$TOMCAT_USER" &>/dev/null || useradd -r -s /bin/false "$TOMCAT_USER"
-  chown -R "$TOMCAT_USER:$TOMCAT_USER" "$TOMCAT_HOME"
-  
-  cat > /etc/systemd/system/tomcat10.service <<EOF
-[Unit]
-Description=Tomcat 10
-After=network.target
-[Service]
-Type=forking
-User=$TOMCAT_USER
-Group=$TOMCAT_USER
-Environment="JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))"
-Environment="CATALINA_HOME=$TOMCAT_HOME"
-Environment="CATALINA_PID=$TOMCAT_HOME/temp/tomcat.pid"
-ExecStart=$TOMCAT_HOME/bin/startup.sh
-ExecStop=$TOMCAT_HOME/bin/shutdown.sh
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable --now tomcat10
-fi
-
-# Configure NGINX to proxy to Tomcat (Web Adaptors)
-# This is required because the Builder configures the site using these URLs.
 cat > /etc/nginx/sites-available/arcgis <<NGINX_EOF
 server {
     listen 80;
@@ -217,26 +195,29 @@ server {
     ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
-    
-    client_max_body_size 500M;
-    proxy_read_timeout 600s;
 
-    # Proxy to Tomcat Web Adaptors
-    location /server/ {
-        proxy_pass http://127.0.0.1:8080/server/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
+    client_max_body_size 2G;
+    proxy_read_timeout   600s;
+    proxy_connect_timeout 60s;
+
+    # Common proxy headers for ArcGIS
+    proxy_set_header Host              \$host;
+    proxy_set_header X-Real-IP         \$remote_addr;
+    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_ssl_verify   off;
+    proxy_ssl_session_reuse on;
+
+    # Portal for ArcGIS: /portal/ -> https://localhost:7443/arcgis/
     location /portal/ {
-        proxy_pass http://127.0.0.1:8080/portal/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass https://127.0.0.1:7443/arcgis/;
     }
-    
+
+    # ArcGIS Server: /server/ -> https://localhost:6443/arcgis/
+    location /server/ {
+        proxy_pass https://127.0.0.1:6443/arcgis/;
+    }
+
     location / {
         return 302 /portal/home/;
     }
@@ -246,7 +227,7 @@ NGINX_EOF
 ln -sf /etc/nginx/sites-available/arcgis /etc/nginx/sites-enabled/arcgis
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
-echo "NGINX configured to proxy https://$DOMAIN -> Tomcat:8080"
+echo "NGINX configured: https://$DOMAIN/portal -> :7443, https://$DOMAIN/server -> :6443"
 
 # ==============================================================================
 # Step 3: Install Builder
@@ -342,46 +323,11 @@ fi
 ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
 
 # ==============================================================================
-# Step 4: Web Adaptor Deployment
+# Step 4: (Skipped - Web Adaptor not required with Enterprise Builder)
 # ==============================================================================
-echo ">>> Step 4: Deploying Web Adaptors"
-
-# Check the standard Builder-installed path first, then fall back to a broad search.
-# NOTE: do not use grep in a $() pipeline with set -o pipefail — a no-match exits the script.
-WA_WAR=""
-for _candidate in \
-    "$ESRI_BASE/arcgis/webadaptor/java/arcgis.war" \
-    "$ESRI_BASE/arcgis/webadaptor12.0/java/arcgis.war"
-  do
-  [[ -f "$_candidate" ]] && WA_WAR="$_candidate" && break
-done
-
-if [[ -z "$WA_WAR" ]]; then
-  WA_WAR=$(find "$ESRI_BASE/arcgis" -name "arcgis.war" 2>/dev/null | head -1 || true)
-fi
-
-# Fallback: run the Web Adaptor sub-installer from the Builder extract.
-if [[ -z "$WA_WAR" && -d "$EXTRACT_DIR" ]]; then
-  # Use find+head only — avoid grep in pipeline (pipefail exits on no match)
-  WA_SETUP=$(find "$EXTRACT_DIR" -maxdepth 4 -name "Setup" -path "*WebAdaptor*" 2>/dev/null | head -1 || true)
-  if [[ -n "$WA_SETUP" ]]; then
-    echo "Web Adaptor WAR missing; running sub-installer from $WA_SETUP..."
-    sudo -u "$ARCGIS_USER" "$WA_SETUP" -m silent -l yes -d "$ESRI_BASE/arcgis/webadaptor"
-    WA_WAR="$ESRI_BASE/arcgis/webadaptor/java/arcgis.war"
-  fi
-fi
-
-if [[ -z "$WA_WAR" ]]; then
-  echo "ERROR: Could not find arcgis.war anywhere under $ESRI_BASE/arcgis."
-  echo "Listing $ESRI_BASE/arcgis to help diagnose:"
-  find "$ESRI_BASE/arcgis" -name "*.war" 2>/dev/null || true
-  exit 1
-fi
-
-echo "Found Web Adaptor WAR: $WA_WAR"
-cp "$WA_WAR" "$TOMCAT_HOME/webapps/server.war"
-cp "$WA_WAR" "$TOMCAT_HOME/webapps/portal.war"
-sleep 15 # Wait for Tomcat
+# The ArcGIS Enterprise Builder does not ship a Java Web Adaptor (arcgis.war).
+# NGINX proxies directly to the native ArcGIS ports configured in Step 2.
+echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxies natively)"
 
 # ==============================================================================
 # Step 5: Configure Site
@@ -399,7 +345,8 @@ if [[ -z "$CONFIG_TOOL" ]]; then
 fi
 echo "Using configuration tool: $CONFIG_TOOL"
 
-# Configure using public FQDN (via NGINX proxy to Tomcat)
+# Public URLs via NGINX proxy to native ArcGIS ports (set in Step 2).
+# /portal/ -> :7443/arcgis/   /server/ -> :6443/arcgis/
 WA_SERVER="https://$DOMAIN/server"
 WA_PORTAL="https://$DOMAIN/portal"
 
