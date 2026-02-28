@@ -125,12 +125,18 @@ apt-get install -y nginx certbot python3-certbot-dns-cloudflare openjdk-11-jdk t
 id -u "$ARCGIS_USER" &>/dev/null || useradd -m -s /bin/bash "$ARCGIS_USER"
 
 # Limits (Esri required)
+# nofile must be >= 65536 (not 65535) per ArcGIS Data Store DIAG029 check.
 cat > /etc/security/limits.d/arcgis.conf <<EOF
-$ARCGIS_USER soft nofile 65535
-$ARCGIS_USER hard nofile 65535
+$ARCGIS_USER soft nofile 65536
+$ARCGIS_USER hard nofile 65536
 $ARCGIS_USER soft nproc 25059
 $ARCGIS_USER hard nproc 25059
 EOF
+
+# Apply to the running kernel immediately so that subprocesses spawned in this
+# session (via sudo -u arcgis) also inherit the raised limit.
+ulimit -Sn 65536
+ulimit -Hn 65536
 
 grep -q "vm.max_map_count" /etc/sysctl.conf || echo "vm.max_map_count=262144" >> /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1 || true
@@ -266,7 +272,9 @@ if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/
   # Builder Setup does NOT support -a flag directly.
   # Use 'bash -c' to ensure correct environment (HOME, CWD) for the installer.
   echo "Invoking installer as $ARCGIS_USER (forcing clean env)..."
-  sudo -u "$ARCGIS_USER" bash -c "cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\""
+  # Explicitly raise the file-handle limit inside the subprocess so the ArcGIS
+  # installer diagnostics (DIAG029) see >= 65536, regardless of PAM session state.
+  sudo -u "$ARCGIS_USER" bash -c "ulimit -Sn 65536; ulimit -Hn 65536; cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\""
 fi
 
 echo "Post-install directory structure:"
