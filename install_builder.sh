@@ -460,10 +460,17 @@ _wait_portal_token() {
 # ---------- Step 5a: Create Portal site ----------
 echo ">>> Step 5a: Creating Portal site..."
 
-PORTAL_STATUS=$("${CURL_ADM[@]}" "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || echo '{}')
+# Strategy: try to get a token first. A valid token means Portal is already
+# initialized with the current credentials — skip createNewSite.
+# If no token, Portal is either uninitialized or mid-startup; call createNewSite.
+# createNewSite is idempotent — it errors distinctly when already configured.
+echo "  Checking if Portal is already initialized (attempting token)..."
+PTOKEN=$(_portal_token)
 
-if echo "$PORTAL_STATUS" | grep -qi 'not_initialized\|Not yet initialized\|Not initialized'; then
-  echo "  Portal not yet initialized — calling createNewSite..."
+if [[ -n "$PTOKEN" ]]; then
+  echo "  Portal already initialized and credentials verified."
+else
+  echo "  No token — Portal not yet initialized. Calling createNewSite..."
   CONTENT_STORE=$(printf \
     '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
     "$ESRI_BASE/arcgis/usr/arcgisusr")
@@ -481,8 +488,16 @@ if echo "$PORTAL_STATUS" | grep -qi 'not_initialized\|Not yet initialized\|Not i
     -d "f=json" 2>/dev/null)
   echo "  createNewSite result: $CREATE_RESULT"
 
+  # "already configured" means a prior run initialized Portal — credentials may
+  # differ from what's in .env. Treat as fatal so the user can investigate.
+  if echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
+    echo "ERROR: Portal is already initialized but credentials in .env do not match." >&2
+    echo "  Either correct ADMIN_USER/ADMIN_PASS in .env or run with --wipe to start fresh." >&2
+    exit 1
+  fi
+
   if echo "$CREATE_RESULT" | grep -q '"error"'; then
-    echo "ERROR: Portal createNewSite failed. See above." >&2; exit 1
+    echo "ERROR: Portal createNewSite failed. See result above." >&2; exit 1
   fi
 
   echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
@@ -490,12 +505,6 @@ if echo "$PORTAL_STATUS" | grep -qi 'not_initialized\|Not yet initialized\|Not i
     echo "ERROR: Portal never became ready after createNewSite." >&2; exit 1
   }
   echo "  Portal site ready."
-else
-  echo "  Portal status: already initialized (or status check inconclusive). Attempting token..."
-  PTOKEN=$(_wait_portal_token 6) || {
-    echo "ERROR: Portal is up but credentials rejected. Check ADMIN_USER/ADMIN_PASS." >&2; exit 1
-  }
-  echo "  Portal credentials verified."
 fi
 
 # ---------- Step 5b: Apply Portal license ----------
