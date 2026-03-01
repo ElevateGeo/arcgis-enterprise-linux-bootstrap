@@ -215,11 +215,20 @@ server {
     # Portal for ArcGIS: /portal/ -> https://localhost:7443/arcgis/
     location /portal/ {
         proxy_pass https://127.0.0.1:7443/arcgis/;
+        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Port  443;
+        # Rewrite Location headers from the internal address back to the public path
+        proxy_redirect https://127.0.0.1:7443/arcgis/ /portal/;
+        proxy_redirect https://127.0.0.1:7443/        /portal/;
     }
 
     # ArcGIS Server: /server/ -> https://localhost:6443/arcgis/
     location /server/ {
         proxy_pass https://127.0.0.1:6443/arcgis/;
+        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_redirect https://127.0.0.1:6443/arcgis/ /server/;
+        proxy_redirect https://127.0.0.1:6443/        /server/;
     }
 
     location / {
@@ -351,8 +360,20 @@ echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxie
 echo ">>> Pre-Step 5: Starting ArcGIS Services"
 
 PORTAL_START="$ESRI_BASE/arcgis/portal/startportal.sh"
+PORTAL_STOP="$ESRI_BASE/arcgis/portal/stopportal.sh"
 SERVER_START="$ESRI_BASE/arcgis/server/startserver.sh"
+SERVER_STOP="$ESRI_BASE/arcgis/server/stopserver.sh"
 DS_START=$(find "$ESRI_BASE/arcgis/datastore" -name "startdatastore.sh" 2>/dev/null | head -1 || true)
+DS_STOP=$(find "$ESRI_BASE/arcgis/datastore" -name "stopdatastore.sh" 2>/dev/null | head -1 || true)
+
+# Always stop first for a clean-state restart — avoids stale process warnings
+# that indicate the prior configurebasedeployment run left services mid-flight.
+echo "Stopping ArcGIS services for clean restart..."
+[[ -n "$DS_STOP" ]] && sudo -u "$ARCGIS_USER" "$DS_STOP" 2>/dev/null || true
+[[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" 2>/dev/null || true
+[[ -f "$PORTAL_STOP" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_STOP" 2>/dev/null || true
+echo "Waiting 20s for processes to fully exit..."
+sleep 20
 
 [[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
 [[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
@@ -419,7 +440,88 @@ EOF
 chown "$ARCGIS_USER:$ARCGIS_USER" "$PROPS_FILE"
 chmod 600 "$PROPS_FILE"
 
+# Import Let's Encrypt chain into every ArcGIS bundled JRE cacerts store.
+# Without this, Java-based tools (incl. configurebasedeployment) reject NGINX's
+# TLS cert when making HTTPS calls to https://$DOMAIN/portal|server.
+LE_CHAIN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+if [[ -f "$LE_CHAIN" ]]; then
+  echo "Importing LE certificate chain into ArcGIS bundled JRE truststores..."
+  while IFS= read -r CACERTS; do
+    keytool -import -trustcacerts -noprompt \
+      -alias "nginx-letsencrypt-chain" \
+      -file "$LE_CHAIN" \
+      -keystore "$CACERTS" \
+      -storepass changeit 2>/dev/null && echo "  Updated: $CACERTS" || true
+  done < <(find "$ESRI_BASE/arcgis" -name "cacerts" -path "*/security/cacerts" 2>/dev/null)
+else
+  echo "WARNING: Let's Encrypt chain not found at $LE_CHAIN — skipping JRE truststore update"
+fi
+
 echo "Running configurebasedeployment..."
-sudo -u "$ARCGIS_USER" "$CONFIG_TOOL" -f "$PROPS_FILE"
+set +e
+CBD_OUT=$(sudo -u "$ARCGIS_USER" "$CONFIG_TOOL" -f "$PROPS_FILE" 2>&1)
+CBD_EXIT=$?
+echo "$CBD_OUT"
+set -e
+
+if echo "$CBD_OUT" | grep -q "Successfully configured\|base ArcGIS Enterprise deployment is already initialized\|Completed wizard"; then
+  echo "configurebasedeployment SUCCEEDED."
+elif [[ $CBD_EXIT -ne 0 ]] || echo "$CBD_OUT" | grep -q "Failed to configure\|Unable to"; then
+  echo "WARNING: configurebasedeployment reported a failure (exit $CBD_EXIT). Attempting REST API fallback..."
+
+  # Allow Portal time to stabilize after any partial initialization
+  echo "Waiting 30s for Portal to stabilize..."
+  sleep 30
+
+  # Check if Portal site exists by generating a token
+  PORTAL_TOKEN=$(curl -sk -X POST \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    "https://localhost:7443/arcgis/sharing/rest/generateToken" 2>/dev/null \
+    | jq -r '.token // empty' || true)
+
+  if [[ -z "$PORTAL_TOKEN" ]]; then
+    echo "ERROR: Portal is not initialized and configurebasedeployment failed."
+    echo "Check the output above, verify the properties file, and re-run the script."
+    exit 1
+  fi
+
+  echo "Portal is initialized (token obtained). Attempting web adaptor registration via Portal REST API..."
+
+  # Portal web adaptor registration (uses Portal Admin API)
+  PORTAL_ADMIN_TOKEN=$(curl -sk -X POST \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    "https://localhost:7443/arcgis/portaladmin/generateToken" 2>/dev/null \
+    | jq -r '.token // empty' || true)
+
+  if [[ -n "$PORTAL_ADMIN_TOKEN" ]]; then
+    WA_RESULT=$(curl -sk -X POST \
+      "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
+      -d "webAdaptorURL=https://${DOMAIN}/portal&description=NGINX+Proxy&httpPort=80&httpsPort=443&isShared=false&f=json&token=${PORTAL_ADMIN_TOKEN}")
+    echo "Portal web adaptor registration: $WA_RESULT"
+    if echo "$WA_RESULT" | grep -q '"error"'; then
+      echo "WARNING: Portal web adaptor registration returned an error (see above)."
+    fi
+  else
+    echo "WARNING: Could not obtain Portal admin token for web adaptor registration."
+  fi
+
+  # Server web adaptor registration (uses Server Admin API)
+  SERVER_TOKEN=$(curl -sk -X POST \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    "https://localhost:6443/arcgis/admin/generateToken" 2>/dev/null \
+    | jq -r '.token // empty' || true)
+
+  if [[ -n "$SERVER_TOKEN" ]]; then
+    WA_RESULT=$(curl -sk -X POST \
+      "https://localhost:6443/arcgis/admin/system/webadaptor/update" \
+      -d "webAdaptorURL=https://${DOMAIN}/server&description=NGINX+Proxy&httpPort=80&httpsPort=443&f=json&token=${SERVER_TOKEN}")
+    echo "Server web adaptor update: $WA_RESULT"
+    if echo "$WA_RESULT" | grep -q '"error"'; then
+      echo "WARNING: Server web adaptor update returned an error (see above)."
+    fi
+  else
+    echo "WARNING: Could not obtain Server admin token for web adaptor update."
+  fi
+fi
 
 echo "DONE."
