@@ -568,11 +568,14 @@ fi
 echo ">>> Step 5d: Configuring ArcGIS Data Store..."
 DS_TOOL=$(find "$ESRI_BASE/arcgis/datastore" -name "configuredatastore.sh" 2>/dev/null | head -1 || true)
 if [[ -n "$DS_TOOL" ]]; then
+  # positional args: <serverHostname> <serverAdmin> <serverAdminPassword> <dataDir> [options]
+  DS_DATA_DIR="$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore"
+  mkdir -p "$DS_DATA_DIR"
+  chown "$ARCGIS_USER:$ARCGIS_USER" "$DS_DATA_DIR"
   set +e
   sudo -u "$ARCGIS_USER" "$DS_TOOL" \
-    --server-url "https://localhost:6443/arcgis" \
-    --username "$ADMIN_USER" --password "$ADMIN_PASS" \
-    --stores relational 2>&1
+    localhost "$ADMIN_USER" "$ADMIN_PASS" \
+    "$DS_DATA_DIR" --stores relational 2>&1
   set -e
 else
   echo "  WARNING: configuredatastore.sh not found — skipping DataStore configuration."
@@ -585,16 +588,23 @@ PTOKEN=$(_portal_token)
 SERVERS_JSON=$("${CURL_ADM[@]}" \
   "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PTOKEN" 2>/dev/null || echo '{}')
 
-if echo "$SERVERS_JSON" | jq -e '.servers | length > 0' >/dev/null 2>&1; then
-  echo "  Server is already federated with Portal."
+FED_COUNT=$(echo "$SERVERS_JSON" | jq -r '.servers | length' 2>/dev/null || echo '0')
+if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
+  echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Registering Server with Portal federation..."
+  # token goes as query param; username+password are the Server's admin credentials
+  # Portal needs them to complete its back-channel handshake with Server.
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/portaladmin/federation/servers/register" \
-    -d "url=https://$DOMAIN/server&adminUrl=https://localhost:6443/arcgis&isHosted=true&serverType=ArcGIS&f=json&token=$PTOKEN")
+    "https://localhost:7443/arcgis/portaladmin/federation/servers/register?token=$PTOKEN" \
+    --data-urlencode "url=https://$DOMAIN/server" \
+    --data-urlencode "adminUrl=https://localhost:6443/arcgis" \
+    --data-urlencode "username=$ADMIN_USER" \
+    --data-urlencode "password=$ADMIN_PASS" \
+    -d "isHosted=true&serverType=ArcGIS&f=json")
   echo "  Federation result: $FED_RESULT"
-  if echo "$FED_RESULT" | grep -q '"error"'; then
-    echo "  WARNING: Federation returned an error (may already be federated or credentials issue)."
+  if echo "$FED_RESULT" | grep -q '"error"\|Method Not Allowed\|405'; then
+    echo "  WARNING: Federation returned an error — see result above."
   else
     echo "  Waiting 30s for federation handshake to complete..."
     sleep 30
@@ -630,9 +640,15 @@ else
   if echo "$SERVER_WAS" | grep -qF "$DOMAIN/server"; then
     echo "  Server web adaptor already registered."
   else
+    # machineName must match the machine hostname as ArcGIS Server registered it
+    SERVER_MACHINE=$("${CURL_ADM[@]}" \
+      "https://localhost:6443/arcgis/admin/machines?f=json&token=$STOKEN" 2>/dev/null \
+      | jq -r '.machines[0].machineName // empty' 2>/dev/null || true)
+    [[ -z "$SERVER_MACHINE" ]] && SERVER_MACHINE=$(hostname -f)
+    echo "  Using Server machine name: $SERVER_MACHINE"
     WA_RESULT=$("${CURL_ADM[@]}" -X POST \
       "https://localhost:6443/arcgis/admin/system/webadaptors/register" \
-      -d "webAdaptorURL=https://${DOMAIN}/server&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&f=json&token=$STOKEN")
+      -d "webAdaptorURL=https://${DOMAIN}/server&machineName=${SERVER_MACHINE}&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&f=json&token=$STOKEN")
     echo "  Server web adaptor result: $WA_RESULT"
   fi
 fi
