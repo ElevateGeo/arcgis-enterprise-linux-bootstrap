@@ -379,7 +379,8 @@ fi
 echo "Waiting for Server to become available on :6443 (up to 3 min)..."
 for i in $(seq 1 18); do
   HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
-  if [[ "$HTTP_CODE" =~ ^[234] ]]; then
+  # 200/302 = fully up; 500 = process is up but site not yet created (normal pre-configure state)
+  if [[ "$HTTP_CODE" =~ ^[2345] && "$HTTP_CODE" != "000" ]]; then
     echo "Server is up (HTTP $HTTP_CODE)."
     break
   fi
@@ -409,8 +410,6 @@ WEBGIS_ADMIN_EMAIL=$EMAIL
 WEBGIS_ADMIN_SECURITY_QUESTION_INDEX=1
 WEBGIS_ADMIN_SECURITY_QUESTION_ANSWER=Blue
 WEBGIS_CONTENT_DIRECTORY=$ESRI_BASE/arcgis/usr/arcgisusr
-WEBGIS_PORTAL_WEBADAPTOR_URL=https://$DOMAIN/portal
-WEBGIS_SERVER_WEBADAPTOR_URL=https://$DOMAIN/server
 PORTAL_LICENSE_FILE=$PORTAL_LIC
 SERVER_LICENSE_FILE=$SERVER_LIC
 DATA_STORE_TYPES=RELATIONAL
