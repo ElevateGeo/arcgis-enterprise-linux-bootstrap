@@ -597,7 +597,9 @@ else
     -d "$ESRI_BASE/arcgis/server/usr"
   echo "  Waiting 30s for Server site to initialise..."
   sleep 30
-fifi # end step 5c
+fi
+fi # end step 5c
+
 # ---------- Step 5d: Configure ArcGIS Data Store ----------
 if step_enabled "5d"; then
 echo ">>> Step 5d: Configuring ArcGIS Data Store..."
@@ -647,6 +649,7 @@ else
     sleep 30
   fi
 fi
+fi # end step 5e
 
 # ---------- Step 5f: Register Portal web adaptor ----------
 if step_enabled "5f"; then
@@ -663,7 +666,9 @@ else
     "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
     -d "webAdaptorURL=https://${DOMAIN}/portal&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&isShared=false&f=json&token=$PTOKEN")
   echo "  Portal web adaptor result: $WA_RESULT"
-fifi # end step 5f
+fi
+fi # end step 5f
+
 # ---------- Step 5g: Register Server web adaptor ----------
 if step_enabled "5g"; then
 echo ">>> Step 5g: Registering NGINX as Server web adaptor..."
