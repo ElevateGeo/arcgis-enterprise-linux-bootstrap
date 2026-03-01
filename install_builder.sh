@@ -409,119 +409,202 @@ for i in $(seq 1 18); do
   sleep 10
 done
 
-echo ">>> Step 5: Configuring Enterprise Deployment (configurebasedeployment)"
+# ==============================================================================
+# Step 5: Configure Enterprise via REST APIs
+# ==============================================================================
+# configurebasedeployment.sh requires a true ArcGIS Web Adaptor (Java EE WAR)
+# for its web adaptor validation handshake. NGINX as a plain reverse proxy
+# cannot satisfy that internal handshake and the tool always fails at the
+# "register the Portal with the Web Adaptor" step.
+#
+# Instead we drive the full configuration via the ArcGIS REST Admin APIs:
+#   5a  Create Portal site (portaladmin/createNewSite)
+#   5b  Apply Portal license (portaladmin/license/importLicense)
+#   5c  Create ArcGIS Server site (createsite.sh)
+#   5d  Configure ArcGIS Data Store — relational (configuredatastore.sh)
+#   5e  Federate ArcGIS Server with Portal (portaladmin/federation/servers/register)
+#   5f  Register NGINX as Portal web adaptor (portaladmin/system/webadaptors/register)
+#   5g  Register NGINX as Server web adaptor (admin/system/webadaptors/register)
+# ==============================================================================
 
-CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "configurebasedeployment.sh" 2>/dev/null | head -1 || true)
-if [[ -z "$CONFIG_TOOL" ]]; then
-  echo "ERROR: configurebasedeployment.sh not found under $ESRI_BASE/arcgis"
-  echo "Available tools:"
-  find "$ESRI_BASE/arcgis/server/tools" -maxdepth 3 2>/dev/null || true
-  exit 1
-fi
-echo "Using configuration tool: $CONFIG_TOOL"
+CURL_ADM=(curl -sk --noproxy '*' --connect-timeout 10 --max-time 90)
 
-PROPS_FILE="$ESRI_BASE/configurebasedeployment.properties"
-cat > "$PROPS_FILE" <<EOF
-WEBGIS_ADMIN_FIRSTNAME=$ADMIN_FIRST
-WEBGIS_ADMIN_LASTNAME=$ADMIN_LAST
-WEBGIS_ADMIN_USERNAME=$ADMIN_USER
-WEBGIS_ADMIN_PASSWORD=$ADMIN_PASS
-WEBGIS_ADMIN_PASSWORD_ENCRYPTED=false
-WEBGIS_ADMIN_EMAIL=$EMAIL
-WEBGIS_ADMIN_SECURITY_QUESTION_INDEX=1
-WEBGIS_ADMIN_SECURITY_QUESTION_ANSWER=Blue
-WEBGIS_CONTENT_DIRECTORY=$ESRI_BASE/arcgis/usr/arcgisusr
-PORTAL_LICENSE_FILE=$PORTAL_LIC
-SERVER_LICENSE_FILE=$SERVER_LIC
-DATA_STORE_TYPES=RELATIONAL
-WEBGIS_PORTAL_WEBADAPTOR_URL=https://$DOMAIN/portal
-WEBGIS_SERVER_WEBADAPTOR_URL=https://$DOMAIN/server
-EOF
-chown "$ARCGIS_USER:$ARCGIS_USER" "$PROPS_FILE"
-chmod 600 "$PROPS_FILE"
+# ---------- Token helpers ----------
+_portal_token() {
+  "${CURL_ADM[@]}" -X POST \
+    "https://localhost:7443/arcgis/portaladmin/generateToken" \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
+}
 
-# Import Let's Encrypt chain into every ArcGIS bundled JRE cacerts store.
-# Without this, Java-based tools (incl. configurebasedeployment) reject NGINX's
-# TLS cert when making HTTPS calls to https://$DOMAIN/portal|server.
-LE_CHAIN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-if [[ -f "$LE_CHAIN" ]]; then
-  echo "Importing LE certificate chain into ArcGIS bundled JRE truststores..."
-  while IFS= read -r CACERTS; do
-    keytool -import -trustcacerts -noprompt \
-      -alias "nginx-letsencrypt-chain" \
-      -file "$LE_CHAIN" \
-      -keystore "$CACERTS" \
-      -storepass changeit 2>/dev/null && echo "  Updated: $CACERTS" || true
-  done < <(find "$ESRI_BASE/arcgis" -name "cacerts" -path "*/security/cacerts" 2>/dev/null)
+_server_token() {
+  "${CURL_ADM[@]}" -X POST \
+    "https://localhost:6443/arcgis/admin/generateToken" \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
+}
+
+# Polls until Portal admin accepts a token, up to max_tries*10s. Prints token on success.
+_wait_portal_token() {
+  local max_tries="${1:-72}"  # 72 × 10s = 12 min
+  local tok
+  for i in $(seq 1 "$max_tries"); do
+    tok=$(_portal_token)
+    if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+    echo "    Waiting for Portal to accept tokens (attempt $i/$max_tries)..."
+    sleep 10
+  done
+  return 1
+}
+
+# ---------- Step 5a: Create Portal site ----------
+echo ">>> Step 5a: Creating Portal site..."
+
+PORTAL_STATUS=$("${CURL_ADM[@]}" "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || echo '{}')
+
+if echo "$PORTAL_STATUS" | grep -qi 'not_initialized\|Not yet initialized\|Not initialized'; then
+  echo "  Portal not yet initialized — calling createNewSite..."
+  CONTENT_STORE=$(printf \
+    '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
+    "$ESRI_BASE/arcgis/usr/arcgisusr")
+
+  CREATE_RESULT=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:7443/arcgis/portaladmin/createNewSite" \
+    --data-urlencode "username=$ADMIN_USER" \
+    --data-urlencode "password=$ADMIN_PASS" \
+    --data-urlencode "fullname=$ADMIN_FIRST $ADMIN_LAST" \
+    --data-urlencode "email=$EMAIL" \
+    --data-urlencode "description=" \
+    --data-urlencode "securityQuestionId=1" \
+    --data-urlencode "securityQuestionAns=Blue" \
+    --data-urlencode "contentStore=$CONTENT_STORE" \
+    -d "f=json" 2>/dev/null)
+  echo "  createNewSite result: $CREATE_RESULT"
+
+  if echo "$CREATE_RESULT" | grep -q '"error"'; then
+    echo "ERROR: Portal createNewSite failed. See above." >&2; exit 1
+  fi
+
+  echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
+  PTOKEN=$(_wait_portal_token 72) || {
+    echo "ERROR: Portal never became ready after createNewSite." >&2; exit 1
+  }
+  echo "  Portal site ready."
 else
-  echo "WARNING: Let's Encrypt chain not found at $LE_CHAIN — skipping JRE truststore update"
+  echo "  Portal status: already initialized (or status check inconclusive). Attempting token..."
+  PTOKEN=$(_wait_portal_token 6) || {
+    echo "ERROR: Portal is up but credentials rejected. Check ADMIN_USER/ADMIN_PASS." >&2; exit 1
+  }
+  echo "  Portal credentials verified."
 fi
 
-echo "Running configurebasedeployment..."
-set +e
-CBD_OUT=$(sudo -u "$ARCGIS_USER" "$CONFIG_TOOL" -f "$PROPS_FILE" 2>&1)
-CBD_EXIT=$?
-echo "$CBD_OUT"
-set -e
+# ---------- Step 5b: Apply Portal license ----------
+echo ">>> Step 5b: Applying Portal license..."
+PTOKEN=$(_portal_token)
+LIC_RESULT=$("${CURL_ADM[@]}" -X POST \
+  "https://localhost:7443/arcgis/portaladmin/license/importLicense?token=$PTOKEN&f=json" \
+  -F "file=@$PORTAL_LIC" 2>/dev/null)
+echo "  License import result: $LIC_RESULT"
+if echo "$LIC_RESULT" | grep -q '"error"'; then
+  echo "  WARNING: License import returned an error (may already be licensed)."
+fi
 
-if echo "$CBD_OUT" | grep -q "Successfully configured\|base ArcGIS Enterprise deployment is already initialized\|Completed wizard"; then
-  echo "configurebasedeployment SUCCEEDED."
-elif [[ $CBD_EXIT -ne 0 ]] || echo "$CBD_OUT" | grep -q "Failed to configure\|Unable to"; then
-  echo "WARNING: configurebasedeployment reported a failure (exit $CBD_EXIT). Attempting REST API fallback..."
+# ---------- Step 5c: Create ArcGIS Server site ----------
+echo ">>> Step 5c: Creating ArcGIS Server site..."
 
-  # Allow Portal time to stabilize after any partial initialization
-  echo "Waiting 30s for Portal to stabilize..."
+# Server returns HTTP 200 with currentVersion when site exists; 302/error when not yet configured
+SERVER_INFO=$("${CURL_ADM[@]}" "https://localhost:6443/arcgis/admin/?f=json" 2>/dev/null || echo '{}')
+
+if echo "$SERVER_INFO" | jq -e '.currentVersion' >/dev/null 2>&1; then
+  echo "  Server site already exists."
+else
+  CREATESITE_TOOL="$ESRI_BASE/arcgis/server/tools/createsite/createsite.sh"
+  [[ ! -f "$CREATESITE_TOOL" ]] && echo "ERROR: createsite.sh not found." >&2 && exit 1
+  echo "  Running createsite.sh..."
+  sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
+    -u "$ADMIN_USER" -p "$ADMIN_PASS" \
+    -d "$ESRI_BASE/arcgis/server/usr"
+  echo "  Waiting 30s for Server site to initialise..."
   sleep 30
+fi
 
-  # Check if Portal site exists by generating a token
-  PORTAL_TOKEN=$(curl -sk -X POST \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    "https://localhost:7443/arcgis/sharing/rest/generateToken" 2>/dev/null \
-    | jq -r '.token // empty' || true)
+# ---------- Step 5d: Configure ArcGIS Data Store ----------
+echo ">>> Step 5d: Configuring ArcGIS Data Store..."
+DS_TOOL=$(find "$ESRI_BASE/arcgis/datastore" -name "configuredatastore.sh" 2>/dev/null | head -1 || true)
+if [[ -n "$DS_TOOL" ]]; then
+  set +e
+  sudo -u "$ARCGIS_USER" "$DS_TOOL" \
+    --server-url "https://localhost:6443/arcgis" \
+    --username "$ADMIN_USER" --password "$ADMIN_PASS" \
+    --stores relational 2>&1
+  set -e
+else
+  echo "  WARNING: configuredatastore.sh not found — skipping DataStore configuration."
+fi
 
-  if [[ -z "$PORTAL_TOKEN" ]]; then
-    echo "ERROR: Portal is not initialized and configurebasedeployment failed."
-    echo "Check the output above, verify the properties file, and re-run the script."
-    exit 1
-  fi
+# ---------- Step 5e: Federate ArcGIS Server with Portal ----------
+echo ">>> Step 5e: Federating ArcGIS Server with Portal..."
+PTOKEN=$(_portal_token)
 
-  echo "Portal is initialized (token obtained). Attempting web adaptor registration via Portal REST API..."
+SERVERS_JSON=$("${CURL_ADM[@]}" \
+  "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PTOKEN" 2>/dev/null || echo '{}')
 
-  # Portal web adaptor registration (uses Portal Admin API)
-  PORTAL_ADMIN_TOKEN=$(curl -sk -X POST \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    "https://localhost:7443/arcgis/portaladmin/generateToken" 2>/dev/null \
-    | jq -r '.token // empty' || true)
-
-  if [[ -n "$PORTAL_ADMIN_TOKEN" ]]; then
-    WA_RESULT=$(curl -sk -X POST \
-      "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
-      -d "webAdaptorURL=https://${DOMAIN}/portal&description=NGINX+Proxy&httpPort=80&httpsPort=443&isShared=false&f=json&token=${PORTAL_ADMIN_TOKEN}")
-    echo "Portal web adaptor registration: $WA_RESULT"
-    if echo "$WA_RESULT" | grep -q '"error"'; then
-      echo "WARNING: Portal web adaptor registration returned an error (see above)."
-    fi
+if echo "$SERVERS_JSON" | jq -e '.servers | length > 0' >/dev/null 2>&1; then
+  echo "  Server is already federated with Portal."
+else
+  echo "  Registering Server with Portal federation..."
+  FED_RESULT=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:7443/arcgis/portaladmin/federation/servers/register" \
+    -d "url=https://$DOMAIN/server&adminUrl=https://localhost:6443/arcgis&isHosted=true&serverType=ArcGIS&f=json&token=$PTOKEN")
+  echo "  Federation result: $FED_RESULT"
+  if echo "$FED_RESULT" | grep -q '"error"'; then
+    echo "  WARNING: Federation returned an error (may already be federated or credentials issue)."
   else
-    echo "WARNING: Could not obtain Portal admin token for web adaptor registration."
-  fi
-
-  # Server web adaptor registration (uses Server Admin API)
-  SERVER_TOKEN=$(curl -sk -X POST \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    "https://localhost:6443/arcgis/admin/generateToken" 2>/dev/null \
-    | jq -r '.token // empty' || true)
-
-  if [[ -n "$SERVER_TOKEN" ]]; then
-    WA_RESULT=$(curl -sk -X POST \
-      "https://localhost:6443/arcgis/admin/system/webadaptor/update" \
-      -d "webAdaptorURL=https://${DOMAIN}/server&description=NGINX+Proxy&httpPort=80&httpsPort=443&f=json&token=${SERVER_TOKEN}")
-    echo "Server web adaptor update: $WA_RESULT"
-    if echo "$WA_RESULT" | grep -q '"error"'; then
-      echo "WARNING: Server web adaptor update returned an error (see above)."
-    fi
-  else
-    echo "WARNING: Could not obtain Server admin token for web adaptor update."
+    echo "  Waiting 30s for federation handshake to complete..."
+    sleep 30
   fi
 fi
 
+# ---------- Step 5f: Register Portal web adaptor ----------
+echo ">>> Step 5f: Registering NGINX as Portal web adaptor..."
+PTOKEN=$(_portal_token)
+
+PORTAL_WAS=$("${CURL_ADM[@]}" \
+  "https://localhost:7443/arcgis/portaladmin/system/webadaptors?f=json&token=$PTOKEN" 2>/dev/null || echo '{}')
+
+if echo "$PORTAL_WAS" | grep -qF "$DOMAIN/portal"; then
+  echo "  Portal web adaptor already registered."
+else
+  WA_RESULT=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
+    -d "webAdaptorURL=https://${DOMAIN}/portal&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&isShared=false&f=json&token=$PTOKEN")
+  echo "  Portal web adaptor result: $WA_RESULT"
+fi
+
+# ---------- Step 5g: Register Server web adaptor ----------
+echo ">>> Step 5g: Registering NGINX as Server web adaptor..."
+STOKEN=$(_server_token)
+
+if [[ -z "$STOKEN" ]]; then
+  echo "  WARNING: Could not get Server admin token — skipping Server web adaptor registration."
+else
+  SERVER_WAS=$("${CURL_ADM[@]}" \
+    "https://localhost:6443/arcgis/admin/system/webadaptors?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
+
+  if echo "$SERVER_WAS" | grep -qF "$DOMAIN/server"; then
+    echo "  Server web adaptor already registered."
+  else
+    WA_RESULT=$("${CURL_ADM[@]}" -X POST \
+      "https://localhost:6443/arcgis/admin/system/webadaptors/register" \
+      -d "webAdaptorURL=https://${DOMAIN}/server&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&f=json&token=$STOKEN")
+    echo "  Server web adaptor result: $WA_RESULT"
+  fi
+fi
+
+echo ""
+echo "========================================"
+echo "ArcGIS Enterprise configuration complete"
+echo "  Portal : https://$DOMAIN/portal/home/"
+echo "  Server : https://$DOMAIN/server/rest/services"
+echo "========================================"
 echo "DONE."
