@@ -430,21 +430,38 @@ done
 CURL_ADM=(curl -sk --noproxy '*' --connect-timeout 10 --max-time 90)
 
 # ---------- Token helpers ----------
+# Portal tokens are issued by sharing/rest/generateToken.
+# The portaladmin API *consumes* those tokens — it does not issue them.
+# Returns the token string on success, empty string on failure (never exits).
 _portal_token() {
-  "${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/portaladmin/generateToken" \
+  local resp tok
+  resp=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
     -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
+    2>/dev/null || true)
+  tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+  if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+  # Print response to stderr for diagnosis, return empty (not exit)
+  echo "  [_portal_token] sharing/rest/generateToken response: $resp" >&2
+  echo ""
+  return 0   # always return 0 — callers check for empty string, not exit code
 }
 
 _server_token() {
-  "${CURL_ADM[@]}" -X POST \
+  local resp tok
+  resp=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/generateToken" \
     -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
+    2>/dev/null || true)
+  tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+  if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+  echo "  [_server_token] generateToken response: $resp" >&2
+  echo ""
+  return 0   # always return 0 — callers check for empty string
 }
 
-# Polls until Portal admin accepts a token, up to max_tries*10s. Prints token on success.
+# Polls until Portal sharing/rest/generateToken returns a token, up to max_tries*10s.
+# Prints the token on stdout on success; exits with error if never ready.
 _wait_portal_token() {
   local max_tries="${1:-72}"  # 72 × 10s = 12 min
   local tok
@@ -488,11 +505,17 @@ else
     -d "f=json" 2>/dev/null)
   echo "  createNewSite result: $CREATE_RESULT"
 
-  # "already configured" means a prior run initialized Portal — credentials may
-  # differ from what's in .env. Treat as fatal so the user can investigate.
-  if echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
-    echo "ERROR: Portal is already initialized but credentials in .env do not match." >&2
-    echo "  Either correct ADMIN_USER/ADMIN_PASS in .env or run with --wipe to start fresh." >&2
+  # code 499 "Token Required" from createNewSite means Portal IS already
+  # initialized (that endpoint only requires auth on an existing site).
+  # A prior run (e.g. configurebasedeployment) created the Portal site but
+  # the credentials in .env don't match what was used.
+  CREATE_CODE=$(echo "$CREATE_RESULT" | jq -r '.error.code // empty' 2>/dev/null || true)
+  if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
+    echo "ERROR: Portal is already initialized but token generation failed." >&2
+    echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
+    echo "  Options:" >&2
+    echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the credentials used during initial Portal setup." >&2
+    echo "    2. Run with --wipe to destroy and fully reinstall (DESTRUCTIVE — all data lost)." >&2
     exit 1
   fi
 
