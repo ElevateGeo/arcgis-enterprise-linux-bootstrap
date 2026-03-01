@@ -166,8 +166,12 @@ FQDN=$(hostname -f)
 
 sed -i "/$HOSTNAME/d" /etc/hosts
 sed -i "/$FQDN/d" /etc/hosts
+# Also remove any existing DOMAIN entry so we don't duplicate it
+[[ -n "$DOMAIN" ]] && sed -i "/[[:space:]]${DOMAIN}\b/d" /etc/hosts
 echo "127.0.0.1 localhost" >> /etc/hosts
 echo "$HOST_IP $FQDN $HOSTNAME" >> /etc/hosts
+# Ensure the public domain resolves locally so ArcGIS tools can reach native ports
+[[ -n "$DOMAIN" && "$DOMAIN" != "$FQDN" ]] && echo "$HOST_IP $DOMAIN" >> /etc/hosts
 
 # ==============================================================================
 # Step 2: NGINX Setup
@@ -338,6 +342,51 @@ echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxie
 # deployment. It configures all components together in one pass.
 # 'createsite.sh' is the standalone ArcGIS Server-only tool — not for use here.
 # ==============================================================================
+# ==============================================================================
+# Pre-Step 5: Ensure all ArcGIS services are running before configuration
+# ==============================================================================
+# configurebasedeployment connects to Portal on :7443 and Server on :6443.
+# The Builder installer starts Server automatically, but NOT Portal or DataStore.
+# We must start them and wait until Portal's admin endpoint responds.
+echo ">>> Pre-Step 5: Starting ArcGIS Services"
+
+PORTAL_START="$ESRI_BASE/arcgis/portal/startportal.sh"
+SERVER_START="$ESRI_BASE/arcgis/server/startserver.sh"
+DS_START=$(find "$ESRI_BASE/arcgis/datastore" -name "startdatastore.sh" 2>/dev/null | head -1 || true)
+
+[[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
+[[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
+[[ -n "$DS_START" ]] && sudo -u "$ARCGIS_USER" "$DS_START" || echo "DataStore start script not found — skipping"
+
+echo "Waiting for Portal to become available on :7443 (up to 5 min)..."
+PORTAL_UP=0
+for i in $(seq 1 30); do
+  HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:7443/arcgis/portaladmin/" 2>/dev/null || true)
+  if [[ "$HTTP_CODE" =~ ^[234] ]]; then
+    echo "Portal is up (HTTP $HTTP_CODE)."
+    PORTAL_UP=1
+    break
+  fi
+  echo "  Portal not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/30 — sleeping 10s..."
+  sleep 10
+done
+
+if [[ $PORTAL_UP -eq 0 ]]; then
+  echo "ERROR: Portal did not become available within 5 minutes. Check /opt/esri/arcgis/portal/.Setup/ logs."
+  exit 1
+fi
+
+echo "Waiting for Server to become available on :6443 (up to 3 min)..."
+for i in $(seq 1 18); do
+  HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
+  if [[ "$HTTP_CODE" =~ ^[234] ]]; then
+    echo "Server is up (HTTP $HTTP_CODE)."
+    break
+  fi
+  echo "  Server not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/18 — sleeping 10s..."
+  sleep 10
+done
+
 echo ">>> Step 5: Configuring Enterprise Deployment (configurebasedeployment)"
 
 CONFIG_TOOL=$(find "$ESRI_BASE/arcgis" -name "configurebasedeployment.sh" 2>/dev/null | head -1 || true)
