@@ -432,19 +432,23 @@ CURL_ADM=(curl -sk --noproxy '*' --connect-timeout 10 --max-time 90)
 # ---------- Token helpers ----------
 # Portal tokens are issued by sharing/rest/generateToken.
 # The portaladmin API *consumes* those tokens — it does not issue them.
-# Returns the token string on success, empty string on failure (never exits).
+# configurebasedeployment may store the FQDN in any case (e.g. GIS.ELEVATEGEO.DEV)
+# and Portal's token endpoint enforces that the request Host header matches.
+# We try localhost (bypasses Host matching) and the FQDN in both cases/lower.
+# Always returns 0; callers check for empty string.
 _portal_token() {
   local resp tok
-  resp=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-    2>/dev/null || true)
-  tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-  if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
-  # Print response to stderr for diagnosis, return empty (not exit)
-  echo "  [_portal_token] sharing/rest/generateToken response: $resp" >&2
+  for _token_host in "localhost:7443" "$DOMAIN:7443" "${DOMAIN^^}:7443"; do
+    resp=$("${CURL_ADM[@]}" -X POST \
+      "https://${_token_host}/arcgis/sharing/rest/generateToken" \
+      -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+      2>/dev/null || true)
+    tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+    if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+  done
+  echo "  [_portal_token] All generateToken attempts failed. Last response: $resp" >&2
   echo ""
-  return 0   # always return 0 — callers check for empty string, not exit code
+  return 0   # callers check for empty string, not exit code
 }
 
 _server_token() {
