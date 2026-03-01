@@ -20,18 +20,24 @@ TOMCAT_USER="tomcat"
 
 # ---------- Usage & Helpers ----------
 usage() {
-  echo "Usage: sudo ./install_builder.sh [--wipe] [--yes]"
+  echo "Usage: sudo ./install_builder.sh [--wipe] [--yes] [--steps STEP[,STEP...]]"
+  echo "  Steps: 1 2 3 4 pre5 5a 5b 5c 5d 5e 5f 5g"
+  echo "  Example: sudo ./install_builder.sh --steps 5d,5e,5g"
   exit 1
 }
 
 WIPE_EXISTING=0
 WIPE_YES=0
-for arg in "$@"; do
-  case "$arg" in
-    --wipe) WIPE_EXISTING=1 ;;
-    --yes) WIPE_YES=1 ;;
+RUN_STEPS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wipe)    WIPE_EXISTING=1 ;;
+    --yes)     WIPE_YES=1 ;;
+    --steps)   IFS=',' read -ra RUN_STEPS <<< "${2:-}"; shift ;;
+    --steps=*) IFS=',' read -ra RUN_STEPS <<< "${1#--steps=}" ;;
     --help|-h) usage ;;
   esac
+  shift
 done
 
 if [[ $EUID -ne 0 ]]; then
@@ -91,6 +97,20 @@ if (( WIPE_EXISTING == 1 )); then
   wipe_existing_enterprise
 fi
 
+# ---------- Step selector ----------
+# If --steps is provided, only the named steps run; otherwise all steps run.
+# "pre5" (service stop/start/wait) auto-runs whenever any 5x step is selected.
+step_enabled() {
+  local step="$1"
+  [[ ${#RUN_STEPS[@]} -eq 0 ]] && return 0         # no filter → run all
+  if [[ "$step" == "pre5" ]]; then
+    for s in "${RUN_STEPS[@]}"; do [[ "$s" == 5* ]] && return 0; done
+    return 1
+  fi
+  for s in "${RUN_STEPS[@]}"; do [[ "$s" == "$step" ]] && return 0; done
+  return 1
+}
+
 # ---------- Configuration ----------
 if [[ -f "$ENV_FILE" ]]; then
   set -a; source "$ENV_FILE"; set +a
@@ -133,6 +153,7 @@ echo "DEBUG: Found Server License: $SERVER_LIC"
 # ==============================================================================
 # Step 1: System Prep
 # ==============================================================================
+if step_enabled "1"; then
 echo ">>> Step 1: System Preparation"
 
 apt-get update -qq
@@ -172,6 +193,7 @@ echo "127.0.0.1 localhost" >> /etc/hosts
 echo "$HOST_IP $FQDN $HOSTNAME" >> /etc/hosts
 # Ensure the public domain resolves locally so ArcGIS tools can reach native ports
 [[ -n "$DOMAIN" && "$DOMAIN" != "$FQDN" ]] && echo "$HOST_IP $DOMAIN" >> /etc/hosts
+fi # end step 1
 
 # ==============================================================================
 # Step 2: NGINX Setup
@@ -183,6 +205,7 @@ echo "$HOST_IP $FQDN $HOSTNAME" >> /etc/hosts
 # NGINX terminates the public TLS cert; proxy_ssl_verify off accepts ArcGIS
 # self-signed internal certs.
 # ==============================================================================
+if step_enabled "2"; then
 echo ">>> Step 2: Web Server Setup (NGINX)"
 
 cat > /etc/nginx/sites-available/arcgis <<NGINX_EOF
@@ -241,10 +264,12 @@ ln -sf /etc/nginx/sites-available/arcgis /etc/nginx/sites-enabled/arcgis
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 echo "NGINX configured: https://$DOMAIN/portal -> :7443, https://$DOMAIN/server -> :6443"
+fi # end step 2
 
 # ==============================================================================
 # Step 3: Install Builder
 # ==============================================================================
+if step_enabled "3"; then
 echo ">>> Step 3: Running Enterprise Builder Installer"
 
 BUILDER_TAR=$(find "$INSTALLERS" -name "ArcGIS_Enterprise_Builder_Linux_*.tar.gz" | head -1)
@@ -334,13 +359,16 @@ else
 fi
 
 ls -la "$ESRI_BASE/arcgis/server/tools" 2>/dev/null
+fi # end step 3
 
 # ==============================================================================
 # Step 4: (Skipped - Web Adaptor not required with Enterprise Builder)
 # ==============================================================================
 # The ArcGIS Enterprise Builder does not ship a Java Web Adaptor (arcgis.war).
 # NGINX proxies directly to the native ArcGIS ports configured in Step 2.
+if step_enabled "4"; then
 echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxies natively)"
+fi # end step 4
 
 # ==============================================================================
 # Step 5: Configure Enterprise Deployment (configurebasedeployment)
@@ -357,6 +385,7 @@ echo ">>> Step 4: Skipped (no Java Web Adaptor needed with Builder; NGINX proxie
 # configurebasedeployment connects to Portal on :7443 and Server on :6443.
 # The Builder installer starts Server automatically, but NOT Portal or DataStore.
 # We must start them and wait until Portal's admin endpoint responds.
+if step_enabled "pre5"; then
 echo ">>> Pre-Step 5: Starting ArcGIS Services"
 
 PORTAL_START="$ESRI_BASE/arcgis/portal/startportal.sh"
@@ -408,6 +437,7 @@ for i in $(seq 1 18); do
   echo "  Server not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/18 — sleeping 10s..."
   sleep 10
 done
+fi # end pre-step 5
 
 # ==============================================================================
 # Step 5: Configure Enterprise via REST APIs
@@ -479,6 +509,7 @@ _wait_portal_token() {
 }
 
 # ---------- Step 5a: Create Portal site ----------
+if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
 # Strategy: try to get a token first. A valid token means Portal is already
@@ -533,8 +564,10 @@ else
   }
   echo "  Portal site ready."
 fi
+fi # end step 5a
 
 # ---------- Step 5b: Apply Portal license ----------
+if step_enabled "5b"; then
 echo ">>> Step 5b: Applying Portal license..."
 PTOKEN=$(_portal_token)
 LIC_RESULT=$("${CURL_ADM[@]}" -X POST \
@@ -544,8 +577,10 @@ echo "  License import result: $LIC_RESULT"
 if echo "$LIC_RESULT" | grep -q '"error"'; then
   echo "  WARNING: License import returned an error (may already be licensed)."
 fi
+fi # end step 5b
 
 # ---------- Step 5c: Create ArcGIS Server site ----------
+if step_enabled "5c"; then
 echo ">>> Step 5c: Creating ArcGIS Server site..."
 
 # Server returns HTTP 200 with currentVersion when site exists; 302/error when not yet configured
@@ -562,9 +597,9 @@ else
     -d "$ESRI_BASE/arcgis/server/usr"
   echo "  Waiting 30s for Server site to initialise..."
   sleep 30
-fi
-
+fifi # end step 5c
 # ---------- Step 5d: Configure ArcGIS Data Store ----------
+if step_enabled "5d"; then
 echo ">>> Step 5d: Configuring ArcGIS Data Store..."
 DS_TOOL=$(find "$ESRI_BASE/arcgis/datastore" -name "configuredatastore.sh" 2>/dev/null | head -1 || true)
 if [[ -n "$DS_TOOL" ]]; then
@@ -580,8 +615,10 @@ if [[ -n "$DS_TOOL" ]]; then
 else
   echo "  WARNING: configuredatastore.sh not found — skipping DataStore configuration."
 fi
+fi # end step 5d
 
 # ---------- Step 5e: Federate ArcGIS Server with Portal ----------
+if step_enabled "5e"; then
 echo ">>> Step 5e: Federating ArcGIS Server with Portal..."
 PTOKEN=$(_portal_token)
 
@@ -612,6 +649,7 @@ else
 fi
 
 # ---------- Step 5f: Register Portal web adaptor ----------
+if step_enabled "5f"; then
 echo ">>> Step 5f: Registering NGINX as Portal web adaptor..."
 PTOKEN=$(_portal_token)
 
@@ -625,9 +663,9 @@ else
     "https://localhost:7443/arcgis/portaladmin/system/webadaptors/register" \
     -d "webAdaptorURL=https://${DOMAIN}/portal&description=NGINX+Reverse+Proxy&httpPort=80&httpsPort=443&isShared=false&f=json&token=$PTOKEN")
   echo "  Portal web adaptor result: $WA_RESULT"
-fi
-
+fifi # end step 5f
 # ---------- Step 5g: Register Server web adaptor ----------
+if step_enabled "5g"; then
 echo ">>> Step 5g: Registering NGINX as Server web adaptor..."
 STOKEN=$(_server_token)
 
@@ -652,6 +690,7 @@ else
     echo "  Server web adaptor result: $WA_RESULT"
   fi
 fi
+fi # end step 5g
 
 echo ""
 echo "========================================"
