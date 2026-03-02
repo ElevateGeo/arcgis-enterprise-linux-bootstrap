@@ -434,15 +434,15 @@ if [[ $PORTAL_UP -eq 0 ]]; then
   exit 1
 fi
 
-echo "Waiting for Server to become available on :6443 (up to 3 min)..."
-for i in $(seq 1 18); do
+  echo "Waiting for Server to become available on :6443 (up to 5 min)..."
+for i in $(seq 1 30); do
   HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
   # 200/302 = fully up; 500 = process is up but site not yet created (normal pre-configure state)
   if [[ "$HTTP_CODE" =~ ^[2345] && "$HTTP_CODE" != "000" ]]; then
     echo "Server is up (HTTP $HTTP_CODE)."
     break
   fi
-  echo "  Server not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/18 — sleeping 10s..."
+  echo "  Server not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/30 — sleeping 10s..."
   sleep 10
 done
 fi # end pre-step 5
@@ -676,9 +676,11 @@ else
     sleep 10
     # Patch the JSON file:
     #   1. Remove portalProperties (stale federation artifact, causes 500 on re-federation)
-    #   2. Convert contentSecurityPolicy from JSONObject → JSON string
-    #      (ArcGIS stores it as a nested object but federation code expects String type;
-    #       the only way to fix the in-memory Java type is to patch the file before JVM start)
+    #   2. Set contentSecurityPolicy to "" (empty string)
+    #      ArcGIS Server writes it as JSONObject {"rest":...,"admin":...} on first boot.
+    #      Portal's federation code casts it to String → ClassCastException if it's a dict.
+    #      Setting it to "" makes Server re-init CSP defaults and Portal can cast it safely.
+    #      DO NOT set it to a JSON-encoded string — Server's own parser will crash on startup.
     python3 - "$SEC_CFG_FILE" <<'PYEOF'
 import json, sys
 path = sys.argv[1]
@@ -689,15 +691,15 @@ if 'portalProperties' in cfg:
     del cfg['portalProperties']
     print("  Removed portalProperties from security-config.json")
     changed = True
+# contentSecurityPolicy must be an empty string for federation to succeed.
+# ArcGIS Server writes it as a JSONObject {"rest":...,"admin":...}.
+# Portal's federation code does a hard String cast -> ClassCastException.
+# Setting it to "" is the correct sentinel: Server re-initialises its CSP
+# defaults on startup, and Portal can safely cast the empty string.
 csp = cfg.get('contentSecurityPolicy')
-if isinstance(csp, dict):
-    # Convert JSONObject to its JSON string representation so Server loads it as String
-    cfg['contentSecurityPolicy'] = json.dumps(csp)
-    print(f"  Converted contentSecurityPolicy from JSONObject to String: {cfg['contentSecurityPolicy']}")
-    changed = True
-elif csp is None:
+if csp != "":
     cfg['contentSecurityPolicy'] = ""
-    print("  Set missing contentSecurityPolicy to empty string")
+    print(f"  Reset contentSecurityPolicy to empty string (was: {type(csp).__name__})")
     changed = True
 if changed:
     with open(path, 'w') as f:
@@ -712,8 +714,10 @@ PYEOF
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
     echo "  Waiting for Server to come back up (up to 5 min)..."
     for _sw in $(seq 1 30); do
-      _scode=$("${CURL_ADM[@]}" -o /dev/null -w "%{http_code}" \
-        "https://localhost:6443/arcgis/admin?f=json" 2>/dev/null || true)
+      # Use /rest/info — unauthenticated endpoint, always returns 200 when Server is up.
+      # /admin?f=json requires a token and returns 302 without one, so it never hits 200.
+      _scode=$(curl -sk -o /dev/null -w "%{http_code}" \
+        "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
       [[ "$_scode" == "200" ]] && echo "  Server is up." && break
       echo "  Server not ready (HTTP $_scode), waiting 10s..."
       sleep 10
@@ -746,12 +750,24 @@ PYEOF
   done
 
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
-  # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
-  # adminUrl must use the Server machine's own hostname (not the public NGINX domain).
-  # Using the NGINX domain (gis.elevategeo.dev:6443) fails because Portal's Java HTTP
-  # client resolves it to the public IP and Azure hairpin NAT blocks the connection.
-  # The machine hostname resolves locally and its SSL cert matches.
-  _SERVER_MACHINE=$(sudo -u "$ARCGIS_USER" hostname -f 2>/dev/null || hostname -f 2>/dev/null || echo "localhost")
+  # adminUrl = direct HTTPS URL Portal uses to administer Server (not through web adaptor).
+  # Must NOT be the public NGINX domain (gis.elevategeo.dev): Azure hairpin NAT blocks
+  # a VM hitting its own public IP from inside the same instance.
+  # Solution: get the Server's registered machine name from its admin API, then pin it
+  # to 127.0.0.1 in /etc/hosts so Portal's JVM resolves it to loopback. The Server TLS
+  # cert is issued for this machine name, so SSL verification also passes.
+  STOKEN=$(_server_token)
+  _SERVER_MACHINE=$(curl -sk \
+    "https://localhost:6443/arcgis/admin/machines?f=json&token=$STOKEN" 2>/dev/null \
+    | jq -r '.machines[0].machineName // empty' 2>/dev/null || true)
+  # Fallback: uppercase FQDN (ArcGIS Server always registers with uppercase machine name)
+  [[ -z "$_SERVER_MACHINE" ]] && _SERVER_MACHINE=$(hostname -f 2>/dev/null | tr '[:lower:]' '[:upper:]' || echo "LOCALHOST")
+  echo "  Server machine name: $_SERVER_MACHINE"
+  # Pin the machine name to loopback so Portal JVM never hits the public IP
+  if ! grep -qi "127\.0\.0\.1.*${_SERVER_MACHINE}" /etc/hosts 2>/dev/null; then
+    echo "127.0.0.1 ${_SERVER_MACHINE} ${_SERVER_MACHINE,,}" >> /etc/hosts
+    echo "  Added /etc/hosts entry: 127.0.0.1 ${_SERVER_MACHINE}"
+  fi
   SERVER_ADMIN_URL="https://${_SERVER_MACHINE}:6443/arcgis"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
