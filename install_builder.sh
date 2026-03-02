@@ -632,48 +632,72 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Federating Server with Portal..."
-  # The ClassCastException (JSONObject$a → String) at admin/security/config/update is caused
-  # by stale portalProperties left in Server's security config from a prior partial federation.
-  # Fix: reset Server security config to clean non-federated state before calling federate.
-  #
-  # Correct format (from Esri arcgis-cookbook server_admin_client.rb):
-  #   Individual POST fields — NOT a JSON securityConfig blob.
-  #   authenticationMode must be ARCGIS_TOKEN (valid enum), not BUILT_IN/PKIANDBUILT_IN.
-  #   portalProperties="" clears the stale Object that causes the ClassCastException.
-  STOKEN=$(_server_token)
-  echo "  Resetting Server security config to non-federated state..."
-  # GET current security config to read back httpsProtocols and cipherSuites —
-  # the update endpoint requires these fields when Protocol=HTTPS.
-  CUR_SEC=$("${CURL_ADM[@]}" \
-    "https://localhost:6443/arcgis/admin/security/config?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
-  HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
-  CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
-  [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
-  RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:6443/arcgis/admin/security/config/update" \
-    --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
-    --data-urlencode "authenticationTier=GIS_SERVER" \
-    --data-urlencode "Protocol=HTTPS" \
-    --data-urlencode "httpsProtocols=$HTTPS_PROTOS" \
-    --data-urlencode "cipherSuites=$CIPHER_SUITES" \
-    --data-urlencode "allowDirectAccess=true" \
-    --data-urlencode "virtualDirsSecurityEnabled=false" \
-    --data-urlencode "HSTSEnabled=false" \
-    --data-urlencode "portalProperties=" \
-    --data-urlencode "token=$STOKEN" \
-    -d "f=json" 2>/dev/null)
-  echo "  Security config reset result: $RESET_RESULT"
-  # Server may restart after security config change; wait up to 2 min for it to recover
-  sleep 30
-  for _sw in $(seq 1 9); do
-    _scode=$("${CURL_ADM[@]}" -o /dev/null -w "%{http_code}" \
-      "https://localhost:6443/arcgis/admin?f=json" 2>/dev/null || true)
-    [[ "$_scode" == "200" ]] && break
-    echo "  Server not ready after reset (HTTP $_scode), waiting 10s..."
-    sleep 10
-  done
+  # The ClassCastException (JSONObject$a → String) is caused by a stale portalProperties
+  # JSONObject left in the Server's on-disk config-store from a prior partial federation.
+  # The REST API /admin/security/config/update cannot clear it (the server merges the
+  # payload over existing data and ignores an empty string for a JSONObject field).
+  # Fix: stop Server, patch the config-store JSON on disk, restart Server, then federate.
 
-  # Refresh tokens after security config change
+  SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/server/usr" -name "config.json" \
+    -path "*/security/*" 2>/dev/null | head -1 || true)
+  if [[ -n "$SEC_CFG_FILE" ]]; then
+    echo "  Found server security config: $SEC_CFG_FILE"
+    echo "  Stopping ArcGIS Server to patch config-store..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
+    sleep 10
+    # Use Python to remove portalProperties (if present) from the JSON file
+    python3 - "$SEC_CFG_FILE" <<'PYEOF'
+import json, sys, os
+path = sys.argv[1]
+with open(path) as f:
+    cfg = json.load(f)
+if 'portalProperties' in cfg:
+    print(f"  Removing portalProperties from {path}")
+    del cfg['portalProperties']
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+else:
+    print(f"  No portalProperties in {path} — no change needed")
+PYEOF
+    # Restore ownership (Python ran as root and may have changed file owner)
+    chown "$ARCGIS_USER:$ARCGIS_USER" "$SEC_CFG_FILE" 2>/dev/null || true
+    echo "  Restarting ArcGIS Server..."
+    sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
+    echo "  Waiting for Server to come back up (up to 3 min)..."
+    for _sw in $(seq 1 18); do
+      _scode=$("${CURL_ADM[@]}" -o /dev/null -w "%{http_code}" \
+        "https://localhost:6443/arcgis/admin?f=json" 2>/dev/null || true)
+      [[ "$_scode" == "200" ]] && echo "  Server is up." && break
+      echo "  Server not ready (HTTP $_scode), waiting 10s..."
+      sleep 10
+    done
+  else
+    echo "  WARNING: Could not find server security config.json — skipping on-disk patch."
+    echo "  Falling back to REST API reset..."
+    STOKEN=$(_server_token)
+    CUR_SEC=$("${CURL_ADM[@]}" \
+      "https://localhost:6443/arcgis/admin/security/config?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
+    HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
+    CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
+    [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
+    RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
+      "https://localhost:6443/arcgis/admin/security/config/update" \
+      --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
+      --data-urlencode "authenticationTier=GIS_SERVER" \
+      --data-urlencode "Protocol=HTTPS" \
+      --data-urlencode "httpsProtocols=$HTTPS_PROTOS" \
+      --data-urlencode "cipherSuites=$CIPHER_SUITES" \
+      --data-urlencode "allowDirectAccess=true" \
+      --data-urlencode "virtualDirsSecurityEnabled=false" \
+      --data-urlencode "HSTSEnabled=false" \
+      --data-urlencode "portalProperties=" \
+      --data-urlencode "token=$STOKEN" \
+      -d "f=json" 2>/dev/null)
+    echo "  Security config reset result: $RESET_RESULT"
+    sleep 30
+  fi
+
+  # Refresh tokens after restart / security config change
   STOKEN=$(_server_token)
   PTOKEN=$(_portal_token)
 
