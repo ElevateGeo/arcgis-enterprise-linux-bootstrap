@@ -633,16 +633,19 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
 else
   echo "  Federating Server with Portal..."
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
-  # (not /register — that returns 405 Method Not Allowed)
-  # Token goes in POST body. Parameters: url, adminUrl, username, password.
+  # Token must be --data-urlencode'd — tokens contain +/= which break if passed raw via -d.
+  # adminUrl must use the real FQDN (not localhost) because Portal calls Server back at
+  # this URL to update security config; Esri cookbook always uses private_url (FQDN:6443).
   # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
+  SERVER_ADMIN_URL="https://${DOMAIN}:6443/arcgis"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
     --data-urlencode "url=https://$DOMAIN/server" \
-    --data-urlencode "adminUrl=https://localhost:6443/arcgis" \
+    --data-urlencode "adminUrl=${SERVER_ADMIN_URL}" \
     --data-urlencode "username=$ADMIN_USER" \
     --data-urlencode "password=$ADMIN_PASS" \
-    -d "token=$PTOKEN&f=json")
+    --data-urlencode "token=$PTOKEN" \
+    -d "f=json")
   echo "  Federation result: $FED_RESULT"
   if echo "$FED_RESULT" | grep -qi '"status":"error"\|"error"\|Method Not Allowed\|405'; then
     echo "  WARNING: Federation returned an error — see result above."
