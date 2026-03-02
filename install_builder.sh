@@ -675,14 +675,16 @@ else
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
     sleep 10
     # Patch the JSON file:
-    #   1. Remove portalProperties (stale federation artifact, causes 500 on re-federation)
-    #   2. Set contentSecurityPolicy to "" (empty string)
-    #      ArcGIS Server writes it as JSONObject {"rest":...,"admin":...} on first boot.
-    #      Portal's federation code casts it to String → ClassCastException if it's a dict.
-    #      Setting it to "" makes Server re-init CSP defaults and Portal can cast it safely.
-    #      DO NOT set it to a JSON-encoded string — Server's own parser will crash on startup.
+    #   1. Remove portalProperties (stale federation artifact from prior runs)
+    #   2. Ensure contentSecurityPolicy is a valid JSONObject so Server boots correctly.
+    #      ArcGIS Server writes {"rest":"script-src 'self';","admin":"script-src 'self';"}
+    #      on first site creation. If a prior run corrupted it to "" or a plain string,
+    #      Server's JVM parser crashes on startup. Restore it to the default dict.
+    #      IMPORTANT: after Server restarts we flip the in-memory type to String via REST
+    #      API, which is what Portal's federation handler expects when it reads security/config.
     python3 - "$SEC_CFG_FILE" <<'PYEOF'
 import json, sys
+DEFAULT_CSP = {"rest": "script-src 'self';", "admin": "script-src 'self';"}
 path = sys.argv[1]
 with open(path) as f:
     cfg = json.load(f)
@@ -691,15 +693,10 @@ if 'portalProperties' in cfg:
     del cfg['portalProperties']
     print("  Removed portalProperties from security-config.json")
     changed = True
-# contentSecurityPolicy must be an empty string for federation to succeed.
-# ArcGIS Server writes it as a JSONObject {"rest":...,"admin":...}.
-# Portal's federation code does a hard String cast -> ClassCastException.
-# Setting it to "" is the correct sentinel: Server re-initialises its CSP
-# defaults on startup, and Portal can safely cast the empty string.
 csp = cfg.get('contentSecurityPolicy')
-if csp != "":
-    cfg['contentSecurityPolicy'] = ""
-    print(f"  Reset contentSecurityPolicy to empty string (was: {type(csp).__name__})")
+if not isinstance(csp, dict):
+    cfg['contentSecurityPolicy'] = DEFAULT_CSP
+    print(f"  Restored contentSecurityPolicy to valid JSONObject (was: {type(csp).__name__} = {repr(csp)[:60]})")
     changed = True
 if changed:
     with open(path, 'w') as f:
@@ -708,35 +705,63 @@ if changed:
 else:
     print(f"  No changes needed in {path}")
 PYEOF
-    # Restore ownership (script runs as root; arcgis user must own config files)
     chown "$ARCGIS_USER:$ARCGIS_USER" "$SEC_CFG_FILE" 2>/dev/null || true
     echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
     echo "  Waiting for Server to come back up (up to 5 min)..."
+    _server_up=0
     for _sw in $(seq 1 30); do
-      # Use /rest/info — unauthenticated endpoint, always returns 200 when Server is up.
-      # /admin?f=json requires a token and returns 302 without one, so it never hits 200.
       _scode=$(curl -sk -o /dev/null -w "%{http_code}" \
         "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
-      [[ "$_scode" == "200" ]] && echo "  Server is up." && break
+      if [[ "$_scode" == "200" ]]; then echo "  Server is up."; _server_up=1; break; fi
       echo "  Server not ready (HTTP $_scode), waiting 10s..."
       sleep 10
     done
+    if [[ $_server_up -eq 0 ]]; then
+      echo "  ERROR: Server did not come back up within 5 minutes. Check logs at:"
+      echo "    $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
+      exit 1
+    fi
   else
-    echo "  ERROR: Could not find security-config.json — cannot patch contentSecurityPolicy."
+    echo "  ERROR: Could not find security-config.json."
     echo "  Expected: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/config-store/security/security-config.json"
     exit 1
   fi
 
-  # Refresh tokens after restart / security config change
+  # Server is up with contentSecurityPolicy as JSONObject in JVM memory.
+  # Portal's federation handler reads GET /admin/security/config and does:
+  #   String csp = (String) secConfig.get("contentSecurityPolicy")  → ClassCastException
+  # Fix: use REST API to POST an empty string for contentSecurityPolicy NOW, which
+  # replaces the in-memory JSONObject with a String. Portal reads it back as String → OK.
+  # This must happen while Server is running (REST updates JVM memory, not disk).
   STOKEN=$(_server_token)
-  PTOKEN=$(_portal_token)
+  if [[ -z "$STOKEN" ]]; then
+    echo "  ERROR: Could not get Server admin token after restart."
+    exit 1
+  fi
+  CUR_SEC=$("${CURL_ADM[@]}" \
+    "https://localhost:6443/arcgis/admin/security/config?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
+  HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
+  CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
+  [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
+  echo "  Setting contentSecurityPolicy to String in JVM via REST (httpsProtocols=$HTTPS_PROTOS)..."
+  RESET_R=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:6443/arcgis/admin/security/config/update" \
+    --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
+    --data-urlencode "authenticationTier=GIS_SERVER" \
+    --data-urlencode "Protocol=HTTPS" \
+    --data-urlencode "httpsProtocols=$HTTPS_PROTOS" \
+    --data-urlencode "cipherSuites=$CIPHER_SUITES" \
+    --data-urlencode "allowDirectAccess=true" \
+    --data-urlencode "virtualDirsSecurityEnabled=false" \
+    --data-urlencode "HSTSEnabled=false" \
+    --data-urlencode "portalProperties=" \
+    --data-urlencode "contentSecurityPolicy=" \
+    --data-urlencode "token=$STOKEN" \
+    -d "f=json" 2>/dev/null)
+  echo "  Security config REST update: $RESET_R"
 
-  # Unregister ANY existing Server web adaptors before federation.
-  # The WA registration can contain machineIP stored as a JSONObject {} instead of ""
-  # which causes a ClassCastException inside Server's security/config/update handler
-  # when Portal's federation wizard iterates web adaptor properties.
-  # Step 5g will cleanly re-register the web adaptor after federation succeeds.
+  # Unregister any existing Server web adaptors. Step 5g re-registers after federation.
   echo "  Unregistering any existing Server web adaptors before federation..."
   SRV_WAS=$("${CURL_ADM[@]}" \
     "https://localhost:6443/arcgis/admin/system/webadaptors?f=json&token=$STOKEN" 2>/dev/null \
@@ -749,26 +774,30 @@ PYEOF
       -d "f=json" 2>/dev/null || true
   done
 
-  # Correct Esri API endpoint: /portaladmin/federation/servers/federate
-  # adminUrl = direct HTTPS URL Portal uses to administer Server (not through web adaptor).
-  # Must NOT be the public NGINX domain (gis.elevategeo.dev): Azure hairpin NAT blocks
-  # a VM hitting its own public IP from inside the same instance.
-  # Solution: get the Server's registered machine name from its admin API, then pin it
-  # to 127.0.0.1 in /etc/hosts so Portal's JVM resolves it to loopback. The Server TLS
-  # cert is issued for this machine name, so SSL verification also passes.
-  STOKEN=$(_server_token)
+  # adminUrl: use Server's registered machine name (uppercase FQDN), pinned to 127.0.0.1
+  # in /etc/hosts so Portal's JVM resolves it to loopback, not the public Azure IP.
+  # Azure hairpin NAT blocks a VM hitting its own public IP from inside the same instance.
   _SERVER_MACHINE=$(curl -sk \
     "https://localhost:6443/arcgis/admin/machines?f=json&token=$STOKEN" 2>/dev/null \
     | jq -r '.machines[0].machineName // empty' 2>/dev/null || true)
-  # Fallback: uppercase FQDN (ArcGIS Server always registers with uppercase machine name)
   [[ -z "$_SERVER_MACHINE" ]] && _SERVER_MACHINE=$(hostname -f 2>/dev/null | tr '[:lower:]' '[:upper:]' || echo "LOCALHOST")
   echo "  Server machine name: $_SERVER_MACHINE"
-  # Pin the machine name to loopback so Portal JVM never hits the public IP
   if ! grep -qi "127\.0\.0\.1.*${_SERVER_MACHINE}" /etc/hosts 2>/dev/null; then
     echo "127.0.0.1 ${_SERVER_MACHINE} ${_SERVER_MACHINE,,}" >> /etc/hosts
     echo "  Added /etc/hosts entry: 127.0.0.1 ${_SERVER_MACHINE}"
   fi
   SERVER_ADMIN_URL="https://${_SERVER_MACHINE}:6443/arcgis"
+
+  # Generate a fresh Portal token immediately before the federation call.
+  # Any token generated before the Server restart may be stale (Portal validates
+  # some tokens against Server; if Server was just restarted, old tokens 498).
+  PTOKEN=$(_portal_token)
+  if [[ -z "$PTOKEN" ]]; then
+    echo "  ERROR: Could not get Portal admin token before federation call."
+    exit 1
+  fi
+
+  echo "  Calling federation endpoint: adminUrl=$SERVER_ADMIN_URL"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
     --data-urlencode "url=https://$DOMAIN/server" \
