@@ -683,41 +683,22 @@ else
 
   if [[ -n "$SEC_CFG_FILE" ]]; then
     echo "  Found server security config: $SEC_CFG_FILE"
-    echo "  Stopping ArcGIS Server to patch config-store on disk..."
+    echo "  Stopping ArcGIS Server to reset security config..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
     sleep 10
-    # Patch the JSON file:
-    #   1. Remove portalProperties (stale federation artifact from prior runs)
-    #   2. Ensure contentSecurityPolicy is a valid JSONObject so Server boots correctly.
-    #      ArcGIS Server writes {"rest":"script-src 'self';","admin":"script-src 'self';"}
-    #      on first site creation. If a prior run corrupted it to "" or a plain string,
-    #      Server's JVM parser crashes on startup. Restore it to the default dict.
-    #      IMPORTANT: after Server restarts we flip the in-memory type to String via REST
-    #      API, which is what Portal's federation handler expects when it reads security/config.
-    python3 - "$SEC_CFG_FILE" <<'PYEOF'
-import json, sys
-DEFAULT_CSP = {"rest": "script-src 'self';", "admin": "script-src 'self';"}
-path = sys.argv[1]
-with open(path) as f:
-    cfg = json.load(f)
-changed = False
-if 'portalProperties' in cfg:
-    del cfg['portalProperties']
-    print("  Removed portalProperties from security-config.json")
-    changed = True
-csp = cfg.get('contentSecurityPolicy')
-if not isinstance(csp, dict):
-    cfg['contentSecurityPolicy'] = DEFAULT_CSP
-    print(f"  Restored contentSecurityPolicy to valid JSONObject (was: {type(csp).__name__} = {repr(csp)[:60]})")
-    changed = True
-if changed:
-    with open(path, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    print(f"  Patched {path}")
-else:
-    print(f"  No changes needed in {path}")
-PYEOF
-    chown "$ARCGIS_USER:$ARCGIS_USER" "$SEC_CFG_FILE" 2>/dev/null || true
+    # DELETE security-config.json rather than patching it.
+    # ArcGIS Server regenerates it from Java defaults on next startup, ensuring every
+    # field has the correct Java type (no JSONObject where String is expected).
+    # Surgically patching the JSON with Python cannot fix ALL fields because some (like
+    # userStoreConfig, roleStoreConfig) must survive as JSONObjects while others the
+    # federation code reads as String — we have no way to know all affected fields.
+    # Deleting and regenerating is the only guaranteed clean-slate approach.
+    # The super/super.json (admin credentials) and all other config-store files are unaffected.
+    _SEC_CFG_DIR=$(dirname "$SEC_CFG_FILE")
+    # Back up in case regeneration fails for any reason
+    cp "$SEC_CFG_FILE" "${SEC_CFG_FILE}.bak" 2>/dev/null || true
+    rm -f "$SEC_CFG_FILE" "${SEC_CFG_FILE}.lock" 2>/dev/null || true
+    echo "  Deleted $SEC_CFG_FILE — Server will regenerate with correct field types."
     echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
     echo "  Waiting for Server to come back up (up to 5 min)..."
