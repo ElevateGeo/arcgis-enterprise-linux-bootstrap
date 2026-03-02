@@ -644,8 +644,23 @@ else
   sudo -u "$ARCGIS_USER" "$CREATESITE_TOOL" \
     -u "$ADMIN_USER" -p "$ADMIN_PASS" \
     -d "$ESRI_BASE/arcgis/server/usr"
-  echo "  Waiting 30s for Server site to initialise..."
-  sleep 30
+  echo "  Waiting for Server site to become ready (HTTP 200, up to 10 min)..."
+  _cs_up=0
+  for _ci in $(seq 1 60); do
+    _ccode=$(curl -sk -o /dev/null -w "%{http_code}" \
+      "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
+    if [[ "$_ccode" == "200" ]]; then
+      echo "  Server site ready (HTTP 200)."
+      _cs_up=1; break
+    fi
+    echo "  Server not ready yet (HTTP ${_ccode:-000}), attempt $_ci/60 — sleeping 10s..."
+    sleep 10
+  done
+  if [[ $_cs_up -eq 0 ]]; then
+    echo "  ERROR: Server site did not become ready within 10 minutes. Check logs at:"
+    echo "    $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
+    exit 1
+  fi
 fi
 fi # end step 5c
 
@@ -776,6 +791,10 @@ else
     --data-urlencode "token=$STOKEN" \
     -d "f=json" 2>/dev/null)
   echo "  Security config REST update: $RESET_R"
+  if echo "$RESET_R" | grep -qi '"status":"error"\|"error":{'; then
+    echo "  ERROR: Security config update failed — federation would hit ClassCastException. Aborting."
+    exit 1
+  fi
   # Re-fetch token — the security config update may have invalidated previous tokens.
   STOKEN=$(_server_token)
   if [[ -z "$STOKEN" ]]; then
@@ -829,8 +848,11 @@ else
     --data-urlencode "token=$PTOKEN" \
     -d "f=json")
   echo "  Federation result: $FED_RESULT"
-  if echo "$FED_RESULT" | grep -qi '"status":"error"\|"error"\|Method Not Allowed\|405'; then
-    echo "  WARNING: Federation returned an error — see result above."
+  if echo "$FED_RESULT" | grep -qi '"status":"error"\|"error":{\|Method Not Allowed\|405'; then
+    echo "  ERROR: Federation call failed — see result above."
+    echo "  If you believe the server is already federated under a different URL, check:"
+    echo "    https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=<PTOKEN>"
+    exit 1
   else
     echo "  Waiting 60s for federation handshake to complete..."
     sleep 60
