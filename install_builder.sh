@@ -632,27 +632,35 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Federating Server with Portal..."
-  # The ClassCastException (JSONObject$a → String) at admin/security/config/update is a
-  # known ArcGIS 12 bug triggered when Server's security config is in a partially-federated
-  # state (left by an earlier configurebasedeployment run).  Reset Server security config
-  # to non-federated BUILT_IN state first so Portal starts with a clean slate.
+  # The ClassCastException (JSONObject$a → String) at admin/security/config/update is caused
+  # by stale portalProperties left in Server's security config from a prior partial federation.
+  # Fix: reset Server security config to clean non-federated state before calling federate.
+  #
+  # Correct format (from Esri arcgis-cookbook server_admin_client.rb):
+  #   Individual POST fields — NOT a JSON securityConfig blob.
+  #   authenticationMode must be ARCGIS_TOKEN (valid enum), not BUILT_IN/PKIANDBUILT_IN.
+  #   portalProperties="" clears the stale Object that causes the ClassCastException.
   STOKEN=$(_server_token)
   echo "  Resetting Server security config to non-federated state..."
   RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/security/config/update" \
-    --data-urlencode "securityConfig={\"securityEnabled\":true,\"authenticationMode\":\"PKIANDBUILT_IN\",\"authenticationTier\":\"GIS_SERVER\",\"allowDirectAccess\":true,\"virtualDirsSecurityEnabled\":false,\"sslEnabled\":true,\"httpEnabled\":false}" \
+    --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
+    --data-urlencode "authenticationTier=GIS_SERVER" \
+    --data-urlencode "Protocol=HTTPS" \
+    --data-urlencode "allowDirectAccess=true" \
+    --data-urlencode "virtualDirsSecurityEnabled=false" \
+    --data-urlencode "HSTSEnabled=false" \
+    --data-urlencode "portalProperties=" \
     --data-urlencode "token=$STOKEN" \
     -d "f=json" 2>/dev/null)
   echo "  Security config reset result: $RESET_RESULT"
   sleep 15
 
-  # Refresh Server token after security config change
+  # Refresh tokens after security config change
   STOKEN=$(_server_token)
   PTOKEN=$(_portal_token)
 
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
-  # Token must be --data-urlencode'd — tokens contain +/= which break if passed raw via -d.
-  # adminUrl must use the real FQDN:6443 — Portal calls Server back at this URL.
   # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
   SERVER_ADMIN_URL="https://${DOMAIN}:6443/arcgis"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
@@ -670,7 +678,7 @@ else
     echo "  Waiting 60s for federation handshake to complete..."
     sleep 60
 
-    # Set server role to HOSTING_SERVER (required for hosted feature layers)
+    # Set server role to HOSTING_SERVER
     PTOKEN=$(_portal_token)
     SERVERS_JSON2=$("${CURL_ADM[@]}" \
       "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PTOKEN" 2>/dev/null || echo '{}')
