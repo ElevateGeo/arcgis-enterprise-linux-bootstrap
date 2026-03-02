@@ -638,8 +638,20 @@ else
   # payload over existing data and ignores an empty string for a JSONObject field).
   # Fix: stop Server, patch the config-store JSON on disk, restart Server, then federate.
 
-  SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/server/usr" -name "config.json" \
-    -path "*/security/*" 2>/dev/null | head -1 || true)
+  # Query the admin API for the config-store path, falling back to a broad find
+  _STOKEN_TMP=$(_server_token)
+  _CFGSTORE_PATH=$("${CURL_ADM[@]}" \
+    "https://localhost:6443/arcgis/admin/info?f=json&token=$_STOKEN_TMP" 2>/dev/null \
+    | jq -r '.configStoreInfo.connectionString // empty' 2>/dev/null || true)
+  if [[ -n "$_CFGSTORE_PATH" ]]; then
+    SEC_CFG_FILE="${_CFGSTORE_PATH}/security/config.json"
+    [[ ! -f "$SEC_CFG_FILE" ]] && SEC_CFG_FILE=""
+  fi
+  # Fallback: search under usr/local (standard createsite layout)
+  if [[ -z "$SEC_CFG_FILE" ]]; then
+    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/server/usr/local" "$ESRI_BASE/arcgis/server/usr" \
+      -name "config.json" -path "*/security/*" 2>/dev/null | head -1 || true)
+  fi
   if [[ -n "$SEC_CFG_FILE" ]]; then
     echo "  Found server security config: $SEC_CFG_FILE"
     echo "  Stopping ArcGIS Server to patch config-store..."
@@ -700,6 +712,23 @@ PYEOF
   # Refresh tokens after restart / security config change
   STOKEN=$(_server_token)
   PTOKEN=$(_portal_token)
+
+  # Unregister ANY existing Server web adaptors before federation.
+  # The WA registration can contain machineIP stored as a JSONObject {} instead of ""
+  # which causes a ClassCastException inside Server's security/config/update handler
+  # when Portal's federation wizard iterates web adaptor properties.
+  # Step 5g will cleanly re-register the web adaptor after federation succeeds.
+  echo "  Unregistering any existing Server web adaptors before federation..."
+  SRV_WAS=$("${CURL_ADM[@]}" \
+    "https://localhost:6443/arcgis/admin/system/webadaptors?f=json&token=$STOKEN" 2>/dev/null \
+    | jq -r '.webAdaptors[]?.id // empty' 2>/dev/null || true)
+  for _wa_id in $SRV_WAS; do
+    echo "  Unregistering Server WA: $_wa_id"
+    "${CURL_ADM[@]}" -X POST \
+      "https://localhost:6443/arcgis/admin/system/webadaptors/${_wa_id}/unregister" \
+      --data-urlencode "token=$STOKEN" \
+      -d "f=json" 2>/dev/null || true
+  done
 
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
   # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
