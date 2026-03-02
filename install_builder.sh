@@ -693,6 +693,10 @@ PYEOF
     HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
     CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
     [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
+    # contentSecurityPolicy is stored as a JSONObject in-process; Portal's federation handler
+    # tries to cast it to String → ClassCastException. Send it back as a JSON *string* to
+    # force Server to store it as String instead of JSONObject.
+    CSP_RAW=$(echo "$CUR_SEC" | jq -c '.contentSecurityPolicy // {}' 2>/dev/null || echo '{}')
     RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
       "https://localhost:6443/arcgis/admin/security/config/update" \
       --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
@@ -704,6 +708,7 @@ PYEOF
       --data-urlencode "virtualDirsSecurityEnabled=false" \
       --data-urlencode "HSTSEnabled=false" \
       --data-urlencode "portalProperties=" \
+      --data-urlencode "contentSecurityPolicy=$CSP_RAW" \
       --data-urlencode "token=$STOKEN" \
       -d "f=json" 2>/dev/null)
     echo "  Security config reset result: $RESET_RESULT"
