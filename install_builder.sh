@@ -632,10 +632,27 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Federating Server with Portal..."
+  # The ClassCastException (JSONObject$a → String) at admin/security/config/update is a
+  # known ArcGIS 12 bug triggered when Server's security config is in a partially-federated
+  # state (left by an earlier configurebasedeployment run).  Reset Server security config
+  # to non-federated BUILT_IN state first so Portal starts with a clean slate.
+  STOKEN=$(_server_token)
+  echo "  Resetting Server security config to non-federated state..."
+  RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
+    "https://localhost:6443/arcgis/admin/security/config/update" \
+    --data-urlencode "securityConfig={\"securityEnabled\":true,\"authenticationMode\":\"PKIANDBUILT_IN\",\"authenticationTier\":\"GIS_SERVER\",\"allowDirectAccess\":true,\"virtualDirsSecurityEnabled\":false,\"sslEnabled\":true,\"httpEnabled\":false}" \
+    --data-urlencode "token=$STOKEN" \
+    -d "f=json" 2>/dev/null)
+  echo "  Security config reset result: $RESET_RESULT"
+  sleep 15
+
+  # Refresh Server token after security config change
+  STOKEN=$(_server_token)
+  PTOKEN=$(_portal_token)
+
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
   # Token must be --data-urlencode'd — tokens contain +/= which break if passed raw via -d.
-  # adminUrl must use the real FQDN (not localhost) because Portal calls Server back at
-  # this URL to update security config; Esri cookbook always uses private_url (FQDN:6443).
+  # adminUrl must use the real FQDN:6443 — Portal calls Server back at this URL.
   # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
   SERVER_ADMIN_URL="https://${DOMAIN}:6443/arcgis"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
@@ -652,6 +669,22 @@ else
   else
     echo "  Waiting 60s for federation handshake to complete..."
     sleep 60
+
+    # Set server role to HOSTING_SERVER (required for hosted feature layers)
+    PTOKEN=$(_portal_token)
+    SERVERS_JSON2=$("${CURL_ADM[@]}" \
+      "https://localhost:7443/arcgis/portaladmin/federation/servers?f=json&token=$PTOKEN" 2>/dev/null || echo '{}')
+    SERVER_ID=$(echo "$SERVERS_JSON2" | jq -r '.servers[] | select(.url | test("'"$DOMAIN"'")) | .id' 2>/dev/null | head -1 || true)
+    if [[ -n "$SERVER_ID" ]]; then
+      echo "  Setting server role to HOSTING_SERVER (id: $SERVER_ID)..."
+      ROLE_RESULT=$("${CURL_ADM[@]}" -X POST \
+        "https://localhost:7443/arcgis/portaladmin/federation/servers/${SERVER_ID}/update" \
+        --data-urlencode "serverRole=HOSTING_SERVER" \
+        --data-urlencode "serverFunction=" \
+        --data-urlencode "token=$PTOKEN" \
+        -d "f=json")
+      echo "  Server role result: $ROLE_RESULT"
+    fi
   fi
 fi
 fi # end step 5e
