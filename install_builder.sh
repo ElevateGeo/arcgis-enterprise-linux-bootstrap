@@ -631,22 +631,24 @@ FED_COUNT=$(echo "$SERVERS_JSON" | jq -r '.servers | length' 2>/dev/null || echo
 if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
-  echo "  Registering Server with Portal federation..."
-  # token goes as query param; username+password are the Server's admin credentials
-  # Portal needs them to complete its back-channel handshake with Server.
+  echo "  Federating Server with Portal..."
+  # Correct Esri API endpoint: /portaladmin/federation/servers/federate
+  # (not /register — that returns 405 Method Not Allowed)
+  # Token goes in POST body. Parameters: url, adminUrl, username, password.
+  # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/portaladmin/federation/servers/register?token=$PTOKEN" \
+    "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
     --data-urlencode "url=https://$DOMAIN/server" \
     --data-urlencode "adminUrl=https://localhost:6443/arcgis" \
     --data-urlencode "username=$ADMIN_USER" \
     --data-urlencode "password=$ADMIN_PASS" \
-    -d "isHosted=true&serverType=ArcGIS&f=json")
+    -d "token=$PTOKEN&f=json")
   echo "  Federation result: $FED_RESULT"
-  if echo "$FED_RESULT" | grep -q '"error"\|Method Not Allowed\|405'; then
+  if echo "$FED_RESULT" | grep -qi '"status":"error"\|"error"\|Method Not Allowed\|405'; then
     echo "  WARNING: Federation returned an error — see result above."
   else
-    echo "  Waiting 30s for federation handshake to complete..."
-    sleep 30
+    echo "  Waiting 60s for federation handshake to complete..."
+    sleep 60
   fi
 fi
 fi # end step 5e
