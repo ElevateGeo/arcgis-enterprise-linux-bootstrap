@@ -424,7 +424,12 @@ else
     _SEC_MAIN_PRE="${_SEC_BAK_PRE%.bak}"
     if [[ ! -f "$_SEC_MAIN_PRE" ]]; then
       echo "  Restoring missing security-config.json from backup before Server start..."
-      cp "$_SEC_BAK_PRE" "$_SEC_MAIN_PRE"
+      cp -p "$_SEC_BAK_PRE" "$_SEC_MAIN_PRE" 2>/dev/null || true
+      # Fix ownership — backup was created as root; ArcGIS Server runs as arcgis.
+      # A root-owned config file will cause startup failures (HTTP 500) because the
+      # server process cannot write locks or updates to a file owned by root.
+      chown "$ARCGIS_USER:$ARCGIS_USER" "$_SEC_MAIN_PRE" 2>/dev/null || true
+      chmod 600 "$_SEC_MAIN_PRE" 2>/dev/null || true
     fi
   fi
   # Stop first to kill any stale processes; startserver.sh refuses to start otherwise.
@@ -465,9 +470,10 @@ fi
 _SERVER_WAIT_UP=0
 for i in $(seq 1 30); do
   HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
-  # Only 200 means REST services are fully initialised and step 5e can proceed.
-  # HTTP 500 means the process is up but security-config/services failed to load — not usable.
-  if [[ "$HTTP_CODE" == "200" ]]; then
+  # Accept any response that is not 000 (connection refused / process not running yet).
+  # HTTP 500 is normal before site creation on a fresh install (step 5c creates the site).
+  # HTTP 500 caused by a broken security-config is handled and recovered inside step 5e.
+  if [[ -n "$HTTP_CODE" && "$HTTP_CODE" != "000" ]]; then
     echo "Server is up (HTTP $HTTP_CODE)."
     _SERVER_WAIT_UP=1
     break
@@ -476,7 +482,7 @@ for i in $(seq 1 30); do
   sleep 10
 done
 if [[ $_SERVER_WAIT_UP -eq 0 ]]; then
-  echo "ERROR: Server did not become available (HTTP 200) within 5 minutes."
+  echo "ERROR: Server process did not respond within 5 minutes."
   echo "  Check logs at: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
   exit 1
 fi
@@ -675,120 +681,79 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Federating Server with Portal..."
-  # Root cause of ClassCastException (JSONObject$a → String):
-  #   contentSecurityPolicy is written to security-config.json as a JSONObject {"rest":...}
-  #   but Portal's federation handler expects it to be a plain String.
-  #   REST API resets update only the in-memory JVM state and cannot change the Java type;
-  #   the JVM must be restarted after the on-disk JSON is patched to a string value.
-  # Fix: stop Server → patch security-config.json on disk → restart Server → federate.
 
-  # Locate security-config.json — try admin/info connectionString first, then known paths
-  SEC_CFG_FILE=""
-  _STOKEN_TMP=$(_server_token)
-  _CFGSTORE_PATH=$("${CURL_ADM[@]}" \
-    "https://localhost:6443/arcgis/admin/info?f=json&token=$_STOKEN_TMP" 2>/dev/null \
-    | jq -r '.configStoreInfo.connectionString // empty' 2>/dev/null || true)
-  if [[ -n "$_CFGSTORE_PATH" ]]; then
-    _candidate="${_CFGSTORE_PATH}/security/security-config.json"
-    [[ -f "$_candidate" ]] && SEC_CFG_FILE="$_candidate"
-  fi
-  # Fallback: search under arcgisusr (actual location confirmed on this host)
-  if [[ -z "$SEC_CFG_FILE" ]]; then
-    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/usr" \
-      -name "security-config.json" -path "*/config-store/security/*" 2>/dev/null \
-      | head -1 || true)
-  fi
-  # Last-resort: any security-config.json under the ESRI base
-  if [[ -z "$SEC_CFG_FILE" ]]; then
-    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis" \
-      -name "security-config.json" 2>/dev/null | head -1 || true)
-  fi
-
-  # If the file was deleted by a previous failed run, restore from the .bak created then.
-  if [[ -z "$SEC_CFG_FILE" ]]; then
-    _SEC_CFG_BAK=$(find "$ESRI_BASE/arcgis" \
-      -name "security-config.json.bak" -path "*/config-store/security/*" 2>/dev/null \
-      | head -1 || true)
-    # Also check last-resort locations
-    [[ -z "$_SEC_CFG_BAK" ]] && _SEC_CFG_BAK=$(find "$ESRI_BASE/arcgis" \
-      -name "security-config.json.bak" 2>/dev/null | head -1 || true)
-    if [[ -n "$_SEC_CFG_BAK" ]]; then
-      SEC_CFG_FILE="${_SEC_CFG_BAK%.bak}"
-      echo "  security-config.json missing — restoring from backup: $_SEC_CFG_BAK"
-      cp "$_SEC_CFG_BAK" "$SEC_CFG_FILE"
+  # ── 5e-i: Ensure server is healthy (HTTP 200) before proceeding ──────────────
+  # A previous failed step 5e may have left the server broken (HTTP 500) because
+  # security-config.json was missing or root-owned. Fix it now if needed.
+  _SRV_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+    "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
+  if [[ "$_SRV_CODE" != "200" ]]; then
+    echo "  Server not at HTTP 200 (got ${_SRV_CODE:-000}) — attempting recovery..."
+    # Find security-config.json; if missing, restore from .bak with correct ownership.
+    _SEC_RECOVER=$(find "$ESRI_BASE/arcgis" \
+      -name "security-config.json" -path "*/config-store/security/*" 2>/dev/null | head -1 || true)
+    if [[ -z "$_SEC_RECOVER" ]]; then
+      _SEC_RECOVER=$(find "$ESRI_BASE/arcgis" \
+        -name "security-config.json" 2>/dev/null | head -1 || true)
     fi
-  fi
-
-  if [[ -n "$SEC_CFG_FILE" ]]; then
-    echo "  Found server security config: $SEC_CFG_FILE"
-    echo "  Stopping ArcGIS Server to reset security config..."
+    if [[ -z "$_SEC_RECOVER" ]]; then
+      # File is genuinely missing — look for a backup left by a previous run.
+      _SEC_BAK_R=$(find "$ESRI_BASE/arcgis" \
+        -name "security-config.json.bak" -path "*/config-store/security/*" 2>/dev/null | head -1 || true)
+      [[ -z "$_SEC_BAK_R" ]] && _SEC_BAK_R=$(find "$ESRI_BASE/arcgis" \
+        -name "security-config.json.bak" 2>/dev/null | head -1 || true)
+      if [[ -n "$_SEC_BAK_R" ]]; then
+        _SEC_RECOVER="${_SEC_BAK_R%.bak}"
+        echo "  Restoring security-config.json from backup: $_SEC_BAK_R"
+        cp -p "$_SEC_BAK_R" "$_SEC_RECOVER" 2>/dev/null || true
+      else
+        echo "  ERROR: security-config.json is missing and no backup found."
+        echo "  Expected: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/config-store/security/security-config.json"
+        exit 1
+      fi
+    fi
+    # Always ensure the file is owned by arcgis, not root.
+    # A root-owned config causes ArcGIS Server to fail writes at startup → HTTP 500.
+    chown "$ARCGIS_USER:$ARCGIS_USER" "$_SEC_RECOVER" 2>/dev/null || true
+    chmod 600 "$_SEC_RECOVER" 2>/dev/null || true
+    echo "  Restarting ArcGIS Server to recover health..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
     sleep 10
-    # PATCH security-config.json surgically rather than deleting it.
-    # Deleting the file causes ArcGIS Server to return HTTP 500 on all REST endpoints
-    # during startup (the web layer starts but REST services fail to initialize without
-    # the existing config). Instead, patch ONLY contentSecurityPolicy to an empty String
-    # in-place so the on-disk JSON has the correct Java type, while leaving every other
-    # field (userStoreConfig, roleStoreConfig, portalProperties, etc.) entirely untouched.
-    _SEC_CFG_DIR=$(dirname "$SEC_CFG_FILE")
-    # Back up in case patching fails for any reason
-    cp "$SEC_CFG_FILE" "${SEC_CFG_FILE}.bak" 2>/dev/null || true
-    python3 - <<'PATCH_PY' "$SEC_CFG_FILE"
-import json, sys
-path = sys.argv[1]
-with open(path, 'r') as fh:
-    cfg = json.load(fh)
-csp = cfg.get('contentSecurityPolicy', '')
-if not isinstance(csp, str):
-    cfg['contentSecurityPolicy'] = ''
-    print(f"  Patched contentSecurityPolicy ({type(csp).__name__}) → empty string", flush=True)
-else:
-    # Already a string — ensure the key exists with an empty value so Server
-    # doesn't write it back as a JSONObject on first save.
-    cfg['contentSecurityPolicy'] = ''
-    print("  contentSecurityPolicy was already a string — reset to empty.", flush=True)
-with open(path, 'w') as fh:
-    json.dump(cfg, fh, indent=2)
-PATCH_PY
-    rm -f "${SEC_CFG_FILE}.lock" 2>/dev/null || true
-    echo "  Patched $SEC_CFG_FILE — contentSecurityPolicy normalized to String."
-    echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
-    echo "  Waiting for Server to come back up (up to 5 min)..."
-    _server_up=0
-    for _sw in $(seq 1 30); do
-      _scode=$(curl -sk -o /dev/null -w "%{http_code}" \
+    echo "  Waiting for Server to recover (up to 5 min)..."
+    _rec_up=0
+    for _ri in $(seq 1 30); do
+      _rcode=$(curl -sk -o /dev/null -w "%{http_code}" \
         "https://localhost:6443/arcgis/rest/info?f=json" 2>/dev/null || true)
-      if [[ "$_scode" == "200" ]]; then echo "  Server is up."; _server_up=1; break; fi
-      echo "  Server not ready (HTTP $_scode), waiting 10s..."
+      if [[ "$_rcode" == "200" ]]; then echo "  Server recovered (HTTP 200)."; _rec_up=1; break; fi
+      echo "  Server not ready (HTTP $_rcode), waiting 10s..."
       sleep 10
     done
-    if [[ $_server_up -eq 0 ]]; then
-      # Restore the backup so the system is at least back in its pre-patch state.
-      echo "  Restoring security-config.json backup before exiting..."
-      cp "${SEC_CFG_FILE}.bak" "$SEC_CFG_FILE" 2>/dev/null || true
-      echo "  ERROR: Server did not come back up within 5 minutes. Check logs at:"
+    if [[ $_rec_up -eq 0 ]]; then
+      echo "  ERROR: Server did not recover to HTTP 200. Check logs at:"
       echo "    $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
       exit 1
     fi
-  else
-    echo "  ERROR: Could not find security-config.json."
-    echo "  Expected: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/config-store/security/security-config.json"
-    exit 1
   fi
 
-  # Server is up. contentSecurityPolicy was already patched to an empty String on disk
-  # before restart, so the JVM loaded it as a String type (no ClassCastException on
-  # Portal's federation handler). We issue the REST update anyway as a belt-and-suspenders
-  # measure to ensure in-memory state matches disk and confirm the admin API is responsive.
+  # ── 5e-ii: Fix ClassCastException for contentSecurityPolicy via REST ──────────
+  # ArcGIS Server persists contentSecurityPolicy as a JSONObject in security-config.json.
+  # Portal's federation handler calls GET /admin/security/config and does:
+  #   String csp = (String) secConfig.get("contentSecurityPolicy") → ClassCastException.
   #
-  # IMPORTANT: do NOT set portalProperties here.
-  # If portalProperties is set to "" (String), Server's internal federation validation
-  # code does (JSONObject)secConfig.get("portalProperties") → ClassCastException.
-  # Keep it absent (null) so the cast returns null, which is handled gracefully.
+  # FIX: POST to security/config/update while the server is running at HTTP 200.
+  # The REST endpoint receives contentSecurityPolicy as a form parameter (always a String
+  # from Java's perspective) and stores it in the JVM's SecurityConfig as java.lang.String.
+  # Portal then reads back a String from the JVM → cast succeeds → no ClassCastException.
+  # No stop/restart is required — this is a pure in-memory JVM state update via REST.
+  #
+  # IMPORTANT: do NOT include portalProperties in this POST.
+  # Setting portalProperties="" (String) causes Server's own federation validation to do:
+  #   (JSONObject)secConfig.get("portalProperties") → ClassCastException on the server side.
+  # Omit it so it remains null/absent, which is handled gracefully.
   STOKEN=$(_server_token)
   if [[ -z "$STOKEN" ]]; then
-    echo "  ERROR: Could not get Server admin token after restart."
+    echo "  ERROR: Could not get Server admin token."
     exit 1
   fi
   CUR_SEC=$("${CURL_ADM[@]}" \
@@ -796,7 +761,7 @@ PATCH_PY
   HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
   CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
   [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
-  echo "  Confirming contentSecurityPolicy String type via REST (httpsProtocols=$HTTPS_PROTOS)..."
+  echo "  Setting contentSecurityPolicy to String in JVM via REST (httpsProtocols=$HTTPS_PROTOS)..."
   RESET_R=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/security/config/update" \
     --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
@@ -811,6 +776,12 @@ PATCH_PY
     --data-urlencode "token=$STOKEN" \
     -d "f=json" 2>/dev/null)
   echo "  Security config REST update: $RESET_R"
+  # Re-fetch token — the security config update may have invalidated previous tokens.
+  STOKEN=$(_server_token)
+  if [[ -z "$STOKEN" ]]; then
+    echo "  ERROR: Could not get Server admin token after security config update."
+    exit 1
+  fi
 
   # Unregister any existing Server web adaptors. Step 5g re-registers after federation.
   echo "  Unregistering any existing Server web adaptors before federation..."
