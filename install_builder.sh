@@ -686,19 +686,34 @@ else
     echo "  Stopping ArcGIS Server to reset security config..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
     sleep 10
-    # DELETE security-config.json rather than patching it.
-    # ArcGIS Server regenerates it from Java defaults on next startup, ensuring every
-    # field has the correct Java type (no JSONObject where String is expected).
-    # Surgically patching the JSON with Python cannot fix ALL fields because some (like
-    # userStoreConfig, roleStoreConfig) must survive as JSONObjects while others the
-    # federation code reads as String — we have no way to know all affected fields.
-    # Deleting and regenerating is the only guaranteed clean-slate approach.
-    # The super/super.json (admin credentials) and all other config-store files are unaffected.
+    # PATCH security-config.json surgically rather than deleting it.
+    # Deleting the file causes ArcGIS Server to return HTTP 500 on all REST endpoints
+    # during startup (the web layer starts but REST services fail to initialize without
+    # the existing config). Instead, patch ONLY contentSecurityPolicy to an empty String
+    # in-place so the on-disk JSON has the correct Java type, while leaving every other
+    # field (userStoreConfig, roleStoreConfig, portalProperties, etc.) entirely untouched.
     _SEC_CFG_DIR=$(dirname "$SEC_CFG_FILE")
-    # Back up in case regeneration fails for any reason
+    # Back up in case patching fails for any reason
     cp "$SEC_CFG_FILE" "${SEC_CFG_FILE}.bak" 2>/dev/null || true
-    rm -f "$SEC_CFG_FILE" "${SEC_CFG_FILE}.lock" 2>/dev/null || true
-    echo "  Deleted $SEC_CFG_FILE — Server will regenerate with correct field types."
+    python3 - <<'PATCH_PY' "$SEC_CFG_FILE"
+import json, sys
+path = sys.argv[1]
+with open(path, 'r') as fh:
+    cfg = json.load(fh)
+csp = cfg.get('contentSecurityPolicy', '')
+if not isinstance(csp, str):
+    cfg['contentSecurityPolicy'] = ''
+    print(f"  Patched contentSecurityPolicy ({type(csp).__name__}) → empty string", flush=True)
+else:
+    # Already a string — ensure the key exists with an empty value so Server
+    # doesn't write it back as a JSONObject on first save.
+    cfg['contentSecurityPolicy'] = ''
+    print("  contentSecurityPolicy was already a string — reset to empty.", flush=True)
+with open(path, 'w') as fh:
+    json.dump(cfg, fh, indent=2)
+PATCH_PY
+    rm -f "${SEC_CFG_FILE}.lock" 2>/dev/null || true
+    echo "  Patched $SEC_CFG_FILE — contentSecurityPolicy normalized to String."
     echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
     echo "  Waiting for Server to come back up (up to 5 min)..."
@@ -711,6 +726,9 @@ else
       sleep 10
     done
     if [[ $_server_up -eq 0 ]]; then
+      # Restore the backup so the system is at least back in its pre-patch state.
+      echo "  Restoring security-config.json backup before exiting..."
+      cp "${SEC_CFG_FILE}.bak" "$SEC_CFG_FILE" 2>/dev/null || true
       echo "  ERROR: Server did not come back up within 5 minutes. Check logs at:"
       echo "    $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
       exit 1
@@ -721,12 +739,15 @@ else
     exit 1
   fi
 
-  # Server is up with contentSecurityPolicy as JSONObject in JVM memory.
-  # Portal's federation handler reads GET /admin/security/config and does:
-  #   String csp = (String) secConfig.get("contentSecurityPolicy")  → ClassCastException
-  # Fix: use REST API to POST an empty string for contentSecurityPolicy NOW, which
-  # replaces the in-memory JSONObject with a String. Portal reads it back as String → OK.
-  # This must happen while Server is running (REST updates JVM memory, not disk).
+  # Server is up. contentSecurityPolicy was already patched to an empty String on disk
+  # before restart, so the JVM loaded it as a String type (no ClassCastException on
+  # Portal's federation handler). We issue the REST update anyway as a belt-and-suspenders
+  # measure to ensure in-memory state matches disk and confirm the admin API is responsive.
+  #
+  # IMPORTANT: do NOT set portalProperties here.
+  # If portalProperties is set to "" (String), Server's internal federation validation
+  # code does (JSONObject)secConfig.get("portalProperties") → ClassCastException.
+  # Keep it absent (null) so the cast returns null, which is handled gracefully.
   STOKEN=$(_server_token)
   if [[ -z "$STOKEN" ]]; then
     echo "  ERROR: Could not get Server admin token after restart."
@@ -737,16 +758,7 @@ else
   HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
   CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
   [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
-  # Set contentSecurityPolicy to an empty String in JVM memory via REST.
-  # Server boots with CSP as a JSONObject (required for JVM startup).
-  # Portal's federation handler casts CSP to String → ClassCastException if it's a JSONObject.
-  # Posting CSP="" replaces the in-memory JSONObject with a String type.
-  #
-  # IMPORTANT: do NOT set portalProperties here.
-  # If portalProperties is set to "" (String), Server's internal federation validation
-  # code does (JSONObject)secConfig.get("portalProperties") → ClassCastException.
-  # Keep it absent (null) so the cast returns null, which is handled gracefully.
-  echo "  Setting contentSecurityPolicy to String in JVM via REST (httpsProtocols=$HTTPS_PROTOS)..."
+  echo "  Confirming contentSecurityPolicy String type via REST (httpsProtocols=$HTTPS_PROTOS)..."
   RESET_R=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/security/config/update" \
     --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
