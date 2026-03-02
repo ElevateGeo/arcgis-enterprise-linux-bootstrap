@@ -632,47 +632,73 @@ if [[ "$FED_COUNT" =~ ^[1-9] ]]; then
   echo "  Server is already federated with Portal ($FED_COUNT server(s))."
 else
   echo "  Federating Server with Portal..."
-  # The ClassCastException (JSONObject$a → String) is caused by a stale portalProperties
-  # JSONObject left in the Server's on-disk config-store from a prior partial federation.
-  # The REST API /admin/security/config/update cannot clear it (the server merges the
-  # payload over existing data and ignores an empty string for a JSONObject field).
-  # Fix: stop Server, patch the config-store JSON on disk, restart Server, then federate.
+  # Root cause of ClassCastException (JSONObject$a → String):
+  #   contentSecurityPolicy is written to security-config.json as a JSONObject {"rest":...}
+  #   but Portal's federation handler expects it to be a plain String.
+  #   REST API resets update only the in-memory JVM state and cannot change the Java type;
+  #   the JVM must be restarted after the on-disk JSON is patched to a string value.
+  # Fix: stop Server → patch security-config.json on disk → restart Server → federate.
 
-  # Query the admin API for the config-store path, falling back to a broad find
+  # Locate security-config.json — try admin/info connectionString first, then known paths
   SEC_CFG_FILE=""
   _STOKEN_TMP=$(_server_token)
   _CFGSTORE_PATH=$("${CURL_ADM[@]}" \
     "https://localhost:6443/arcgis/admin/info?f=json&token=$_STOKEN_TMP" 2>/dev/null \
     | jq -r '.configStoreInfo.connectionString // empty' 2>/dev/null || true)
   if [[ -n "$_CFGSTORE_PATH" ]]; then
-    SEC_CFG_FILE="${_CFGSTORE_PATH}/security/config.json"
-    [[ ! -f "$SEC_CFG_FILE" ]] && SEC_CFG_FILE=""
+    _candidate="${_CFGSTORE_PATH}/security/security-config.json"
+    [[ -f "$_candidate" ]] && SEC_CFG_FILE="$_candidate"
   fi
-  # Fallback: search under usr/local (standard createsite layout)
+  # Fallback: search under arcgisusr (actual location confirmed on this host)
   if [[ -z "$SEC_CFG_FILE" ]]; then
-    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/server/usr/local" "$ESRI_BASE/arcgis/server/usr" \
-      -name "config.json" -path "*/security/*" 2>/dev/null | head -1 || true)
+    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis/usr" \
+      -name "security-config.json" -path "*/config-store/security/*" 2>/dev/null \
+      | head -1 || true)
   fi
+  # Last-resort: any security-config.json under the ESRI base
+  if [[ -z "$SEC_CFG_FILE" ]]; then
+    SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis" \
+      -name "security-config.json" 2>/dev/null | head -1 || true)
+  fi
+
   if [[ -n "$SEC_CFG_FILE" ]]; then
     echo "  Found server security config: $SEC_CFG_FILE"
-    echo "  Stopping ArcGIS Server to patch config-store..."
+    echo "  Stopping ArcGIS Server to patch config-store on disk..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/stopserver.sh" >/dev/null 2>&1 || true
     sleep 10
-    # Use Python to remove portalProperties (if present) from the JSON file
+    # Patch the JSON file:
+    #   1. Remove portalProperties (stale federation artifact, causes 500 on re-federation)
+    #   2. Convert contentSecurityPolicy from JSONObject → JSON string
+    #      (ArcGIS stores it as a nested object but federation code expects String type;
+    #       the only way to fix the in-memory Java type is to patch the file before JVM start)
     python3 - "$SEC_CFG_FILE" <<'PYEOF'
-import json, sys, os
+import json, sys
 path = sys.argv[1]
 with open(path) as f:
     cfg = json.load(f)
+changed = False
 if 'portalProperties' in cfg:
-    print(f"  Removing portalProperties from {path}")
     del cfg['portalProperties']
+    print("  Removed portalProperties from security-config.json")
+    changed = True
+csp = cfg.get('contentSecurityPolicy')
+if isinstance(csp, dict):
+    # Convert JSONObject to its JSON string representation so Server loads it as String
+    cfg['contentSecurityPolicy'] = json.dumps(csp)
+    print(f"  Converted contentSecurityPolicy from JSONObject to String: {cfg['contentSecurityPolicy']}")
+    changed = True
+elif csp is None:
+    cfg['contentSecurityPolicy'] = ""
+    print("  Set missing contentSecurityPolicy to empty string")
+    changed = True
+if changed:
     with open(path, 'w') as f:
         json.dump(cfg, f, indent=2)
+    print(f"  Patched {path}")
 else:
-    print(f"  No portalProperties in {path} — no change needed")
+    print(f"  No changes needed in {path}")
 PYEOF
-    # Restore ownership (Python ran as root and may have changed file owner)
+    # Restore ownership (script runs as root; arcgis user must own config files)
     chown "$ARCGIS_USER:$ARCGIS_USER" "$SEC_CFG_FILE" 2>/dev/null || true
     echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
@@ -685,34 +711,9 @@ PYEOF
       sleep 10
     done
   else
-    echo "  WARNING: Could not find server security config.json — skipping on-disk patch."
-    echo "  Falling back to REST API reset..."
-    STOKEN=$(_server_token)
-    CUR_SEC=$("${CURL_ADM[@]}" \
-      "https://localhost:6443/arcgis/admin/security/config?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
-    HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
-    CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
-    [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
-    # contentSecurityPolicy is stored as a JSONObject in-process; Portal's federation handler
-    # tries to cast it to String → ClassCastException. Send it back as a JSON *string* to
-    # force Server to store it as String instead of JSONObject.
-    CSP_RAW=$(echo "$CUR_SEC" | jq -c '.contentSecurityPolicy // {}' 2>/dev/null || echo '{}')
-    RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
-      "https://localhost:6443/arcgis/admin/security/config/update" \
-      --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
-      --data-urlencode "authenticationTier=GIS_SERVER" \
-      --data-urlencode "Protocol=HTTPS" \
-      --data-urlencode "httpsProtocols=$HTTPS_PROTOS" \
-      --data-urlencode "cipherSuites=$CIPHER_SUITES" \
-      --data-urlencode "allowDirectAccess=true" \
-      --data-urlencode "virtualDirsSecurityEnabled=false" \
-      --data-urlencode "HSTSEnabled=false" \
-      --data-urlencode "portalProperties=" \
-      --data-urlencode "contentSecurityPolicy=$CSP_RAW" \
-      --data-urlencode "token=$STOKEN" \
-      -d "f=json" 2>/dev/null)
-    echo "  Security config reset result: $RESET_RESULT"
-    sleep 30
+    echo "  ERROR: Could not find security-config.json — cannot patch contentSecurityPolicy."
+    echo "  Expected: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/config-store/security/security-config.json"
+    exit 1
   fi
 
   # Refresh tokens after restart / security config change
