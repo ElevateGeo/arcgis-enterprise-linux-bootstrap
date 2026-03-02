@@ -642,11 +642,20 @@ else
   #   portalProperties="" clears the stale Object that causes the ClassCastException.
   STOKEN=$(_server_token)
   echo "  Resetting Server security config to non-federated state..."
+  # GET current security config to read back httpsProtocols and cipherSuites —
+  # the update endpoint requires these fields when Protocol=HTTPS.
+  CUR_SEC=$("${CURL_ADM[@]}" \
+    "https://localhost:6443/arcgis/admin/security/config?f=json&token=$STOKEN" 2>/dev/null || echo '{}')
+  HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
+  CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
+  [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
   RESET_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/security/config/update" \
     --data-urlencode "authenticationMode=ARCGIS_TOKEN" \
     --data-urlencode "authenticationTier=GIS_SERVER" \
     --data-urlencode "Protocol=HTTPS" \
+    --data-urlencode "httpsProtocols=$HTTPS_PROTOS" \
+    --data-urlencode "cipherSuites=$CIPHER_SUITES" \
     --data-urlencode "allowDirectAccess=true" \
     --data-urlencode "virtualDirsSecurityEnabled=false" \
     --data-urlencode "HSTSEnabled=false" \
@@ -654,7 +663,15 @@ else
     --data-urlencode "token=$STOKEN" \
     -d "f=json" 2>/dev/null)
   echo "  Security config reset result: $RESET_RESULT"
-  sleep 15
+  # Server may restart after security config change; wait up to 2 min for it to recover
+  sleep 30
+  for _sw in $(seq 1 9); do
+    _scode=$("${CURL_ADM[@]}" -o /dev/null -w "%{http_code}" \
+      "https://localhost:6443/arcgis/admin?f=json" 2>/dev/null || true)
+    [[ "$_scode" == "200" ]] && break
+    echo "  Server not ready after reset (HTTP $_scode), waiting 10s..."
+    sleep 10
+  done
 
   # Refresh tokens after security config change
   STOKEN=$(_server_token)
