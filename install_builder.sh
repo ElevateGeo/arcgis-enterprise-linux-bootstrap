@@ -639,6 +639,7 @@ else
   # Fix: stop Server, patch the config-store JSON on disk, restart Server, then federate.
 
   # Query the admin API for the config-store path, falling back to a broad find
+  SEC_CFG_FILE=""
   _STOKEN_TMP=$(_server_token)
   _CFGSTORE_PATH=$("${CURL_ADM[@]}" \
     "https://localhost:6443/arcgis/admin/info?f=json&token=$_STOKEN_TMP" 2>/dev/null \
