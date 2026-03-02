@@ -408,12 +408,27 @@ else
   [[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
 fi
 
-if [[ "$_SERVER_HTTP" =~ ^[2345] && "$_SERVER_HTTP" != "000" ]]; then
+if [[ "$_SERVER_HTTP" == "200" || "$_SERVER_HTTP" == "302" ]]; then
   echo "Server already running (HTTP $_SERVER_HTTP) — skipping Server start."
 else
-  # Stop first to kill any zombie processes left by a prior failed restart attempt.
-  # startserver.sh refuses to start if old processes are still running.
-  echo "Server not responding — stopping any stale processes before starting..."
+  # HTTP 500 means the process is running but REST services failed to load.
+  # The most common cause: security-config.json was deleted by a previous failed step 5e run.
+  # If a .bak copy exists (written by step 5e before it deleted the original), restore it now
+  # so the server can start successfully. Step 5e will then patch + restart as normal.
+  _SEC_BAK_PRE=$(find "$ESRI_BASE/arcgis" \
+    -name "security-config.json.bak" -path "*/config-store/security/*" 2>/dev/null \
+    | head -1 || true)
+  [[ -z "$_SEC_BAK_PRE" ]] && _SEC_BAK_PRE=$(find "$ESRI_BASE/arcgis" \
+    -name "security-config.json.bak" 2>/dev/null | head -1 || true)
+  if [[ -n "$_SEC_BAK_PRE" ]]; then
+    _SEC_MAIN_PRE="${_SEC_BAK_PRE%.bak}"
+    if [[ ! -f "$_SEC_MAIN_PRE" ]]; then
+      echo "  Restoring missing security-config.json from backup before Server start..."
+      cp "$_SEC_BAK_PRE" "$_SEC_MAIN_PRE"
+    fi
+  fi
+  # Stop first to kill any stale processes; startserver.sh refuses to start otherwise.
+  echo "Server not healthy (HTTP ${_SERVER_HTTP:-000}) — stopping any stale processes before starting..."
   [[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" >/dev/null 2>&1 || true
   sleep 5
   echo "Starting ArcGIS Server..."
@@ -447,16 +462,24 @@ if [[ $PORTAL_UP -eq 0 ]]; then
 fi
 
   echo "Waiting for Server to become available on :6443 (up to 5 min)..."
+_SERVER_WAIT_UP=0
 for i in $(seq 1 30); do
   HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
-  # 200/302 = fully up; 500 = process is up but site not yet created (normal pre-configure state)
-  if [[ "$HTTP_CODE" =~ ^[2345] && "$HTTP_CODE" != "000" ]]; then
+  # Only 200 means REST services are fully initialised and step 5e can proceed.
+  # HTTP 500 means the process is up but security-config/services failed to load — not usable.
+  if [[ "$HTTP_CODE" == "200" ]]; then
     echo "Server is up (HTTP $HTTP_CODE)."
+    _SERVER_WAIT_UP=1
     break
   fi
   echo "  Server not ready yet (HTTP ${HTTP_CODE:-none}), attempt $i/30 — sleeping 10s..."
   sleep 10
 done
+if [[ $_SERVER_WAIT_UP -eq 0 ]]; then
+  echo "ERROR: Server did not become available (HTTP 200) within 5 minutes."
+  echo "  Check logs at: $ESRI_BASE/arcgis/usr/arcgisusr/arcgisserver/logs/"
+  exit 1
+fi
 fi # end pre-step 5
 
 # ==============================================================================
@@ -679,6 +702,21 @@ else
   if [[ -z "$SEC_CFG_FILE" ]]; then
     SEC_CFG_FILE=$(find "$ESRI_BASE/arcgis" \
       -name "security-config.json" 2>/dev/null | head -1 || true)
+  fi
+
+  # If the file was deleted by a previous failed run, restore from the .bak created then.
+  if [[ -z "$SEC_CFG_FILE" ]]; then
+    _SEC_CFG_BAK=$(find "$ESRI_BASE/arcgis" \
+      -name "security-config.json.bak" -path "*/config-store/security/*" 2>/dev/null \
+      | head -1 || true)
+    # Also check last-resort locations
+    [[ -z "$_SEC_CFG_BAK" ]] && _SEC_CFG_BAK=$(find "$ESRI_BASE/arcgis" \
+      -name "security-config.json.bak" 2>/dev/null | head -1 || true)
+    if [[ -n "$_SEC_CFG_BAK" ]]; then
+      SEC_CFG_FILE="${_SEC_CFG_BAK%.bak}"
+      echo "  security-config.json missing — restoring from backup: $_SEC_CFG_BAK"
+      cp "$_SEC_CFG_BAK" "$SEC_CFG_FILE"
+    fi
   fi
 
   if [[ -n "$SEC_CFG_FILE" ]]; then
