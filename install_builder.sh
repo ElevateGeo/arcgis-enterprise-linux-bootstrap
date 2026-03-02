@@ -395,18 +395,26 @@ SERVER_STOP="$ESRI_BASE/arcgis/server/stopserver.sh"
 DS_START=$(find "$ESRI_BASE/arcgis/datastore" -name "startdatastore.sh" 2>/dev/null | head -1 || true)
 DS_STOP=$(find "$ESRI_BASE/arcgis/datastore" -name "stopdatastore.sh" 2>/dev/null | head -1 || true)
 
-# Always stop first for a clean-state restart — avoids stale process warnings
-# that indicate the prior configurebasedeployment run left services mid-flight.
-echo "Stopping ArcGIS services for clean restart..."
-[[ -n "$DS_STOP" ]] && sudo -u "$ARCGIS_USER" "$DS_STOP" 2>/dev/null || true
-[[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" 2>/dev/null || true
-[[ -f "$PORTAL_STOP" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_STOP" 2>/dev/null || true
-echo "Waiting 20s for processes to fully exit..."
-sleep 20
+# Only stop/restart services that are not already responding.
+# Bouncing Portal when it's healthy wastes ~3 minutes of startup time.
+_PORTAL_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:7443/arcgis/portaladmin/" 2>/dev/null || true)
+_SERVER_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
+_DS_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:2443/arcgis/datastoreadmin" 2>/dev/null || true)
 
-[[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
-[[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
-[[ -n "$DS_START" ]] && sudo -u "$ARCGIS_USER" "$DS_START" || echo "DataStore start script not found — skipping"
+if [[ "$_PORTAL_HTTP" =~ ^[234] ]] && [[ "$_SERVER_HTTP" =~ ^[2345] && "$_SERVER_HTTP" != "000" ]]; then
+  echo "All services already running (Portal HTTP $_PORTAL_HTTP, Server HTTP $_SERVER_HTTP) — skipping stop/restart."
+else
+  echo "Stopping ArcGIS services for clean restart..."
+  [[ -n "$DS_STOP" ]] && sudo -u "$ARCGIS_USER" "$DS_STOP" 2>/dev/null || true
+  [[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" 2>/dev/null || true
+  [[ -f "$PORTAL_STOP" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_STOP" 2>/dev/null || true
+  echo "Waiting 20s for processes to fully exit..."
+  sleep 20
+
+  [[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
+  [[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
+  [[ -n "$DS_START" ]] && sudo -u "$ARCGIS_USER" "$DS_START" || echo "DataStore start script not found — skipping"
+fi
 
 echo "Waiting for Portal to become available on :7443 (up to 5 min)..."
 PORTAL_UP=0
@@ -702,8 +710,8 @@ PYEOF
     chown "$ARCGIS_USER:$ARCGIS_USER" "$SEC_CFG_FILE" 2>/dev/null || true
     echo "  Restarting ArcGIS Server..."
     sudo -u "$ARCGIS_USER" "$ESRI_BASE/arcgis/server/startserver.sh" >/dev/null 2>&1 || true
-    echo "  Waiting for Server to come back up (up to 3 min)..."
-    for _sw in $(seq 1 18); do
+    echo "  Waiting for Server to come back up (up to 5 min)..."
+    for _sw in $(seq 1 30); do
       _scode=$("${CURL_ADM[@]}" -o /dev/null -w "%{http_code}" \
         "https://localhost:6443/arcgis/admin?f=json" 2>/dev/null || true)
       [[ "$_scode" == "200" ]] && echo "  Server is up." && break
@@ -739,7 +747,12 @@ PYEOF
 
   # Correct Esri API endpoint: /portaladmin/federation/servers/federate
   # Source: https://github.com/Esri/arcgis-cookbook portal_admin_client.rb#federate_server
-  SERVER_ADMIN_URL="https://${DOMAIN}:6443/arcgis"
+  # adminUrl must use the Server machine's own hostname (not the public NGINX domain).
+  # Using the NGINX domain (gis.elevategeo.dev:6443) fails because Portal's Java HTTP
+  # client resolves it to the public IP and Azure hairpin NAT blocks the connection.
+  # The machine hostname resolves locally and its SSL cert matches.
+  _SERVER_MACHINE=$(sudo -u "$ARCGIS_USER" hostname -f 2>/dev/null || hostname -f 2>/dev/null || echo "localhost")
+  SERVER_ADMIN_URL="https://${_SERVER_MACHINE}:6443/arcgis"
   FED_RESULT=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:7443/arcgis/portaladmin/federation/servers/federate" \
     --data-urlencode "url=https://$DOMAIN/server" \
