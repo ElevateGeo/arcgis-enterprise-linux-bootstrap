@@ -395,24 +395,31 @@ SERVER_STOP="$ESRI_BASE/arcgis/server/stopserver.sh"
 DS_START=$(find "$ESRI_BASE/arcgis/datastore" -name "startdatastore.sh" 2>/dev/null | head -1 || true)
 DS_STOP=$(find "$ESRI_BASE/arcgis/datastore" -name "stopdatastore.sh" 2>/dev/null | head -1 || true)
 
-# Only stop/restart services that are not already responding.
-# Bouncing Portal when it's healthy wastes ~3 minutes of startup time.
+# Start only services that are not already responding — independently.
+# Checking them as a group means one downed service (e.g. Server left stopped by a
+# prior failed step 5e) triggers a full restart including a healthy Portal.
 _PORTAL_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:7443/arcgis/portaladmin/" 2>/dev/null || true)
 _SERVER_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:6443/arcgis/rest/info" 2>/dev/null || true)
-_DS_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:2443/arcgis/datastoreadmin" 2>/dev/null || true)
 
-if [[ "$_PORTAL_HTTP" =~ ^[234] ]] && [[ "$_SERVER_HTTP" =~ ^[2345] && "$_SERVER_HTTP" != "000" ]]; then
-  echo "All services already running (Portal HTTP $_PORTAL_HTTP, Server HTTP $_SERVER_HTTP) — skipping stop/restart."
+if [[ "$_PORTAL_HTTP" =~ ^[234] ]]; then
+  echo "Portal already running (HTTP $_PORTAL_HTTP) — skipping Portal start."
 else
-  echo "Stopping ArcGIS services for clean restart..."
-  [[ -n "$DS_STOP" ]] && sudo -u "$ARCGIS_USER" "$DS_STOP" 2>/dev/null || true
-  [[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" 2>/dev/null || true
-  [[ -f "$PORTAL_STOP" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_STOP" 2>/dev/null || true
-  echo "Waiting 20s for processes to fully exit..."
-  sleep 20
-
+  echo "Starting Portal for ArcGIS..."
   [[ -f "$PORTAL_START" ]] && sudo -u "$ARCGIS_USER" "$PORTAL_START" || echo "Portal start script not found — skipping"
+fi
+
+if [[ "$_SERVER_HTTP" =~ ^[2345] && "$_SERVER_HTTP" != "000" ]]; then
+  echo "Server already running (HTTP $_SERVER_HTTP) — skipping Server start."
+else
+  echo "Starting ArcGIS Server..."
   [[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
+fi
+
+_DS_HTTP=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:2443/arcgis/datastoreadmin" 2>/dev/null || true)
+if [[ "$_DS_HTTP" =~ ^[234] ]]; then
+  echo "DataStore already running (HTTP $_DS_HTTP) — skipping DataStore start."
+else
+  echo "Starting ArcGIS Data Store..."
   [[ -n "$DS_START" ]] && sudo -u "$ARCGIS_USER" "$DS_START" || echo "DataStore start script not found — skipping"
 fi
 
