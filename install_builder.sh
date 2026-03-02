@@ -411,6 +411,11 @@ fi
 if [[ "$_SERVER_HTTP" =~ ^[2345] && "$_SERVER_HTTP" != "000" ]]; then
   echo "Server already running (HTTP $_SERVER_HTTP) — skipping Server start."
 else
+  # Stop first to kill any zombie processes left by a prior failed restart attempt.
+  # startserver.sh refuses to start if old processes are still running.
+  echo "Server not responding — stopping any stale processes before starting..."
+  [[ -f "$SERVER_STOP" ]] && sudo -u "$ARCGIS_USER" "$SERVER_STOP" >/dev/null 2>&1 || true
+  sleep 5
   echo "Starting ArcGIS Server..."
   [[ -f "$SERVER_START" ]] && sudo -u "$ARCGIS_USER" "$SERVER_START" || echo "Server start script not found — skipping"
 fi
@@ -751,6 +756,15 @@ PYEOF
   HTTPS_PROTOS=$(echo "$CUR_SEC" | jq -r '.httpsProtocols // "TLSv1.2,TLSv1.3"' 2>/dev/null)
   CIPHER_SUITES=$(echo "$CUR_SEC" | jq -r '.cipherSuites // ""' 2>/dev/null)
   [[ -z "$HTTPS_PROTOS" || "$HTTPS_PROTOS" == "null" ]] && HTTPS_PROTOS="TLSv1.2,TLSv1.3"
+  # Set contentSecurityPolicy to an empty String in JVM memory via REST.
+  # Server boots with CSP as a JSONObject (required for JVM startup).
+  # Portal's federation handler casts CSP to String → ClassCastException if it's a JSONObject.
+  # Posting CSP="" replaces the in-memory JSONObject with a String type.
+  #
+  # IMPORTANT: do NOT set portalProperties here.
+  # If portalProperties is set to "" (String), Server's internal federation validation
+  # code does (JSONObject)secConfig.get("portalProperties") → ClassCastException.
+  # Keep it absent (null) so the cast returns null, which is handled gracefully.
   echo "  Setting contentSecurityPolicy to String in JVM via REST (httpsProtocols=$HTTPS_PROTOS)..."
   RESET_R=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/security/config/update" \
@@ -762,7 +776,6 @@ PYEOF
     --data-urlencode "allowDirectAccess=true" \
     --data-urlencode "virtualDirsSecurityEnabled=false" \
     --data-urlencode "HSTSEnabled=false" \
-    --data-urlencode "portalProperties=" \
     --data-urlencode "contentSecurityPolicy=" \
     --data-urlencode "token=$STOKEN" \
     -d "f=json" 2>/dev/null)
