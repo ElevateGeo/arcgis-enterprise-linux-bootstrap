@@ -526,11 +526,13 @@ CURL_ADM=(curl -sk --noproxy '*' --connect-timeout 10 --max-time 90)
 _portal_token() {
   local resp tok
   for _token_host in "localhost:7443" "$DOMAIN:7443" "${DOMAIN^^}:7443"; do
-    resp=$("${CURL_ADM[@]}" -X POST \
+    resp=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
       "https://${_token_host}/arcgis/sharing/rest/generateToken" \
+      -H "Referer: https://localhost:7443/arcgis" \
       --data-urlencode "username=$ADMIN_USER" \
       --data-urlencode "password=$ADMIN_PASS" \
-      -d "client=requestip&expiration=120&f=json" \
+      -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
+      -d "expiration=120" -d "f=json" \
       2>/dev/null || true)
     tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
     if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
@@ -542,11 +544,13 @@ _portal_token() {
 
 _server_token() {
   local resp tok
-  resp=$("${CURL_ADM[@]}" -X POST \
+  resp=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
     "https://localhost:6443/arcgis/admin/generateToken" \
+    -H "Referer: https://localhost:6443/arcgis/admin" \
     --data-urlencode "username=$ADMIN_USER" \
     --data-urlencode "password=$ADMIN_PASS" \
-    -d "client=requestip&expiration=120&f=json" \
+    -d "client=referer" -d "referer=https://localhost:6443/arcgis/admin" \
+    -d "expiration=120" -d "f=json" \
     2>/dev/null || true)
   tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
   if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
@@ -583,11 +587,13 @@ PTOKEN=""
 
 # Quick check: is Portal already initialized?
 echo "  Checking if Portal is already initialized..."
-_CHK_RESP=$("${CURL_ADM[@]}" -X POST \
+_CHK_RESP=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
   "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+  -H "Referer: https://localhost:7443/arcgis" \
   --data-urlencode "username=$ADMIN_USER" \
   --data-urlencode "password=$ADMIN_PASS" \
-  -d "client=requestip&expiration=120&f=json" \
+  -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
+  -d "expiration=120" -d "f=json" \
   2>/dev/null || true)
 _CHK_TOK=$(echo "$_CHK_RESP" | jq -r '.token // empty' 2>/dev/null || true)
 if [[ -n "$_CHK_TOK" ]]; then
@@ -637,11 +643,13 @@ if [[ -z "$PTOKEN" ]]; then
       _RETRY_TOK=""
       _RETRY_RESP=""
       for _rt in $(seq 1 90); do
-        _RETRY_RESP=$("${CURL_ADM[@]}" -X POST \
+        _RETRY_RESP=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
           "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+          -H "Referer: https://localhost:7443/arcgis" \
           --data-urlencode "username=$ADMIN_USER" \
           --data-urlencode "password=$ADMIN_PASS" \
-          -d "client=requestip&expiration=120&f=json" \
+          -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
+          -d "expiration=120" -d "f=json" \
           2>/dev/null || true)
         _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
         if [[ -n "$_RETRY_TOK" ]]; then
