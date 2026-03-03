@@ -20,22 +20,27 @@ TOMCAT_USER="tomcat"
 
 # ---------- Usage & Helpers ----------
 usage() {
-  echo "Usage: sudo ./install_builder.sh [--wipe] [--yes] [--steps STEP[,STEP...]]"
-  echo "  Steps: 1 2 3 4 pre5 5a 5b 5c 5d 5e 5f 5g"
-  echo "  Example: sudo ./install_builder.sh --steps 5d,5e,5g"
+  echo "Usage: sudo ./install_builder.sh [--wipe] [--reset-sites] [--yes] [--steps STEP[,STEP...]]"
+  echo "  --wipe        Remove all ArcGIS software and reinstall from scratch"
+  echo "  --reset-sites Reset Portal/Server/DataStore sites (keeps software, re-runs site creation)"
+  echo "  --yes         Skip confirmation prompts"
+  echo "  --steps       Run only specified steps: 1 2 3 4 pre5 5a 5b 5c 5d 5e 5f 5g"
+  echo "  Example: sudo ./install_builder.sh --reset-sites --steps 5a,5b,5c"
   exit 1
 }
 
 WIPE_EXISTING=0
+RESET_SITES=0
 WIPE_YES=0
 RUN_STEPS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --wipe)    WIPE_EXISTING=1 ;;
-    --yes)     WIPE_YES=1 ;;
-    --steps)   IFS=',' read -ra RUN_STEPS <<< "${2:-}"; shift ;;
-    --steps=*) IFS=',' read -ra RUN_STEPS <<< "${1#--steps=}" ;;
-    --help|-h) usage ;;
+    --wipe)        WIPE_EXISTING=1 ;;
+    --reset-sites) RESET_SITES=1 ;;
+    --yes)         WIPE_YES=1 ;;
+    --steps)       IFS=',' read -ra RUN_STEPS <<< "${2:-}"; shift ;;
+    --steps=*)     IFS=',' read -ra RUN_STEPS <<< "${1#--steps=}" ;;
+    --help|-h)     usage ;;
   esac
   shift
 done
@@ -103,6 +108,69 @@ wipe_existing_enterprise() {
 
 if (( WIPE_EXISTING == 1 )); then
   wipe_existing_enterprise
+fi
+
+# ---------- Reset Sites Function ----------
+# Resets Portal/Server/DataStore site configuration WITHOUT reinstalling software.
+# Use when sites are corrupted or need to be recreated with different credentials.
+reset_arcgis_sites() {
+  echo ""
+  echo "!!! RESET SITES MODE !!!"
+  echo "This will delete Portal, Server, and DataStore site configurations."
+  echo "Software will NOT be reinstalled, but sites must be recreated (steps 5a-5g)."
+  
+  if (( WIPE_YES == 0 )); then
+    read -rp "Type RESET to confirm: " _confirm
+    [[ "$_confirm" != "RESET" ]] && echo "Cancelled." && exit 1
+  fi
+
+  echo "Stopping ArcGIS services..."
+  systemctl stop arcgisportal arcgisserver arcgisdatastore 2>/dev/null || true
+  # Give processes time to terminate gracefully
+  sleep 5
+  # Force kill any remaining processes
+  pkill -9 -u "$ARCGIS_USER" 2>/dev/null || true
+  sleep 2
+
+  echo "Resetting Portal site..."
+  # Portal stores its site configuration in usr/arcgisportal/
+  # The 'content' directory is the content store, 'etc' has config
+  # The internal PostgreSQL database is in 'db/'
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/content" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/db" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/etc" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/index" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/temp" 2>/dev/null || true
+  # Remove user-level Portal state
+  rm -rf /home/"$ARCGIS_USER"/.arcgis* 2>/dev/null || true
+  rm -rf /home/"$ARCGIS_USER"/.com.esri* 2>/dev/null || true
+
+  echo "Resetting Server site..."
+  # Server stores site config in usr/directories/ and usr/config-store/
+  rm -rf "$ESRI_BASE/arcgis/server/usr/config-store" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/server/usr/directories" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/server/usr/arcgisserver/config-store" 2>/dev/null || true
+
+  echo "Resetting DataStore..."
+  # DataStore stores its configuration in usr/arcgisdatastore/
+  rm -rf "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" 2>/dev/null || true
+
+  # Also clean up the shared content directory if it exists
+  rm -rf "$ESRI_BASE/arcgis/usr" 2>/dev/null || true
+
+  echo "Restarting ArcGIS services..."
+  systemctl start arcgisportal 2>/dev/null || true
+  systemctl start arcgisserver 2>/dev/null || true
+  # Don't start DataStore yet - it needs Server to be configured first
+
+  echo "Waiting for services to start (30 seconds)..."
+  sleep 30
+
+  echo "Reset complete. Run steps 5a-5g to recreate sites."
+}
+
+if (( RESET_SITES == 1 )); then
+  reset_arcgis_sites
 fi
 
 # ---------- Step selector ----------
@@ -667,8 +735,8 @@ if _portal_site_exists; then
     done
     if [[ -z "$PTOKEN" ]]; then
       echo "ERROR: Portal site exists but cannot authenticate." >&2
-      echo "  This usually means Portal was created with different credentials." >&2
-      echo "  To fix: run with --wipe to delete and recreate Portal." >&2
+      echo "  This usually means Portal's internal state is corrupted." >&2
+      echo "  To fix: run with --reset-sites to clear and recreate Portal site." >&2
       exit 1
     fi
   fi
@@ -768,17 +836,25 @@ else
   # Now get token
   echo "  Waiting for Portal to accept tokens (up to 5 min)..."
   for _tok in $(seq 1 30); do
-    PTOKEN=$(_portal_token 2>/dev/null) || PTOKEN=""
-    if [[ -n "$PTOKEN" ]]; then
+    PTOKEN=$(_portal_token 2>&1) || PTOKEN=""
+    # Check if we got a valid token (not error message)
+    if [[ -n "$PTOKEN" ]] && [[ ! "$PTOKEN" =~ ^\[_portal_token\] ]]; then
       echo "  Successfully obtained token."
       break
+    fi
+    # Show diagnostic info every 5 attempts
+    if (( _tok % 5 == 0 )); then
+      _DIAG=$("${CURL_ADM[@]}" "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || true)
+      echo "    [diag] portaladmin: ${_DIAG:0:150}"
     fi
     echo "    Token attempt $_tok/30 — sleeping 10s..."
     sleep 10
   done
 
-  if [[ -z "$PTOKEN" ]]; then
+  if [[ -z "$PTOKEN" ]] || [[ "$PTOKEN" =~ ^\[_portal_token\] ]]; then
     echo "ERROR: Portal site created but cannot get token." >&2
+    echo "  This usually means Portal's internal database is corrupted." >&2
+    echo "  Run with --reset-sites to clear Portal state and retry." >&2
     echo "  Check Portal logs at /opt/esri/arcgis/portal/usr/arcgisportal/logs/" >&2
     exit 1
   fi
