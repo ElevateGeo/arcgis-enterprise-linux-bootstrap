@@ -795,10 +795,20 @@ else
       --data-urlencode "contentStore=$CONTENT_STORE" \
       -d "f=json" 2>/dev/null || true)
 
-    # Empty or non-JSON → Portal not ready yet
+    # Empty or non-JSON → Portal not ready yet, OR request timed out but may have triggered init
     if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
-      echo "    createNewSite attempt $_cns/90: not ready yet (empty/non-JSON) — sleeping 10s..."
-      sleep 10
+      echo "    createNewSite attempt $_cns/90: not ready yet (empty/non-JSON) — sleeping 30s..."
+      sleep 30
+      # Re-check if site now exists (request may have triggered init)
+      if _portal_site_exists 2>/dev/null; then
+        echo "    Site now exists after empty response - checking if we can get token..."
+        _CHECK_TOK=$(_portal_token 2>/dev/null) || _CHECK_TOK=""
+        if [[ -n "$_CHECK_TOK" ]] && [[ ! "$_CHECK_TOK" =~ ^\[_portal_token\] ]]; then
+          echo "    Token obtained! Site was created successfully."
+          _CREATE_SUCCESS=1
+          break
+        fi
+      fi
       continue
     fi
 
@@ -815,21 +825,43 @@ else
       break
     fi
     
-    # Error 499 = Token Required - but we just checked site doesn't exist!
-    # This means Portal is in a corrupted state where it thinks it's initialized 
-    # but has no admin account. The --reset-sites didn't fully clean it.
+    # Error 499 = Token Required - this could be:
+    # 1. Previous createNewSite attempt (empty response) actually triggered init
+    # 2. Portal auto-initialized from leftover state
+    # Try to get a token - if it works, site was created with our credentials
     if [[ "$CREATE_CODE" == "499" ]]; then
+      echo "  createNewSite returned 499 (Token Required). Checking if site initialized with our credentials..."
+      sleep 5  # Give Portal a moment
+      _CHECK_TOK=$(_portal_token 2>/dev/null) || _CHECK_TOK=""
+      if [[ -n "$_CHECK_TOK" ]] && [[ ! "$_CHECK_TOK" =~ ^\[_portal_token\] ]]; then
+        echo "  Token obtained! Site was created successfully."
+        _CREATE_SUCCESS=1
+        break
+      fi
+      # Token failed - but site might still be initializing. Wait and retry.
+      echo "  Cannot get token yet. Portal may still be initializing (up to 3 more minutes)..."
+      for _499_wait in $(seq 1 18); do
+        sleep 10
+        _CHECK_TOK=$(_portal_token 2>/dev/null) || _CHECK_TOK=""
+        if [[ -n "$_CHECK_TOK" ]] && [[ ! "$_CHECK_TOK" =~ ^\[_portal_token\] ]]; then
+          echo "  Token obtained after waiting! Site is ready."
+          _CREATE_SUCCESS=1
+          break 2
+        fi
+        echo "    Still waiting for token ($_499_wait/18)..."
+      done
+      # If still no token after 3 minutes, it's corrupted
       echo ""
-      echo "ERROR: createNewSite returned 499 (Token Required) but site check said uninitialized." >&2
-      echo "  This indicates Portal is in a corrupted state." >&2
-      echo "  Portal thinks it's initialized but has no admin account." >&2
+      echo "ERROR: Portal returned 499 but cannot authenticate with provided credentials." >&2
+      echo "  This usually means Portal auto-initialized incorrectly." >&2
       echo "" >&2
-      echo "  To fix:" >&2
-      echo "  1. Stop Portal: sudo systemctl stop arcgisportal" >&2
-      echo "  2. Kill PostgreSQL: sudo pkill -9 -f 'arcgisportal.*postgres'" >&2
-      echo "  3. Delete Portal data: sudo rm -rf /opt/esri/arcgis/portal/usr/arcgisportal/*" >&2
-      echo "  4. Start Portal: sudo systemctl start arcgisportal" >&2
-      echo "  5. Wait 2 min, then re-run: sudo ./install_builder.sh --steps 5a,5b,5c,5d,5e" >&2
+      echo "  To fix (Builder installation - no systemd):" >&2
+      echo "    sudo -u arcgis /opt/esri/arcgis/portal/stopportal.sh" >&2
+      echo "    sudo pkill -9 -f postgres" >&2
+      echo "    sudo rm -rf /opt/esri/arcgis/portal/usr/arcgisportal/*" >&2
+      echo "    sudo -u arcgis /opt/esri/arcgis/portal/startportal.sh" >&2
+      echo "    sleep 120" >&2
+      echo "    sudo ./install_builder.sh --steps 5a,5b,5c,5d,5e" >&2
       exit 1
     fi
     
