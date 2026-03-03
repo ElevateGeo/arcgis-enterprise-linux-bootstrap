@@ -624,22 +624,32 @@ if [[ -z "$PTOKEN" ]]; then
 
     # code 499 = Token Required → Portal IS already initialized.
     # The quick generateToken check may have run before Portal was fully up.
-    # Now that Portal is responding, try generateToken again.
+    # The sharing/rest endpoint can lag behind the admin endpoint, so retry
+    # generateToken in a loop (up to 2 min) before concluding credentials mismatch.
     if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
-      echo "  Portal is already initialized (createNewSite returned 499). Re-checking credentials..."
-      _RETRY_RESP=$("${CURL_ADM[@]}" -X POST \
-        "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-        -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
-        2>/dev/null || true)
-      _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+      echo "  Portal is already initialized (createNewSite returned 499). Waiting for sharing/rest to be ready..."
+      _RETRY_TOK=""
+      _RETRY_RESP=""
+      for _rt in $(seq 1 12); do
+        _RETRY_RESP=$("${CURL_ADM[@]}" -X POST \
+          "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+          -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+          2>/dev/null || true)
+        _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+        if [[ -n "$_RETRY_TOK" ]]; then
+          break
+        fi
+        echo "    generateToken attempt $_rt/12: no token yet (response: ${_RETRY_RESP:0:120}) — sleeping 10s..."
+        sleep 10
+      done
       if [[ -n "$_RETRY_TOK" ]]; then
         PTOKEN="$_RETRY_TOK"
         echo "  Portal already initialized and credentials verified — skipping createNewSite."
         _CNS_DONE=1
         break
       else
-        echo "ERROR: Portal is already initialized but token generation failed." >&2
-        echo "  generateToken response: $_RETRY_RESP" >&2
+        echo "ERROR: Portal is already initialized but token generation failed after 2 min." >&2
+        echo "  Last generateToken response: $_RETRY_RESP" >&2
         echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
         echo "  Options:" >&2
         echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the existing credentials." >&2
