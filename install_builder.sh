@@ -561,27 +561,31 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
-# Wait for Portal's REST/sharing layer to be ready before doing anything.
-# Portal's web layer (HTTP 200 on /portaladmin/) can be up while the internal
-# Java app is still initialising — generateToken returns HTTP 503 in that window.
-# We must not call createNewSite or generateToken until the sharing REST API is
-# actually responding (anything other than 503 / 000 is acceptable here, because
-# an uninitialised Portal will return 200 with an HTML wizard page, not 503).
-echo "  Waiting for Portal REST API to become ready (up to 10 min)..."
+# Wait for Portal's authentication stack to be ready before doing anything.
+# Portal's web layer (HTTP 200 on /portaladmin/) and even /sharing/rest/info
+# can return 200 while the internal identity/user store is still initialising.
+# The definitive signal is: generateToken returns something OTHER than HTTP 503
+# (code 503 / messageCode SSAMP_0006 = auth stack not yet ready).
+# On an uninitialised Portal the response will be an error about missing site,
+# not a 503 — that is fine, createNewSite will create it.
+echo "  Waiting for Portal auth stack to become ready (up to 10 min)..."
 _PORTAL_REST_READY=0
 for _pri in $(seq 1 60); do
-  _PRI_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
-    "https://localhost:7443/arcgis/sharing/rest/info?f=json" 2>/dev/null || true)
-  if [[ -n "$_PRI_CODE" && "$_PRI_CODE" != "000" && "$_PRI_CODE" != "503" ]]; then
-    echo "  Portal REST API ready (HTTP $_PRI_CODE)."
+  _PRI_RESP=$(curl -sk -o /dev/null -w '%{http_code}' \
+    -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+    -d "username=_readycheck_&password=_readycheck_&client=requestip&expiration=1&f=json" \
+    2>/dev/null || true)
+  # 503 means auth stack not up yet; 000 means process not listening
+  if [[ -n "$_PRI_RESP" && "$_PRI_RESP" != "000" && "$_PRI_RESP" != "503" ]]; then
+    echo "  Portal auth stack ready (HTTP $_PRI_RESP)."
     _PORTAL_REST_READY=1
     break
   fi
-  echo "    Portal REST API not ready yet (HTTP ${_PRI_CODE:-000}), attempt $_pri/60 — sleeping 10s..."
+  echo "    Portal auth stack not ready yet (HTTP ${_PRI_RESP:-000}), attempt $_pri/60 — sleeping 10s..."
   sleep 10
 done
 if [[ $_PORTAL_REST_READY -eq 0 ]]; then
-  echo "ERROR: Portal REST API did not become ready within 10 minutes." >&2
+  echo "ERROR: Portal auth stack did not become ready within 10 minutes." >&2
   exit 1
 fi
 
