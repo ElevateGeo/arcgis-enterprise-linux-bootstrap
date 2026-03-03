@@ -128,43 +128,74 @@ reset_arcgis_sites() {
   systemctl stop arcgisportal arcgisserver arcgisdatastore 2>/dev/null || true
   # Give processes time to terminate gracefully
   sleep 5
-  # Force kill any remaining processes
-  pkill -9 -u "$ARCGIS_USER" 2>/dev/null || true
+  
+  # Kill Portal's internal PostgreSQL explicitly
+  echo "Stopping Portal PostgreSQL processes..."
+  pkill -9 -f "arcgisportal.*postgres" 2>/dev/null || true
+  pkill -9 -f "postgres.*arcgisportal" 2>/dev/null || true
   sleep 2
+  
+  # Force kill any remaining ArcGIS processes
+  pkill -9 -u "$ARCGIS_USER" 2>/dev/null || true
+  sleep 3
 
-  echo "Resetting Portal site..."
-  # Portal stores its site configuration in usr/arcgisportal/
-  # The 'content' directory is the content store, 'etc' has config
-  # The internal PostgreSQL database is in 'db/'
-  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/content" 2>/dev/null || true
-  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/db" 2>/dev/null || true
-  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/etc" 2>/dev/null || true
-  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/index" 2>/dev/null || true
-  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal/temp" 2>/dev/null || true
-  # Remove user-level Portal state
+  echo "Resetting Portal site (clearing entire usr/arcgisportal)..."
+  # Portal stores ALL site state in usr/arcgisportal/ - clear everything
+  # This includes: db/ (PostgreSQL), content/, etc/, index/, security/, logs/
+  rm -rf "$ESRI_BASE/arcgis/portal/usr/arcgisportal" 2>/dev/null || true
+  # Recreate the directory structure that Portal expects
+  mkdir -p "$ESRI_BASE/arcgis/portal/usr/arcgisportal"
+  chown -R "$ARCGIS_USER":"$ARCGIS_USER" "$ESRI_BASE/arcgis/portal/usr/arcgisportal"
+  
+  # Remove user-level Portal state from home directory
   rm -rf /home/"$ARCGIS_USER"/.arcgis* 2>/dev/null || true
   rm -rf /home/"$ARCGIS_USER"/.com.esri* 2>/dev/null || true
+  rm -rf /home/"$ARCGIS_USER"/.ESRI* 2>/dev/null || true
+  rm -rf /home/"$ARCGIS_USER"/arcgis* 2>/dev/null || true
 
   echo "Resetting Server site..."
-  # Server stores site config in usr/directories/ and usr/config-store/
+  # Server stores site config in usr/ subdirectories
   rm -rf "$ESRI_BASE/arcgis/server/usr/config-store" 2>/dev/null || true
   rm -rf "$ESRI_BASE/arcgis/server/usr/directories" 2>/dev/null || true
-  rm -rf "$ESRI_BASE/arcgis/server/usr/arcgisserver/config-store" 2>/dev/null || true
+  rm -rf "$ESRI_BASE/arcgis/server/usr/arcgisserver" 2>/dev/null || true
+  mkdir -p "$ESRI_BASE/arcgis/server/usr"
+  chown -R "$ARCGIS_USER":"$ARCGIS_USER" "$ESRI_BASE/arcgis/server/usr"
 
   echo "Resetting DataStore..."
-  # DataStore stores its configuration in usr/arcgisdatastore/
   rm -rf "$ESRI_BASE/arcgis/datastore/usr/arcgisdatastore" 2>/dev/null || true
+  mkdir -p "$ESRI_BASE/arcgis/datastore/usr"
+  chown -R "$ARCGIS_USER":"$ARCGIS_USER" "$ESRI_BASE/arcgis/datastore/usr"
 
-  # Also clean up the shared content directory if it exists
+  # Clean up the shared content directory
   rm -rf "$ESRI_BASE/arcgis/usr" 2>/dev/null || true
+  mkdir -p "$ESRI_BASE/arcgis/usr/arcgisusr"
+  chown -R "$ARCGIS_USER":"$ARCGIS_USER" "$ESRI_BASE/arcgis/usr"
 
-  echo "Restarting ArcGIS services..."
+  echo "Starting Portal service (may take up to 2 minutes for first start)..."
   systemctl start arcgisportal 2>/dev/null || true
+  
+  # Wait for Portal to start and verify it's truly uninitialized
+  echo "Waiting for Portal to start and verifying reset..."
+  _RESET_OK=0
+  for _rv in $(seq 1 24); do  # 4 minutes max
+    sleep 10
+    _RESP=$(curl -sk "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || true)
+    if echo "$_RESP" | grep -q '"status":"error"'; then
+      if echo "$_RESP" | grep -qi 'not been initialized\|create a new site'; then
+        echo "  Portal is uninitialized (reset successful)."
+        _RESET_OK=1
+        break
+      fi
+    fi
+    echo "  Waiting for Portal to report uninitialized state ($_rv/24)..."
+  done
+  
+  if [[ $_RESET_OK -eq 0 ]]; then
+    echo "WARNING: Could not verify Portal reset. Response: ${_RESP:0:200}"
+  fi
+  
   systemctl start arcgisserver 2>/dev/null || true
   # Don't start DataStore yet - it needs Server to be configured first
-
-  echo "Waiting for services to start (30 seconds)..."
-  sleep 30
 
   echo "Reset complete. Run steps 5a-5g to recreate sites."
 }
@@ -784,11 +815,22 @@ else
       break
     fi
     
-    # Error 499 = Token Required means site already exists (race condition)
+    # Error 499 = Token Required - but we just checked site doesn't exist!
+    # This means Portal is in a corrupted state where it thinks it's initialized 
+    # but has no admin account. The --reset-sites didn't fully clean it.
     if [[ "$CREATE_CODE" == "499" ]]; then
-      echo "  createNewSite returned 499 (site already exists from concurrent creation)"
-      _CREATE_SUCCESS=1
-      break
+      echo ""
+      echo "ERROR: createNewSite returned 499 (Token Required) but site check said uninitialized." >&2
+      echo "  This indicates Portal is in a corrupted state." >&2
+      echo "  Portal thinks it's initialized but has no admin account." >&2
+      echo "" >&2
+      echo "  To fix:" >&2
+      echo "  1. Stop Portal: sudo systemctl stop arcgisportal" >&2
+      echo "  2. Kill PostgreSQL: sudo pkill -9 -f 'arcgisportal.*postgres'" >&2
+      echo "  3. Delete Portal data: sudo rm -rf /opt/esri/arcgis/portal/usr/arcgisportal/*" >&2
+      echo "  4. Start Portal: sudo systemctl start arcgisportal" >&2
+      echo "  5. Wait 2 min, then re-run: sudo ./install_builder.sh --steps 5a,5b,5c,5d,5e" >&2
+      exit 1
     fi
     
     # "already configured" or similar
