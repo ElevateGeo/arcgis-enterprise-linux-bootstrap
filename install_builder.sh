@@ -561,42 +561,46 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
-# Wait for Portal's authentication stack to be ready before doing anything.
-# Portal's web layer and even HTTP-level redirects can complete while the internal
-# identity/user store is still initialising. The definitive signal is: a POST to
-# generateToken returns a JSON body that does NOT contain SSAMP_0006 (the specific
-# "auth service not ready" error). Any other JSON response (including "invalid
-# credentials" or "site not initialised") means the stack is up.
-echo "  Waiting for Portal auth stack to become ready (up to 10 min)..."
+# Wait for Portal's auth stack to be ready AND check if Portal is already
+# initialized in a single combined loop. We use the same curl options as
+# _portal_token (no -L redirect following) so we always hit the real endpoint.
+#
+# Response outcomes:
+#   - contains a token                     → Portal initialized + credentials valid
+#   - SSAMP_0006 / empty body              → auth stack not ready yet → keep waiting
+#   - any other JSON error (incl. 401/400) → auth stack ready, Portal needs init
+#
+echo "  Waiting for Portal auth stack to be ready (up to 10 min)..."
+PTOKEN=""
 _PORTAL_REST_READY=0
 for _pri in $(seq 1 60); do
-  _PRI_BODY=$(curl -skL -X POST \
+  _PRI_RESP=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-    -d "username=_readycheck_&password=_readycheck_&client=requestip&expiration=1&f=json" \
+    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
     2>/dev/null || true)
-  # SSAMP_0006 = auth service still initialising; empty = process not listening yet
-  if [[ -n "$_PRI_BODY" ]] && ! echo "$_PRI_BODY" | grep -q 'SSAMP_0006'; then
-    echo "  Portal auth stack ready."
-    _PORTAL_REST_READY=1
-    break
+  if [[ -z "$_PRI_RESP" ]] || echo "$_PRI_RESP" | grep -q 'SSAMP_0006'; then
+    echo "    Portal auth stack not ready yet, attempt $_pri/60 — sleeping 10s..."
+    sleep 10
+    continue
   fi
-  echo "    Portal auth stack not ready yet (SSAMP_0006), attempt $_pri/60 — sleeping 10s..."
-  sleep 10
+  # Auth stack is up — check if we actually got a token
+  _PRI_TOK=$(echo "$_PRI_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+  if [[ -n "$_PRI_TOK" ]]; then
+    PTOKEN="$_PRI_TOK"
+    echo "  Portal already initialized and credentials verified."
+  else
+    echo "  Portal auth stack ready (no token — site not yet initialized)."
+  fi
+  _PORTAL_REST_READY=1
+  break
 done
 if [[ $_PORTAL_REST_READY -eq 0 ]]; then
   echo "ERROR: Portal auth stack did not become ready within 10 minutes." >&2
   exit 1
 fi
 
-# Strategy: try to get a token first. A valid token means Portal is already
-# initialized with the current credentials — skip createNewSite.
-# If no token, Portal is either uninitialized or mid-startup; call createNewSite.
-# createNewSite is idempotent — it errors distinctly when already configured.
-echo "  Checking if Portal is already initialized (attempting token)..."
-PTOKEN=$(_portal_token)
-
 if [[ -n "$PTOKEN" ]]; then
-  echo "  Portal already initialized and credentials verified."
+  : # already initialized — PTOKEN set above
 else
   echo "  No token — Portal not yet initialized. Calling createNewSite..."
   CONTENT_STORE=$(printf \
