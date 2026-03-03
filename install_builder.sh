@@ -90,6 +90,14 @@ wipe_existing_enterprise() {
   # Also wipe any Esri user-level property files that record install state.
   rm -f /home/"$ARCGIS_USER"/.ESRI* /home/"$ARCGIS_USER"/.esri* 2>/dev/null || true
 
+  # Wipe Portal/Server/DataStore user-level state that persists outside the
+  # install directory. Portal in particular stores its init state & content
+  # store pointers under the arcgis user's home; if these survive, Portal
+  # considers itself already configured after a fresh reinstall.
+  rm -rf /home/"$ARCGIS_USER"/.arcgis* 2>/dev/null || true
+  rm -rf /home/"$ARCGIS_USER"/arcgis* 2>/dev/null || true
+  rm -rf /home/"$ARCGIS_USER"/.com.esri* 2>/dev/null || true
+
   echo "Wipe complete."
 }
 
@@ -614,14 +622,30 @@ if [[ -z "$PTOKEN" ]]; then
 
     CREATE_CODE=$(echo "$CREATE_RESULT" | jq -r '.error.code // empty' 2>/dev/null || true)
 
-    # code 499 = Token Required → Portal IS already initialized (credentials mismatch)
+    # code 499 = Token Required → Portal IS already initialized.
+    # The quick generateToken check may have run before Portal was fully up.
+    # Now that Portal is responding, try generateToken again.
     if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
-      echo "ERROR: Portal is already initialized but token generation failed." >&2
-      echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
-      echo "  Options:" >&2
-      echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the existing credentials." >&2
-      echo "    2. Run with --wipe to destroy and fully reinstall (DESTRUCTIVE)." >&2
-      exit 1
+      echo "  Portal is already initialized (createNewSite returned 499). Re-checking credentials..."
+      _RETRY_RESP=$("${CURL_ADM[@]}" -X POST \
+        "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+        -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+        2>/dev/null || true)
+      _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+      if [[ -n "$_RETRY_TOK" ]]; then
+        PTOKEN="$_RETRY_TOK"
+        echo "  Portal already initialized and credentials verified — skipping createNewSite."
+        _CNS_DONE=1
+        break
+      else
+        echo "ERROR: Portal is already initialized but token generation failed." >&2
+        echo "  generateToken response: $_RETRY_RESP" >&2
+        echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
+        echo "  Options:" >&2
+        echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the existing credentials." >&2
+        echo "    2. Run with --wipe to destroy and fully reinstall (DESTRUCTIVE)." >&2
+        exit 1
+      fi
     fi
 
     # Any other error → fatal
@@ -640,11 +664,13 @@ if [[ -z "$PTOKEN" ]]; then
     exit 1
   fi
 
-  echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
-  PTOKEN=$(_wait_portal_token 72) || {
-    echo "ERROR: Portal never became ready after createNewSite." >&2; exit 1
-  }
-  echo "  Portal site ready."
+  if [[ -z "$PTOKEN" ]]; then
+    echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
+    PTOKEN=$(_wait_portal_token 72) || {
+      echo "ERROR: Portal never became ready after createNewSite." >&2; exit 1
+    }
+    echo "  Portal site ready."
+  fi
 fi
 fi # end step 5a
 
