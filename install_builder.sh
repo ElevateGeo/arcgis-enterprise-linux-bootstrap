@@ -561,48 +561,51 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
-# Wait for Portal's auth stack to be ready AND check if Portal is already
-# initialized in a single combined loop. We use the same curl options as
-# _portal_token (no -L redirect following) so we always hit the real endpoint.
-#
-# Response outcomes:
-#   - contains a token                     → Portal initialized + credentials valid
-#   - SSAMP_0006 / empty body              → auth stack not ready yet → keep waiting
-#   - any other JSON error (incl. 401/400) → auth stack ready, Portal needs init
-#
-echo "  Waiting for Portal auth stack to be ready (up to 10 min)..."
-PTOKEN=""
-_PORTAL_REST_READY=0
-for _pri in $(seq 1 60); do
-  _PRI_RESP=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+# Phase 1: Wait for the Portal admin API to become accessible (no auth needed).
+# On a fresh (wipe) install, generateToken always returns SSAMP_0006 until
+# createNewSite is called, so we CANNOT use generateToken as the readiness
+# signal on an uninitialized portal. Instead we poll /portaladmin which
+# returns JSON (without auth) as soon as the admin service is up.
+echo "  Waiting for Portal admin API to be ready (up to 10 min)..."
+_PORTAL_ADMIN_READY=0
+for _pai in $(seq 1 60); do
+  _PAI_RESP=$("${CURL_ADM[@]}" \
+    "https://localhost:7443/arcgis/portaladmin/?f=json" \
     2>/dev/null || true)
-  if [[ -z "$_PRI_RESP" ]] || echo "$_PRI_RESP" | grep -q 'SSAMP_0006'; then
-    echo "    Portal auth stack not ready yet, attempt $_pri/60 — sleeping 10s..."
-    sleep 10
-    continue
+  if [[ -n "$_PAI_RESP" ]] && echo "$_PAI_RESP" | grep -q '{' && ! echo "$_PAI_RESP" | grep -q 'recheckAfterSeconds'; then
+    echo "  Portal admin API is up (attempt $_pai)."
+    _PORTAL_ADMIN_READY=1
+    break
   fi
-  # Auth stack is up — check if we actually got a token
-  _PRI_TOK=$(echo "$_PRI_RESP" | jq -r '.token // empty' 2>/dev/null || true)
-  if [[ -n "$_PRI_TOK" ]]; then
-    PTOKEN="$_PRI_TOK"
-    echo "  Portal already initialized and credentials verified."
-  else
-    echo "  Portal auth stack ready (no token — site not yet initialized)."
-  fi
-  _PORTAL_REST_READY=1
-  break
+  echo "    Portal admin API not ready yet, attempt $_pai/60 — sleeping 10s..."
+  sleep 10
 done
-if [[ $_PORTAL_REST_READY -eq 0 ]]; then
-  echo "ERROR: Portal auth stack did not become ready within 10 minutes." >&2
+if [[ $_PORTAL_ADMIN_READY -eq 0 ]]; then
+  echo "ERROR: Portal admin API did not become ready within 10 minutes." >&2
   exit 1
+fi
+
+# Phase 2: Now that the admin API is up, check initialization state by trying
+# generateToken ONCE. On an uninitialized portal this will fail (SSAMP_0006 or
+# similar) — that is expected and we proceed to createNewSite. On an already-
+# initialized portal we get a token and skip createNewSite.
+PTOKEN=""
+_PRI_RESP=$("${CURL_ADM[@]}" -X POST \
+  "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+  -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+  2>/dev/null || true)
+_PRI_TOK=$(echo "$_PRI_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+if [[ -n "$_PRI_TOK" ]]; then
+  PTOKEN="$_PRI_TOK"
+  echo "  Portal already initialized and credentials verified."
+else
+  echo "  No token from generateToken — Portal not yet initialized (will call createNewSite)."
+  echo "  generateToken response: $_PRI_RESP"
 fi
 
 if [[ -n "$PTOKEN" ]]; then
   : # already initialized — PTOKEN set above
 else
-  echo "  No token — Portal not yet initialized. Calling createNewSite..."
   CONTENT_STORE=$(printf \
     '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
     "$ESRI_BASE/arcgis/usr/arcgisusr")
