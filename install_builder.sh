@@ -562,26 +562,25 @@ if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
 # Wait for Portal's authentication stack to be ready before doing anything.
-# Portal's web layer (HTTP 200 on /portaladmin/) and even /sharing/rest/info
-# can return 200 while the internal identity/user store is still initialising.
-# The definitive signal is: generateToken returns something OTHER than HTTP 503
-# (code 503 / messageCode SSAMP_0006 = auth stack not yet ready).
-# On an uninitialised Portal the response will be an error about missing site,
-# not a 503 — that is fine, createNewSite will create it.
+# Portal's web layer and even HTTP-level redirects can complete while the internal
+# identity/user store is still initialising. The definitive signal is: a POST to
+# generateToken returns a JSON body that does NOT contain SSAMP_0006 (the specific
+# "auth service not ready" error). Any other JSON response (including "invalid
+# credentials" or "site not initialised") means the stack is up.
 echo "  Waiting for Portal auth stack to become ready (up to 10 min)..."
 _PORTAL_REST_READY=0
 for _pri in $(seq 1 60); do
-  _PRI_RESP=$(curl -sk -o /dev/null -w '%{http_code}' \
-    -X POST "https://localhost:7443/arcgis/sharing/rest/generateToken" \
+  _PRI_BODY=$(curl -skL -X POST \
+    "https://localhost:7443/arcgis/sharing/rest/generateToken" \
     -d "username=_readycheck_&password=_readycheck_&client=requestip&expiration=1&f=json" \
     2>/dev/null || true)
-  # 503 means auth stack not up yet; 000 means process not listening
-  if [[ -n "$_PRI_RESP" && "$_PRI_RESP" != "000" && "$_PRI_RESP" != "503" ]]; then
-    echo "  Portal auth stack ready (HTTP $_PRI_RESP)."
+  # SSAMP_0006 = auth service still initialising; empty = process not listening yet
+  if [[ -n "$_PRI_BODY" ]] && ! echo "$_PRI_BODY" | grep -q 'SSAMP_0006'; then
+    echo "  Portal auth stack ready."
     _PORTAL_REST_READY=1
     break
   fi
-  echo "    Portal auth stack not ready yet (HTTP ${_PRI_RESP:-000}), attempt $_pri/60 — sleeping 10s..."
+  echo "    Portal auth stack not ready yet (SSAMP_0006), attempt $_pri/60 — sleeping 10s..."
   sleep 10
 done
 if [[ $_PORTAL_REST_READY -eq 0 ]]; then
