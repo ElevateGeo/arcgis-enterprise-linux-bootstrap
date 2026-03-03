@@ -774,17 +774,21 @@ if _portal_site_exists; then
 else
   # Site doesn't exist — create it
   echo "  Portal site does not exist. Creating new site..."
+  echo "  NOTE: createNewSite can take 3-5 minutes. Please wait..."
   
   CONTENT_STORE=$(printf \
     '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
     "$ESRI_BASE/arcgis/usr/arcgisusr")
 
-  # Call createNewSite - retry until we get a valid response
+  # Call createNewSite with LONG timeout (600s = 10 min) - this operation can take several minutes
+  # Using separate curl call instead of CURL_ADM to avoid the 90s max-time limit
   _CREATE_SUCCESS=0
-  for _cns in $(seq 1 90); do
-    CREATE_RESULT=$("${CURL_ADM[@]}" -X POST \
-      "https://localhost:7443/arcgis/portaladmin/createNewSite" \
-      -H "Referer: referer" \
+  for _cns in $(seq 1 30); do
+    echo "    createNewSite attempt $_cns/30 (timeout: 10 min)..."
+    CREATE_RESULT=$(curl -sk --noproxy '*' --connect-timeout 30 --max-time 600 \
+      -X POST "https://localhost:7443/arcgis/portaladmin/createNewSite" \
+      -H "Referer: https://localhost:7443/arcgis" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
       --data-urlencode "username=$ADMIN_USER" \
       --data-urlencode "password=$ADMIN_PASS" \
       --data-urlencode "fullname=$ADMIN_FIRST $ADMIN_LAST" \
@@ -793,11 +797,12 @@ else
       --data-urlencode "securityQuestionIdx=1" \
       --data-urlencode "securityQuestionAns=$ADMIN_SECURITY_ANSWER" \
       --data-urlencode "contentStore=$CONTENT_STORE" \
-      -d "f=json" 2>/dev/null || true)
+      --data-urlencode "f=json" \
+      2>/dev/null || true)
 
-    # Empty or non-JSON → Portal not ready yet, OR request timed out but may have triggered init
+    # Empty or non-JSON → Portal not ready yet
     if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
-      echo "    createNewSite attempt $_cns/90: not ready yet (empty/non-JSON) — sleeping 30s..."
+      echo "    createNewSite: no response yet — sleeping 30s..."
       sleep 30
       # Re-check if site now exists (request may have triggered init)
       if _portal_site_exists 2>/dev/null; then
@@ -885,7 +890,7 @@ else
   done
 
   if [[ $_CREATE_SUCCESS -eq 0 ]]; then
-    echo "ERROR: createNewSite never returned a valid response within 15 minutes." >&2
+    echo "ERROR: createNewSite never succeeded." >&2
     exit 1
   fi
 
