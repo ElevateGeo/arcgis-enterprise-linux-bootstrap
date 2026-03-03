@@ -238,6 +238,7 @@ prompt_val ADMIN_USER "Admin Username" "siteadmin"
 prompt_val ADMIN_PASS "Admin Password" # secret
 prompt_val ADMIN_FIRST "Admin First" "Site"
 prompt_val ADMIN_LAST "Admin Last" "Admin"
+prompt_val ADMIN_SECURITY_ANSWER "Security Question Answer" "Blue"
 prompt_val CF_API_TOKEN "Cloudflare API Token" 
 
 mkdir -p "$ESRI_BASE/licenses"
