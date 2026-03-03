@@ -517,29 +517,68 @@ fi # end pre-step 5
 CURL_ADM=(curl -sk --noproxy '*' --connect-timeout 10 --max-time 90)
 
 # ---------- Token helpers ----------
-# Portal tokens are issued by sharing/rest/generateToken.
-# The portaladmin API *consumes* those tokens — it does not issue them.
-# configurebasedeployment may store the FQDN in any case (e.g. GIS.ELEVATEGEO.DEV)
-# and Portal's token endpoint enforces that the request Host header matches.
-# We try localhost (bypasses Host matching) and the FQDN in both cases/lower.
+# Portal tokens can be generated via:
+#   1. /sharing/rest/generateToken (primary user-facing endpoint)
+#   2. /portaladmin/generateToken (admin endpoint, works during startup)
+#
+# Per Esri's Chef cookbook, use client=referer with referer='referer' (literal string).
 # Always returns 0; callers check for empty string.
 _portal_token() {
   local resp tok
-  for _token_host in "localhost:7443" "$DOMAIN:7443" "${DOMAIN^^}:7443"; do
-    resp=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
-      "https://${_token_host}/arcgis/sharing/rest/generateToken" \
-      -H "Referer: https://localhost:7443/arcgis" \
-      --data-urlencode "username=$ADMIN_USER" \
-      --data-urlencode "password=$ADMIN_PASS" \
-      -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
-      -d "expiration=120" -d "f=json" \
-      2>/dev/null || true)
-    tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-    if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+  local _ep _token_host
+  # Try multiple host variations
+  for _token_host in "localhost:7443" "$DOMAIN:7443" "${DOMAIN^^}:7443" "${DOMAIN,,}:7443"; do
+    # Try both endpoints - portaladmin first (often works during startup when sharing/rest doesn't)
+    for _ep in "portaladmin/generateToken" "sharing/rest/generateToken"; do
+      # Per Esri cookbook: use literal 'referer' as the referer value
+      resp=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
+        "https://${_token_host}/arcgis/${_ep}" \
+        -H "Referer: referer" \
+        --data-urlencode "username=$ADMIN_USER" \
+        --data-urlencode "password=$ADMIN_PASS" \
+        -d "client=referer" -d "referer=referer" \
+        -d "expiration=600" -d "f=json" \
+        2>/dev/null || true)
+      tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+      if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
+    done
   done
   echo "  [_portal_token] All generateToken attempts failed. Last response: $resp" >&2
   echo ""
   return 0   # callers check for empty string, not exit code
+}
+
+# ---------------------------------------------------------------------------
+# Check if Portal site exists (per Esri cookbook logic)
+# Returns 0 (true) if site exists (error.code == 499), 1 (false) otherwise
+# ---------------------------------------------------------------------------
+_portal_site_exists() {
+  local resp code status
+  resp=$("${CURL_ADM[@]}" "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || true)
+  
+  # Check for error.code == 499 (Token Required) - this means site IS initialized
+  code=$(echo "$resp" | jq -r '.error.code // empty' 2>/dev/null || true)
+  if [[ "$code" == "499" ]]; then
+    echo "  [site_exists] Portal site exists (error.code=499, token required)" >&2
+    return 0
+  fi
+  
+  # Check status field - if "error" with "not initialized" message, site doesn't exist
+  status=$(echo "$resp" | jq -r '.status // empty' 2>/dev/null || true)
+  if [[ "$status" == "error" ]]; then
+    echo "  [site_exists] Portal site does NOT exist (status=error)" >&2
+    echo "  [site_exists] Response: ${resp:0:200}" >&2
+    return 1
+  fi
+  
+  # If we get a valid response without error, site exists
+  if echo "$resp" | jq -e '.version' >/dev/null 2>&1; then
+    echo "  [site_exists] Portal site exists (got version info)" >&2
+    return 0
+  fi
+  
+  echo "  [site_exists] Unknown state. Response: ${resp:0:200}" >&2
+  return 1
 }
 
 _server_token() {
@@ -577,132 +616,175 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
-# Strategy: try generateToken once — if we get a token, Portal is already
-# initialized and we skip createNewSite entirely. Otherwise, retry
-# createNewSite in a loop (up to 15 min). The createNewSite endpoint is the
-# true readiness signal: it returns an actionable JSON response only when
-# Portal's admin service is fully ready. We use || true on every curl so
-# set -e never kills us on a transient connection failure.
+# Per Esri's Chef cookbook, the correct flow is:
+#   1. Check if site exists via /portaladmin/?f=json (error.code 499 = exists)
+#   2. If site exists, get token
+#   3. If site doesn't exist, call createNewSite
+#   4. Wait for site to fully initialize (site_exists returns true)
+#   5. Then get token
 PTOKEN=""
 
-# Quick check: is Portal already initialized?
-echo "  Checking if Portal is already initialized..."
-_CHK_RESP=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
-  "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-  -H "Referer: https://localhost:7443/arcgis" \
-  --data-urlencode "username=$ADMIN_USER" \
-  --data-urlencode "password=$ADMIN_PASS" \
-  -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
-  -d "expiration=120" -d "f=json" \
-  2>/dev/null || true)
-_CHK_TOK=$(echo "$_CHK_RESP" | jq -r '.token // empty' 2>/dev/null || true)
-if [[ -n "$_CHK_TOK" ]]; then
-  PTOKEN="$_CHK_TOK"
-  echo "  Portal already initialized and credentials verified — skipping createNewSite."
+# First, check if Portal's admin endpoint is reachable at all
+echo "  Waiting for Portal admin endpoint to be reachable..."
+_PORTAL_UP=0
+for _pu in $(seq 1 60); do
+  _PCHECK=$("${CURL_ADM[@]}" "https://localhost:7443/arcgis/portaladmin/?f=json" 2>/dev/null || true)
+  if [[ -n "$_PCHECK" ]] && echo "$_PCHECK" | grep -q '{'; then
+    _PORTAL_UP=1
+    echo "  Portal admin endpoint is reachable."
+    break
+  fi
+  echo "    Portal not reachable yet (attempt $_pu/60) — sleeping 10s..."
+  sleep 10
+done
+
+if [[ $_PORTAL_UP -eq 0 ]]; then
+  echo "ERROR: Portal admin endpoint never became reachable within 10 minutes." >&2
+  echo "  Check if Portal service is running: systemctl status arcgisportal" >&2
+  exit 1
 fi
 
-if [[ -z "$PTOKEN" ]]; then
-  # Portal is not yet initialized (or not yet ready). Retry createNewSite
-  # until it returns a well-formed JSON response (up to 15 min / 90 attempts).
-  echo "  Portal not yet initialized. Will call createNewSite (retrying up to 15 min)..."
+# Check if site already exists (per Esri cookbook: error.code 499 means site exists)
+echo "  Checking if Portal site already exists..."
+if _portal_site_exists; then
+  echo "  Portal site already exists. Attempting to get token..."
+  PTOKEN=$(_portal_token 2>/dev/null) || PTOKEN=""
+  if [[ -n "$PTOKEN" ]]; then
+    echo "  Successfully obtained token — Portal is ready."
+  else
+    echo "  WARNING: Site exists but cannot get token. This may indicate:"
+    echo "    - Credentials mismatch (different admin account was used to create the site)"
+    echo "    - Portal is still initializing internally"
+    echo "  Will retry token acquisition for up to 5 minutes..."
+    for _tok_retry in $(seq 1 30); do
+      PTOKEN=$(_portal_token 2>/dev/null) || PTOKEN=""
+      if [[ -n "$PTOKEN" ]]; then
+        echo "  Token obtained on retry $_tok_retry."
+        break
+      fi
+      echo "    Token retry $_tok_retry/30 — sleeping 10s..."
+      sleep 10
+    done
+    if [[ -z "$PTOKEN" ]]; then
+      echo "ERROR: Portal site exists but cannot authenticate." >&2
+      echo "  This usually means Portal was created with different credentials." >&2
+      echo "  To fix: run with --wipe to delete and recreate Portal." >&2
+      exit 1
+    fi
+  fi
+else
+  # Site doesn't exist — create it
+  echo "  Portal site does not exist. Creating new site..."
+  
   CONTENT_STORE=$(printf \
     '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
     "$ESRI_BASE/arcgis/usr/arcgisusr")
 
-  _CNS_DONE=0
+  # Call createNewSite - retry until we get a valid response
+  _CREATE_SUCCESS=0
   for _cns in $(seq 1 90); do
     CREATE_RESULT=$("${CURL_ADM[@]}" -X POST \
       "https://localhost:7443/arcgis/portaladmin/createNewSite" \
+      -H "Referer: referer" \
       --data-urlencode "username=$ADMIN_USER" \
       --data-urlencode "password=$ADMIN_PASS" \
       --data-urlencode "fullname=$ADMIN_FIRST $ADMIN_LAST" \
       --data-urlencode "email=$EMAIL" \
       --data-urlencode "description=" \
-      --data-urlencode "securityQuestionId=1" \
-      --data-urlencode "securityQuestionAns=Blue" \
+      --data-urlencode "securityQuestionIdx=1" \
+      --data-urlencode "securityQuestionAns=$ADMIN_SECURITY_ANSWER" \
       --data-urlencode "contentStore=$CONTENT_STORE" \
       -d "f=json" 2>/dev/null || true)
 
-    # Empty or non-JSON → Portal not ready yet, keep waiting
+    # Empty or non-JSON → Portal not ready yet
     if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
       echo "    createNewSite attempt $_cns/90: not ready yet (empty/non-JSON) — sleeping 10s..."
       sleep 10
       continue
     fi
 
-    echo "  createNewSite result (attempt $_cns): $CREATE_RESULT"
+    echo "  createNewSite response: ${CREATE_RESULT:0:300}"
 
+    # Check for errors
     CREATE_CODE=$(echo "$CREATE_RESULT" | jq -r '.error.code // empty' 2>/dev/null || true)
-
-    # code 499 = Token Required → Portal IS already initialized.
-    # The quick generateToken check may have run before Portal was fully up.
-    # The sharing/rest servlet can lag significantly behind the admin servlet
-    # (Portal's internal startup sequence), so retry for up to 15 min.
-    if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
-      echo "  Portal is already initialized (createNewSite returned 499). Waiting for sharing/rest to be ready (up to 15 min)..."
-      _RETRY_TOK=""
-      _RETRY_RESP=""
-      for _rt in $(seq 1 90); do
-        _RETRY_RESP=$("${CURL_ADM[@]}" --post301 --post302 -L -X POST \
-          "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-          -H "Referer: https://localhost:7443/arcgis" \
-          --data-urlencode "username=$ADMIN_USER" \
-          --data-urlencode "password=$ADMIN_PASS" \
-          -d "client=referer" -d "referer=https://localhost:7443/arcgis" \
-          -d "expiration=120" -d "f=json" \
-          2>/dev/null || true)
-        _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
-        if [[ -n "$_RETRY_TOK" ]]; then
-          break
-        fi
-        # Every 5 attempts, also check /sharing/rest/info for diagnostics
-        if (( _rt % 5 == 0 )); then
-          _INFO_RESP=$("${CURL_ADM[@]}" \
-            "https://localhost:7443/arcgis/sharing/rest/info?f=json" \
-            2>/dev/null || true)
-          echo "    [diag] /sharing/rest/info: ${_INFO_RESP:0:200}"
-        fi
-        echo "    generateToken attempt $_rt/90: no token yet (response: ${_RETRY_RESP:0:120}) — sleeping 10s..."
-        sleep 10
-      done
-      if [[ -n "$_RETRY_TOK" ]]; then
-        PTOKEN="$_RETRY_TOK"
-        echo "  Portal already initialized and credentials verified — skipping createNewSite."
-        _CNS_DONE=1
-        break
-      else
-        echo "ERROR: Portal sharing/rest did not respond to generateToken within 15 minutes." >&2
-        echo "  Last generateToken response: $_RETRY_RESP" >&2
-        echo "  If response is empty, sharing/rest may still be starting — try running again without --wipe." >&2
-        echo "  If response shows a credentials error, update ADMIN_USER/ADMIN_PASS in .env." >&2
-        exit 1
-      fi
+    CREATE_MSG=$(echo "$CREATE_RESULT" | jq -r '.error.message // empty' 2>/dev/null || true)
+    
+    # Success response or status=success
+    if echo "$CREATE_RESULT" | jq -e '.status == "success"' >/dev/null 2>&1; then
+      echo "  createNewSite succeeded!"
+      _CREATE_SUCCESS=1
+      break
     fi
-
-    # Any other error → fatal
-    if echo "$CREATE_RESULT" | grep -q '"error"'; then
-      echo "ERROR: Portal createNewSite failed. See result above." >&2
+    
+    # Error 499 = Token Required means site already exists (race condition)
+    if [[ "$CREATE_CODE" == "499" ]]; then
+      echo "  createNewSite returned 499 (site already exists from concurrent creation)"
+      _CREATE_SUCCESS=1
+      break
+    fi
+    
+    # "already configured" or similar
+    if echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized\|already exists'; then
+      echo "  createNewSite: site already configured"
+      _CREATE_SUCCESS=1
+      break
+    fi
+    
+    # Any other error
+    if [[ -n "$CREATE_CODE" ]]; then
+      echo "ERROR: createNewSite failed with code $CREATE_CODE: $CREATE_MSG" >&2
       exit 1
     fi
-
-    # Success
-    _CNS_DONE=1
+    
+    # Got a response but unclear status - treat as success and continue
+    echo "  createNewSite returned, waiting for site to fully initialize..."
+    _CREATE_SUCCESS=1
     break
   done
 
-  if [[ $_CNS_DONE -eq 0 ]]; then
+  if [[ $_CREATE_SUCCESS -eq 0 ]]; then
     echo "ERROR: createNewSite never returned a valid response within 15 minutes." >&2
     exit 1
   fi
 
+  # Wait for site to be fully initialized (site_exists returns true)
+  echo "  Waiting for Portal site to be fully initialized (up to 10 min)..."
+  _SITE_READY=0
+  for _sr in $(seq 1 60); do
+    if _portal_site_exists; then
+      _SITE_READY=1
+      echo "  Portal site is now initialized."
+      break
+    fi
+    echo "    Site initialization check $_sr/60 — sleeping 10s..."
+    sleep 10
+  done
+
+  if [[ $_SITE_READY -eq 0 ]]; then
+    echo "ERROR: Portal site did not become ready within 10 minutes after createNewSite." >&2
+    exit 1
+  fi
+
+  # Now get token
+  echo "  Waiting for Portal to accept tokens (up to 5 min)..."
+  for _tok in $(seq 1 30); do
+    PTOKEN=$(_portal_token 2>/dev/null) || PTOKEN=""
+    if [[ -n "$PTOKEN" ]]; then
+      echo "  Successfully obtained token."
+      break
+    fi
+    echo "    Token attempt $_tok/30 — sleeping 10s..."
+    sleep 10
+  done
+
   if [[ -z "$PTOKEN" ]]; then
-    echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
-    PTOKEN=$(_wait_portal_token 72) || {
-      echo "ERROR: Portal never became ready after createNewSite." >&2; exit 1
-    }
-    echo "  Portal site ready."
+    echo "ERROR: Portal site created but cannot get token." >&2
+    echo "  Check Portal logs at /opt/esri/arcgis/portal/usr/arcgisportal/logs/" >&2
+    exit 1
   fi
 fi
+
+echo "  Step 5a complete. Portal site is ready."
 fi # end step 5a
 
 # ---------- Step 5b: Apply Portal license ----------
