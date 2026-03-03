@@ -561,92 +561,83 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
-# Phase 1: Wait for the Portal admin API to become accessible (no auth needed).
-# On a fresh (wipe) install, generateToken always returns SSAMP_0006 until
-# createNewSite is called, so we CANNOT use generateToken as the readiness
-# signal on an uninitialized portal. Instead we poll /portaladmin which
-# returns JSON (without auth) as soon as the admin service is up.
-echo "  Waiting for Portal admin API to be ready (up to 10 min)..."
-_PORTAL_ADMIN_READY=0
-for _pai in $(seq 1 60); do
-  _PAI_RESP=$("${CURL_ADM[@]}" \
-    "https://localhost:7443/arcgis/portaladmin/?f=json" \
-    2>/dev/null || true)
-  if [[ -n "$_PAI_RESP" ]] && echo "$_PAI_RESP" | grep -q '{' && ! echo "$_PAI_RESP" | grep -q 'recheckAfterSeconds'; then
-    echo "  Portal admin API is up (attempt $_pai)."
-    _PORTAL_ADMIN_READY=1
-    break
-  fi
-  echo "    Portal admin API not ready yet, attempt $_pai/60 — sleeping 10s..."
-  sleep 10
-done
-if [[ $_PORTAL_ADMIN_READY -eq 0 ]]; then
-  echo "ERROR: Portal admin API did not become ready within 10 minutes." >&2
-  exit 1
-fi
-
-# Phase 2: Now that the admin API is up, check initialization state by trying
-# generateToken ONCE. On an uninitialized portal this will fail (SSAMP_0006 or
-# similar) — that is expected and we proceed to createNewSite. On an already-
-# initialized portal we get a token and skip createNewSite.
+# Strategy: try generateToken once — if we get a token, Portal is already
+# initialized and we skip createNewSite entirely. Otherwise, retry
+# createNewSite in a loop (up to 15 min). The createNewSite endpoint is the
+# true readiness signal: it returns an actionable JSON response only when
+# Portal's admin service is fully ready. We use || true on every curl so
+# set -e never kills us on a transient connection failure.
 PTOKEN=""
-_PRI_RESP=$("${CURL_ADM[@]}" -X POST \
+
+# Quick check: is Portal already initialized?
+echo "  Checking if Portal is already initialized..."
+_CHK_RESP=$("${CURL_ADM[@]}" -X POST \
   "https://localhost:7443/arcgis/sharing/rest/generateToken" \
   -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
   2>/dev/null || true)
-_PRI_TOK=$(echo "$_PRI_RESP" | jq -r '.token // empty' 2>/dev/null || true)
-if [[ -n "$_PRI_TOK" ]]; then
-  PTOKEN="$_PRI_TOK"
-  echo "  Portal already initialized and credentials verified."
-else
-  echo "  No token from generateToken — Portal not yet initialized (will call createNewSite)."
-  echo "  generateToken response: $_PRI_RESP"
+_CHK_TOK=$(echo "$_CHK_RESP" | jq -r '.token // empty' 2>/dev/null || true)
+if [[ -n "$_CHK_TOK" ]]; then
+  PTOKEN="$_CHK_TOK"
+  echo "  Portal already initialized and credentials verified — skipping createNewSite."
 fi
 
-if [[ -n "$PTOKEN" ]]; then
-  : # already initialized — PTOKEN set above
-else
+if [[ -z "$PTOKEN" ]]; then
+  # Portal is not yet initialized (or not yet ready). Retry createNewSite
+  # until it returns a well-formed JSON response (up to 15 min / 90 attempts).
+  echo "  Portal not yet initialized. Will call createNewSite (retrying up to 15 min)..."
   CONTENT_STORE=$(printf \
     '{"type":"fileStore","provider":"FileSystem","connectionString":{"rootDir":"%s"}}' \
     "$ESRI_BASE/arcgis/usr/arcgisusr")
 
-  CREATE_RESULT=$("${CURL_ADM[@]}" -X POST \
-    "https://localhost:7443/arcgis/portaladmin/createNewSite" \
-    --data-urlencode "username=$ADMIN_USER" \
-    --data-urlencode "password=$ADMIN_PASS" \
-    --data-urlencode "fullname=$ADMIN_FIRST $ADMIN_LAST" \
-    --data-urlencode "email=$EMAIL" \
-    --data-urlencode "description=" \
-    --data-urlencode "securityQuestionId=1" \
-    --data-urlencode "securityQuestionAns=Blue" \
-    --data-urlencode "contentStore=$CONTENT_STORE" \
-    -d "f=json" 2>/dev/null)
-  echo "  createNewSite result: $CREATE_RESULT"
+  _CNS_DONE=0
+  for _cns in $(seq 1 90); do
+    CREATE_RESULT=$("${CURL_ADM[@]}" -X POST \
+      "https://localhost:7443/arcgis/portaladmin/createNewSite" \
+      --data-urlencode "username=$ADMIN_USER" \
+      --data-urlencode "password=$ADMIN_PASS" \
+      --data-urlencode "fullname=$ADMIN_FIRST $ADMIN_LAST" \
+      --data-urlencode "email=$EMAIL" \
+      --data-urlencode "description=" \
+      --data-urlencode "securityQuestionId=1" \
+      --data-urlencode "securityQuestionAns=Blue" \
+      --data-urlencode "contentStore=$CONTENT_STORE" \
+      -d "f=json" 2>/dev/null || true)
 
-  # If the result is empty or clearly not JSON (e.g. HTML page), Portal was not
-  # ready to accept the createNewSite call despite passing the REST-ready check.
-  if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
-    echo "ERROR: createNewSite returned an empty or non-JSON response — Portal may not be ready." >&2
-    echo "  Raw response: '$CREATE_RESULT'" >&2
+    # Empty or non-JSON → Portal not ready yet, keep waiting
+    if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
+      echo "    createNewSite attempt $_cns/90: not ready yet (empty/non-JSON) — sleeping 10s..."
+      sleep 10
+      continue
+    fi
+
+    echo "  createNewSite result (attempt $_cns): $CREATE_RESULT"
+
+    CREATE_CODE=$(echo "$CREATE_RESULT" | jq -r '.error.code // empty' 2>/dev/null || true)
+
+    # code 499 = Token Required → Portal IS already initialized (credentials mismatch)
+    if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
+      echo "ERROR: Portal is already initialized but token generation failed." >&2
+      echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
+      echo "  Options:" >&2
+      echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the existing credentials." >&2
+      echo "    2. Run with --wipe to destroy and fully reinstall (DESTRUCTIVE)." >&2
+      exit 1
+    fi
+
+    # Any other error → fatal
+    if echo "$CREATE_RESULT" | grep -q '"error"'; then
+      echo "ERROR: Portal createNewSite failed. See result above." >&2
+      exit 1
+    fi
+
+    # Success
+    _CNS_DONE=1
+    break
+  done
+
+  if [[ $_CNS_DONE -eq 0 ]]; then
+    echo "ERROR: createNewSite never returned a valid response within 15 minutes." >&2
     exit 1
-  fi
-
-  # code 499 "Token Required" from createNewSite means Portal IS already
-  # initialized (that endpoint only requires auth on an existing site).
-  # A prior run (e.g. configurebasedeployment) created the Portal site but
-  # the credentials in .env don't match what was used.
-  CREATE_CODE=$(echo "$CREATE_RESULT" | jq -r '.error.code // empty' 2>/dev/null || true)
-  if [[ "$CREATE_CODE" == "499" ]] || echo "$CREATE_RESULT" | grep -qi 'already configured\|already initialized'; then
-    echo "ERROR: Portal is already initialized but token generation failed." >&2
-    echo "  ADMIN_USER/ADMIN_PASS in .env likely don't match the Portal's stored credentials." >&2
-    echo "  Options:" >&2
-    echo "    1. Update ADMIN_USER/ADMIN_PASS in .env to match the credentials used during initial Portal setup." >&2
-    echo "    2. Run with --wipe to destroy and fully reinstall (DESTRUCTIVE — all data lost)." >&2
-    exit 1
-  fi
-
-  if echo "$CREATE_RESULT" | grep -q '"error"'; then
-    echo "ERROR: Portal createNewSite failed. See result above." >&2; exit 1
   fi
 
   echo "  Portal site creation started. Waiting for it to become ready (up to 12 min)..."
