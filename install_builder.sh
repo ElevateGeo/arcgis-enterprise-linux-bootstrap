@@ -305,12 +305,12 @@ if [[ ! -f "$ESRI_BASE/arcgis/server/startserver.sh" || ! -f "$ESRI_BASE/arcgis/
   chown -R "$ARCGIS_USER:$ARCGIS_USER" "$ESRI_BASE/arcgis"
   
   # Note: Builder installs all components. Takes time.
-  # Builder Setup does NOT support -a flag directly.
+  # Pass -a to authorize Server during installation (avoids "NO_AUTH_FILE_SUPPLIED" in log).
   # Use 'bash -c' to ensure correct environment (HOME, CWD) for the installer.
   echo "Invoking installer as $ARCGIS_USER (forcing clean env)..."
   # Explicitly raise the file-handle limit inside the subprocess so the ArcGIS
   # installer diagnostics (DIAG029) see >= 65536, regardless of PAM session state.
-  sudo -u "$ARCGIS_USER" bash -c "ulimit -Sn 65536; ulimit -Hn 65536; cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\""
+  sudo -u "$ARCGIS_USER" bash -c "ulimit -Sn 65536; ulimit -Hn 65536; cd ~; export HOME=~; \"$SETUP_SCRIPT\" -m silent -l yes -d \"$ESRI_BASE/arcgis\" -s \"$SERVER_LIC\""
 fi
 
 echo "Post-install directory structure:"
@@ -561,6 +561,30 @@ _wait_portal_token() {
 if step_enabled "5a"; then
 echo ">>> Step 5a: Creating Portal site..."
 
+# Wait for Portal's REST/sharing layer to be ready before doing anything.
+# Portal's web layer (HTTP 200 on /portaladmin/) can be up while the internal
+# Java app is still initialising — generateToken returns HTTP 503 in that window.
+# We must not call createNewSite or generateToken until the sharing REST API is
+# actually responding (anything other than 503 / 000 is acceptable here, because
+# an uninitialised Portal will return 200 with an HTML wizard page, not 503).
+echo "  Waiting for Portal REST API to become ready (up to 10 min)..."
+_PORTAL_REST_READY=0
+for _pri in $(seq 1 60); do
+  _PRI_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
+    "https://localhost:7443/arcgis/sharing/rest/info?f=json" 2>/dev/null || true)
+  if [[ -n "$_PRI_CODE" && "$_PRI_CODE" != "000" && "$_PRI_CODE" != "503" ]]; then
+    echo "  Portal REST API ready (HTTP $_PRI_CODE)."
+    _PORTAL_REST_READY=1
+    break
+  fi
+  echo "    Portal REST API not ready yet (HTTP ${_PRI_CODE:-000}), attempt $_pri/60 — sleeping 10s..."
+  sleep 10
+done
+if [[ $_PORTAL_REST_READY -eq 0 ]]; then
+  echo "ERROR: Portal REST API did not become ready within 10 minutes." >&2
+  exit 1
+fi
+
 # Strategy: try to get a token first. A valid token means Portal is already
 # initialized with the current credentials — skip createNewSite.
 # If no token, Portal is either uninitialized or mid-startup; call createNewSite.
@@ -588,6 +612,14 @@ else
     --data-urlencode "contentStore=$CONTENT_STORE" \
     -d "f=json" 2>/dev/null)
   echo "  createNewSite result: $CREATE_RESULT"
+
+  # If the result is empty or clearly not JSON (e.g. HTML page), Portal was not
+  # ready to accept the createNewSite call despite passing the REST-ready check.
+  if [[ -z "$CREATE_RESULT" ]] || ! echo "$CREATE_RESULT" | grep -q '{'; then
+    echo "ERROR: createNewSite returned an empty or non-JSON response — Portal may not be ready." >&2
+    echo "  Raw response: '$CREATE_RESULT'" >&2
+    exit 1
+  fi
 
   # code 499 "Token Required" from createNewSite means Portal IS already
   # initialized (that endpoint only requires auth on an existing site).
