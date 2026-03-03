@@ -528,7 +528,9 @@ _portal_token() {
   for _token_host in "localhost:7443" "$DOMAIN:7443" "${DOMAIN^^}:7443"; do
     resp=$("${CURL_ADM[@]}" -X POST \
       "https://${_token_host}/arcgis/sharing/rest/generateToken" \
-      -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+      --data-urlencode "username=$ADMIN_USER" \
+      --data-urlencode "password=$ADMIN_PASS" \
+      -d "client=requestip&expiration=120&f=json" \
       2>/dev/null || true)
     tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
     if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
@@ -542,7 +544,9 @@ _server_token() {
   local resp tok
   resp=$("${CURL_ADM[@]}" -X POST \
     "https://localhost:6443/arcgis/admin/generateToken" \
-    -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+    --data-urlencode "username=$ADMIN_USER" \
+    --data-urlencode "password=$ADMIN_PASS" \
+    -d "client=requestip&expiration=120&f=json" \
     2>/dev/null || true)
   tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
   if [[ -n "$tok" ]]; then echo "$tok"; return 0; fi
@@ -581,7 +585,9 @@ PTOKEN=""
 echo "  Checking if Portal is already initialized..."
 _CHK_RESP=$("${CURL_ADM[@]}" -X POST \
   "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-  -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+  --data-urlencode "username=$ADMIN_USER" \
+  --data-urlencode "password=$ADMIN_PASS" \
+  -d "client=requestip&expiration=120&f=json" \
   2>/dev/null || true)
 _CHK_TOK=$(echo "$_CHK_RESP" | jq -r '.token // empty' 2>/dev/null || true)
 if [[ -n "$_CHK_TOK" ]]; then
@@ -633,7 +639,9 @@ if [[ -z "$PTOKEN" ]]; then
       for _rt in $(seq 1 90); do
         _RETRY_RESP=$("${CURL_ADM[@]}" -X POST \
           "https://localhost:7443/arcgis/sharing/rest/generateToken" \
-          -d "username=$ADMIN_USER&password=$ADMIN_PASS&client=requestip&expiration=120&f=json" \
+          --data-urlencode "username=$ADMIN_USER" \
+          --data-urlencode "password=$ADMIN_PASS" \
+          -d "client=requestip&expiration=120&f=json" \
           2>/dev/null || true)
         _RETRY_TOK=$(echo "$_RETRY_RESP" | jq -r '.token // empty' 2>/dev/null || true)
         if [[ -n "$_RETRY_TOK" ]]; then
