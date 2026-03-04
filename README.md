@@ -79,7 +79,7 @@ Single-command installation of ArcGIS Enterprise on Linux following Esri's recom
 Ensure your domain points to the VM's public IP before running the installer *(Let's Encrypt requires this for certificate verification)*.
 
 ```
-gis.elevategeo.dev  →  20.49.7.31
+gis.example.com  →  <your-public-ip>
 ```
 
 </details>
@@ -103,7 +103,7 @@ sudo mkdir -p /opt/esri/licenses
 sudo mkdir -p /opt/esri/installers
 
 # Upload your files (example using scp from local machine)
-scp ArcGIS_Enterprise_Builder_Linux_120_197835.tar.gz user@vm:/opt/esri/installers/
+scp ArcGIS_Enterprise_Builder_Linux_*.tar.gz user@vm:/opt/esri/installers/
 scp *.prvc *.json user@vm:/opt/esri/licenses/
 ```
 
@@ -119,9 +119,9 @@ nano .env
 
 ```bash
 # Domain & Network
-ARCGIS_FQDN=gis.elevategeo.dev
-ARCGIS_PUBLIC_IP=20.49.7.31
-ARCGIS_PRIVATE_IP=172.17.0.4
+ARCGIS_FQDN=gis.example.com
+ARCGIS_PUBLIC_IP=<your-public-ip>
+ARCGIS_PRIVATE_IP=<your-private-ip>
 
 # Admin Credentials (USE STRONG PASSWORD!)
 ARCGIS_ADMIN_USER=admin
@@ -129,11 +129,11 @@ ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
 ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
 
 # License Files
-ARCGIS_SERVER_LICENSE=/opt/esri/licenses/ArcGISGISServerAdvanced_DeveloperArcGISServer_1600222.prvc
-ARCGIS_PORTAL_LICENSE=/opt/esri/licenses/ArcGIS_Enterprise_Portal_120_551327_20260122.json
+ARCGIS_SERVER_LICENSE=/opt/esri/licenses/your_server_license.prvc
+ARCGIS_PORTAL_LICENSE=/opt/esri/licenses/your_portal_license.json
 
 # Installer
-ARCGIS_INSTALLER_TAR=/opt/esri/installers/ArcGIS_Enterprise_Builder_Linux_120_197835.tar.gz
+ARCGIS_INSTALLER_TAR=/opt/esri/installers/ArcGIS_Enterprise_Builder_Linux_120_XXXXXX.tar.gz
 
 # Let's Encrypt
 LETSENCRYPT_EMAIL=admin@yourdomain.com
@@ -179,10 +179,10 @@ The installer deploys a **complete ArcGIS Enterprise base deployment**:
 
 | Service | URL |
 |:--------|:----|
-| 🏠 **Portal Home** | `https://gis.elevategeo.dev/portal/home` |
-| ⚙️ **Portal Admin** | `https://gis.elevategeo.dev:7443/arcgis/portaladmin` |
-| 🗺️ **Server REST** | `https://gis.elevategeo.dev/server/rest/services` |
-| 🔧 **Server Admin** | `https://gis.elevategeo.dev:6443/arcgis/admin` |
+| 🏠 **Portal Home** | `https://<your-fqdn>/portal/home` |
+| ⚙️ **Portal Admin** | `https://<your-fqdn>:7443/arcgis/portaladmin` |
+| 🗺️ **Server REST** | `https://<your-fqdn>/server/rest/services` |
+| 🔧 **Server Admin** | `https://<your-fqdn>:6443/arcgis/admin` |
 
 <br/>
 
@@ -191,13 +191,13 @@ The installer deploys a **complete ArcGIS Enterprise base deployment**:
 ### How It Works
 
 ```
-┌──────────────┐    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│   Certbot    │───▶│   PKCS12    │───▶│   Import to  │───▶│   ArcGIS    │
-│   Obtains    │    │   Convert   │    │   Portal &   │    │   Ready!    │
-│   Cert       │    │             │    │   Server     │    │             │
-└──────────────┘    └─────────────┘    └──────────────┘    └─────────────┘
-       │                                                          │
-       └──────────────── Auto-Renewal (Every 60 days) ────────────┘
+ +------------+     +------------+     +------------+     +------------+
+ |  Certbot   | --> |  PKCS12    | --> | Import to  | --> |  ArcGIS    |
+ |  Obtains   |     |  Convert   |     | Portal &   |     |  Ready!    |
+ |  Cert      |     |            |     | Server     |     |            |
+ +------------+     +------------+     +------------+     +------------+
+       |                                                        |
+       +----------------- Auto-Renewal (every 60 days) ---------+
 ```
 
 1. **Initial Setup** — Installer obtains Let's Encrypt certificate via certbot
