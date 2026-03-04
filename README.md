@@ -1,393 +1,410 @@
 <p align="center">
-  <img src="https://www.esri.com/content/dam/esrisites/en-us/common/icons/product-logos/ArcGIS-Enterprise.png" alt="ArcGIS Enterprise" width="80" />
+  <img src="https://www.esri.com/content/dam/esrisites/en-us/common/icons/product-logos/ArcGIS-Enterprise.png" alt="ArcGIS Enterprise" width="80"/>
 </p>
 
-<h1 align="center">🌍 ArcGIS Enterprise 12.0 Linux Bootstrap</h1>
+<h1 align="center">ArcGIS Enterprise Linux Bootstrap</h1>
 
 <p align="center">
-  <strong>One-command bootstrap for a single-machine ArcGIS Enterprise 12.0 deployment on Linux</strong><br/>
-  with automatic HTTPS certificates via Cloudflare DNS
+  <strong>One command. Full deployment. Zero hassle.</strong>
 </p>
 
 <p align="center">
-  <a href="https://enterprise.arcgis.com/en/get-started/12.0/linux/tutorial-creating-your-first-web-gis-configuration.htm">📖 Esri Tutorial</a> ·
-  <a href="#-quick-start">🚀 Quick Start</a> ·
-  <a href="#-prerequisites">📋 Prerequisites</a> ·
-  <a href="#-configuration">⚙️ Configuration</a>
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-blue?style=for-the-badge" alt="Quick Start"/></a>
+  <a href="#-features"><img src="https://img.shields.io/badge/Features-green?style=for-the-badge" alt="Features"/></a>
+  <a href="#-troubleshooting"><img src="https://img.shields.io/badge/Troubleshooting-orange?style=for-the-badge" alt="Troubleshooting"/></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/ArcGIS_Enterprise-12.x-0079C1?style=flat-square&logo=esri" alt="ArcGIS Enterprise 12"/>
+  <img src="https://img.shields.io/badge/Ubuntu-24.x-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu 24"/>
+  <img src="https://img.shields.io/badge/Let's_Encrypt-SSL-003A70?style=flat-square&logo=letsencrypt" alt="Let's Encrypt"/>
+  <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License"/>
 </p>
 
 ---
 
-## ✨ What This Sets Up
+Single-command installation of ArcGIS Enterprise on Linux following Esri's recommendations for single-machine deployments. Includes automatic SSL certificate provisioning and renewal via Let's Encrypt.
 
-| Component | Details |
-|-----------|---------|
-| 🐧 **OS** | Ubuntu 22.04 LTS or 24.04 LTS |
-| 🌐 **Portal for ArcGIS** | Web GIS hub |
-| 🖥️ **ArcGIS GIS Server** | Map/feature services |
-| 💾 **ArcGIS Data Store** | Relational + object stores |
-| 🔌 **Web Adaptor** | Java / Tomcat 10.1 (auto-installed; required for 12.x Web Adaptor WAR) |
-| 🔒 **HTTPS** | Let's Encrypt via Cloudflare DNS |
-| ⚡ **NGINX** | Reverse proxy with WebSocket support |
-| 📄 **Config** | `.env`-based (no secrets in scripts) |
+<br/>
 
-### 🎯 Designed For
+## ✨ Features
 
-- ☁️ Azure, AWS, or on-prem Linux VMs
-- 🧑‍💻 Any ArcGIS Enterprise license (Developer, Standard, Advanced)
-- 💰 Lowest-cost, repeatable deployments
+| Feature | Description |
+|:-------:|-------------|
+| 🚀 | **One Command Install** — Run `sudo ./install.sh` and walk away |
+| 🔐 | **Let's Encrypt SSL** — Automatic certificate provisioning and renewal |
+| 🔒 | **Git-Safe Configuration** — Sensitive values in `.env` (gitignored) |
+| 📋 | **Esri Best Practices** — Follows single-machine deployment guidelines |
+| 🔄 | **Auto-Renewal Hooks** — Certificates automatically updated in ArcGIS when renewed |
+| ✅ | **Pre-flight Checks** — Validate your setup before installation |
 
-### 🚫 What This Is *Not*
-
-- ❌ Production-ready
-- ❌ High-availability
-- ❌ Docker (not supported by Esri)
-
----
+<br/>
 
 ## 📋 Prerequisites
 
-### 1. 🐧 Linux VM
+<details>
+<summary><strong>🖥️ VM Requirements</strong></summary>
 
-- Ubuntu 22.04 LTS or 24.04 LTS
-- 4 vCPU / 16 GB RAM minimum ([system requirements](https://enterprise.arcgis.com/en/system-requirements/12.0/linux/arcgis-enterprise-overall-system-requirements.htm))
-- 💿 **100 GB+ free disk** (Portal extraction alone requires ~15 GB; full deployment needs 50+ GB)
+<br/>
 
-### 2. 📦 ArcGIS Installers
+| Requirement | Specification |
+|:------------|:--------------|
+| **OS** | Ubuntu 24.x |
+| **RAM** | Minimum 16GB *(32GB recommended)* |
+| **Storage** | Minimum 100GB |
+| **CPU** | 8+ cores recommended |
+| **Ports** | 80, 443, 6443, 7443 open |
 
-Download from [My Esri](https://my.esri.com/) and place in `/opt/esri/installers`:
+</details>
 
-| File | Required |
-|------|----------|
-| `ArcGIS_Server_Linux_*.tar.gz` | ✅ Yes |
-| `Portal_for_ArcGIS_Linux_*.tar.gz` | ✅ Yes |
-| `ArcGIS_DataStore_Linux_*.tar.gz` | ✅ Yes |
-| `Web_Adaptor_Java_Linux_*.tar.gz` | ✅ Yes |
-| `Portal_for_ArcGIS_Web_Styles_Linux_*.tar.gz` | ⬜ Optional (3D symbols for Scene Viewer) |
+<details>
+<summary><strong>📄 Required Files on VM</strong></summary>
 
-### 3. 🔑 License Files
+<br/>
 
-Download from [My Esri](https://my.esri.com/) and place in `/opt/esri/licenses`:
+**License Files:**
+- ArcGIS Server license (`.prvc` or `.json`)
+- Portal for ArcGIS license (`.json`)
 
-| File | Format | Notes |
-|------|--------|-------|
-| `ArcGIS_Enterprise_Portal_*.json` | JSON | Portal user types & apps |
-| `*.prvc` (e.g., `ArcGISGISServerAdvanced_*.prvc`) | PRVC | Server provisioning file |
+**Installer:**
+- ArcGIS Enterprise Builder for Linux tarball
 
-> 💡 **Tip:** Portal 12.0 uses `.json` (not `.prvc`). Server still uses `.prvc`.
-> The script **auto-detects** matching files in `/opt/esri/licenses/`.
+</details>
 
-### 4. ☁️ Cloudflare
+<details>
+<summary><strong>🌐 DNS Configuration</strong></summary>
 
-- Domain managed by Cloudflare
-- API Token with permissions:
-  - `Zone → DNS → Edit`
-  - `Zone → Zone → Read`
+<br/>
 
----
+Ensure your domain points to the VM's public IP before running the installer *(Let's Encrypt requires this for certificate verification)*.
 
-## ⚙️ Configuration
-
-### ✅ Machine FQDN (Esri DIAG024)
-
-Esri requires the VM's hostname to resolve to the VM's **primary (non-loopback) IP** using an `/etc/hosts` entry in this format:
-
-`<IP> <FQDN> <Machine_name>`
-
-This **machine FQDN** does not need to match your public reverse-proxy URL. A common pattern is:
-
-- **Public URL (reverse proxy):** `DOMAIN=gis.example.com`
-- **Machine identity (hostname/FQDN):** `MACHINE_FQDN=arcgis.example.com`
-
-The script will enforce this when `MACHINE_FQDN` is set.
-
-Create a `.env` file (or the script will prompt and save automatically):
-
-```env
-# 🌐 Domain and SSL
-DOMAIN='gis.example.com'
-
-# 🖥️ VM hostname (Esri DIAG024) — should resolve to the VM's PRIMARY private IP
-# Example: arcgis.example.com (different from DOMAIN is OK)
-MACHINE_FQDN='arcgis.example.com'
-
-EMAIL='admin@example.com'
-CF_API_TOKEN='your_cloudflare_api_token'
-
-# 👤 Admin credentials (used for Portal and Server)
-ADMIN_USER='siteadmin'
-ADMIN_PASS='YourSecurePassword123!'
-ADMIN_FIRST_NAME='Site'
-ADMIN_LAST_NAME='Admin'
-# Security question index (1-14):
-#   1  What city were you born in?
-#   2  What was your high school mascot?
-#   3  What is your mother's maiden name?
-#   4  What was the make of your first car?
-#   5  What high school did you go to?
-#   6  What is the last name of your best friend?
-#   7  What is the middle name of your youngest sibling?
-#   8  What is the name of the street on which you grew up?
-#   9  What is the name of your favorite fictional character?
-#  10  What is the name of your favorite pet?
-#  11  What is the name of your favorite restaurant?
-#  12  What is the title of your favorite book?
-#  13  What is your dream job?
-#  14  Where did you go on your honeymoon?
-ADMIN_SECURITY_QUESTION='1'
-ADMIN_SECURITY_ANSWER='Springfield'
-
-# 🔑 License files (auto-detected if not specified)
-PORTAL_LICENSE_FILE='/opt/esri/licenses/ArcGIS_Enterprise_Portal.json'
-SERVER_LICENSE_FILE='/opt/esri/licenses/server.prvc'
+```
+gis.elevategeo.dev  →  20.49.7.31
 ```
 
-> 💡 If any value is missing, the script will prompt you interactively and save it to `.env`.
+</details>
 
-### 🔎 Verify hostname/FQDN on the VM
-
-Run these on the VM before installing:
-
-```bash
-hostname
-hostname -f || true
-getent hosts "$(hostname -s)" || true
-ip -4 route get 1.1.1.1 || true
-grep -nE '(^127\.0\.0\.1|^127\.0\.1\.1|localhost|arcgis)' /etc/hosts || true
-```
-
-You want `hostname -f` to return your machine FQDN (for example `arcgis.example.com`), not `localhost`.
-
----
+<br/>
 
 ## 🚀 Quick Start
 
-### Option A: Download from GitHub (recommended)
+### Step 1️⃣ — Clone Repository
 
 ```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/ElevateGeo/arcgis-enterprise-linux-bootstrap/main/install.sh
-chmod +x install.sh
-sudo ./install.sh
+git clone <this-repo> ~/arcgis-enterprise-linux-bootstrap
+cd ~/arcgis-enterprise-linux-bootstrap
 ```
 
-> ⚠️ The script reads `.env` from the **current directory**. Run it from the same folder as your `.env` file. Do not pipe via `curl | bash` — interactive prompts won't work.
-
-### Option B: Clone the repo
+### Step 2️⃣ — Upload Licenses & Installer
 
 ```bash
-git clone https://github.com/ElevateGeo/arcgis-enterprise-linux-bootstrap.git
-cd arcgis-enterprise-linux-bootstrap
-sudo chmod +x install.sh
-sudo ./install.sh
+# Create directories
+sudo mkdir -p /opt/esri/licenses
+sudo mkdir -p /opt/esri/installers
+
+# Upload your files (example using scp from local machine)
+scp ArcGIS_Enterprise_Builder_Linux_120_197835.tar.gz user@vm:/opt/esri/installers/
+scp *.prvc *.json user@vm:/opt/esri/licenses/
 ```
 
-> 🔄 The script is **idempotent** — safe to re-run. All steps check for prior completion.
-
-### 🧨 Wipe and Reinstall (destructive)
-
-If you’re stuck in a bad state and want a clean reinstall, you can wipe existing ArcGIS Enterprise components first:
+### Step 3️⃣ — Configure
 
 ```bash
-sudo ./install.sh --wipe
-```
-
-For non-interactive automation (no prompt), add `--yes`:
-
-```bash
-sudo ./install.sh --wipe --yes
-```
-
-> ⚠️ **Destructive:** `--wipe` deletes the existing deployment under `/opt/esri/arcgis` (Portal/Server/Data Store/Web Adaptor install dirs) and removes Tomcat Web Adaptor deployments. This will remove your existing configuration/content unless you’ve backed it up.
-
-### ⬆️ Upgrade Existing Installation
-
-1. Place new version installers in `/opt/esri/installers`
-2. Download and run:
-
-```bash
-curl -fsSL -o upgrade.sh https://raw.githubusercontent.com/ElevateGeo/arcgis-enterprise-linux-bootstrap/main/upgrade.sh
-chmod +x upgrade.sh
-sudo ./upgrade.sh
+cp .env.example .env
+nano .env
 ```
 
 <details>
-<summary>📄 What the upgrade does</summary>
+<summary>📝 <strong>Example Configuration</strong></summary>
 
-- 🛑 Stop all ArcGIS services (reverse dependency order)
-- 💾 Backup configuration
-- 🔧 Verify system tuning (ulimits, sysctl)
-- 📦 Upgrade each component in Esri's documented order
-- 🔑 Re-authorize ArcGIS Server (via `-a` flag)
-- ▶️ Restart services (dependency order)
-- 📄 Re-import Portal JSON license
-- 🔌 Re-configure Web Adaptors
-- 🔄 Reload NGINX
+```bash
+# Domain & Network
+ARCGIS_FQDN=gis.elevategeo.dev
+ARCGIS_PUBLIC_IP=20.49.7.31
+ARCGIS_PRIVATE_IP=172.17.0.4
+
+# Admin Credentials (USE STRONG PASSWORD!)
+ARCGIS_ADMIN_USER=admin
+ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
+ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
+
+# License Files
+ARCGIS_SERVER_LICENSE=/opt/esri/licenses/ArcGISGISServerAdvanced_DeveloperArcGISServer_1600222.prvc
+ARCGIS_PORTAL_LICENSE=/opt/esri/licenses/ArcGIS_Enterprise_Portal_120_551327_20260122.json
+
+# Installer
+ARCGIS_INSTALLER_TAR=/opt/esri/installers/ArcGIS_Enterprise_Builder_Linux_120_197835.tar.gz
+
+# Let's Encrypt
+LETSENCRYPT_EMAIL=admin@yourdomain.com
+```
 
 </details>
 
----
+### Step 4️⃣ — Install 🎉
 
-## 🌐 Access After Install
+```bash
+# Make scripts executable
+chmod +x install.sh preflight.sh scripts/*.sh
+
+# (Optional) Validate setup first
+./preflight.sh
+
+# Run the installer (takes 30-60 minutes)
+sudo ./install.sh
+```
+
+> 💡 **Tip:** Grab a coffee ☕ — the installation takes 30-60 minutes.
+
+<br/>
+
+## 📦 What Gets Installed
+
+The installer deploys a **complete ArcGIS Enterprise base deployment**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ArcGIS Enterprise                         │
+├─────────────────┬─────────────────┬─────────────────────────┤
+│  Portal for     │  ArcGIS Server  │  ArcGIS Data Store      │
+│  ArcGIS         │                 │  (Relational + Tile)    │
+├─────────────────┴─────────────────┴─────────────────────────┤
+│              Web Adaptor (Tomcat)                           │
+├─────────────────────────────────────────────────────────────┤
+│              Let's Encrypt SSL Certificate                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🌐 Access Points After Installation
 
 | Service | URL |
-|---------|-----|
-| 🏠 Portal Home | `https://YOUR_DOMAIN/portal/home` |
-| 🔧 Portal Admin | `https://YOUR_DOMAIN:7443/arcgis/portaladmin` |
-| 🗺️ Server REST | `https://YOUR_DOMAIN/server/rest/services` |
-| ⚙️ Server Admin | `https://YOUR_DOMAIN:6443/arcgis/admin` |
+|:--------|:----|
+| 🏠 **Portal Home** | `https://gis.elevategeo.dev/portal/home` |
+| ⚙️ **Portal Admin** | `https://gis.elevategeo.dev:7443/arcgis/portaladmin` |
+| 🗺️ **Server REST** | `https://gis.elevategeo.dev/server/rest/services` |
+| 🔧 **Server Admin** | `https://gis.elevategeo.dev:6443/arcgis/admin` |
 
----
+<br/>
 
-## 📝 Installation Steps
+## 🔐 SSL Certificate Management
 
-The `install.sh` script follows [Esri's documented deployment order](https://enterprise.arcgis.com/en/get-started/12.0/linux/tutorial-creating-your-first-web-gis-configuration.htm):
+### How It Works
 
-| Step | Action | Reference |
-|:----:|--------|:---------:|
-| 1️⃣ | Install system dependencies (NGINX, Tomcat, OpenJDK 11, Certbot) | |
-| 2️⃣ | Configure SSL certificates via Cloudflare DNS | |
-| 3️⃣ | Configure NGINX reverse proxy (WebSocket support) | |
-| 4️⃣ | Create `arcgis` user, set ulimits & sysctl | [📖](https://enterprise.arcgis.com/en/server/12.0/install/linux/arcgis-server-system-requirements.htm) |
-| 5️⃣ | Extract installer archives | |
-| 6️⃣ | Install & authorize ArcGIS Server (`-a` flag) | [📖](https://enterprise.arcgis.com/en/server/12.0/install/linux/silently-install-arcgis-server.htm) |
-| 7️⃣ | Install Portal for ArcGIS (+ Web Styles if present) | [📖](https://enterprise.arcgis.com/en/portal/12.0/install/linux/install-portal-for-arcgis.htm) |
-| 8️⃣ | Install ArcGIS Data Store | [📖](https://enterprise.arcgis.com/en/data-store/12.0/install/linux/install-arcgis-data-store.htm) |
-| 9️⃣ | Install Web Adaptor + deploy WARs to Tomcat | [📖](https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/install-arcgis-web-adaptor-java-linux.htm) |
-| 🔟 | Start all ArcGIS services | |
-| 1️⃣1️⃣ | Create Server site (`createsite.sh`) | [📖](https://enterprise.arcgis.com/en/server/12.0/deploy/linux/creating-a-new-site.htm) |
-| 1️⃣2️⃣ | Create Portal with JSON license (`-lf` flag) | [📖](https://enterprise.arcgis.com/en/portal/12.0/install/linux/create-a-single-machine-portal.htm) |
-| 1️⃣3️⃣ | Configure Web Adaptors | [📖](https://enterprise.arcgis.com/en/web-adaptor/12.0/install/java-linux/configure-arcgis-web-adaptor-portal.htm) |
-| 1️⃣4️⃣ | Federate Server with Portal | [📖](https://enterprise.arcgis.com/en/portal/12.0/administer/linux/federate-an-arcgis-server-site-with-your-portal.htm) |
-| 1️⃣5️⃣ | Register/configure relational & object data stores | [📖](https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm) |
+```
+┌──────────────┐    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+│   Certbot    │───▶│   PKCS12    │───▶│   Import to  │───▶│   ArcGIS    │
+│   Obtains    │    │   Convert   │    │   Portal &   │    │   Ready!    │
+│   Cert       │    │             │    │   Server     │    │             │
+└──────────────┘    └─────────────┘    └──────────────┘    └─────────────┘
+       │                                                          │
+       └──────────────── Auto-Renewal (Every 60 days) ────────────┘
+```
 
----
-
-## 🔐 Key Esri Compliance Notes
-
-| Topic | Details |
-|-------|---------|
-| 🔑 **Server auth** | Done during install (Step 6) via `-a` flag — avoids standalone `authorizeSoftware` which needs `-e EMAIL` for `.prvc` |
-| 📄 **Portal license** | JSON imported during creation (Step 12) via `-lf` flag |
-| 💾 **Object store** | Registered alongside relational (Step 14) — [required in 12.0](https://enterprise.arcgis.com/en/get-started/12.0/linux/base-arcgis-enterprise-deployment.htm) |
-| ⚙️ **Kernel params** | `vm.max_map_count=262144`, `vm.swappiness=1` per Esri system requirements |
-
----
-
-## 🛠️ Manual Steps (if automation fails)
+1. **Initial Setup** — Installer obtains Let's Encrypt certificate via certbot
+2. **PKCS12 Conversion** — Certificate converted to PKCS12 format for ArcGIS
+3. **Import** — Certificate imported into both Portal and Server
+4. **Auto-Renewal** — Certbot timer automatically renews certificates
+5. **Renewal Hook** — On renewal, script reimports the certificate into ArcGIS
 
 <details>
-<summary>🔧 Click to expand manual steps</summary>
-
-#### 🔑 Authorize ArcGIS Server (standalone)
+<summary>🔧 <strong>Manual Certificate Operations</strong></summary>
 
 ```bash
-cd /opt/esri/arcgis/server/tools/authorizeSoftware
-sudo -u arcgis ./authorizeSoftware -f /opt/esri/licenses/YOUR_SERVER_LICENSE.prvc -e admin@example.com
+# Force certificate renewal
+sudo certbot renew --force-renewal
+
+# Manually run the ArcGIS import hook
+sudo /opt/esri/scripts/ssl-renewal-hook.sh
+
+# Check certificate status
+sudo certbot certificates
+
+# View renewal hook log
+sudo cat /var/log/arcgis-ssl-renewal.log
 ```
-
-#### 🏗️ Create Initial Portal Administrator
-
-```bash
-cd /opt/esri/arcgis/portal/tools/createportal
-sudo -u arcgis ./createportal.sh \
-  -fn "Admin" -ln "User" \
-  -u siteadmin -p "YourSecurePassword123!" \
-  -e admin@example.com \
-  -qi 1 -qa "Springfield" \
-  -d /opt/esri/arcgis/portal/usr/arcgisportal \
-  -lf /opt/esri/licenses/ArcGIS_Enterprise_Portal_120_551327_20260122.json
-```
-
-#### 🖥️ Create ArcGIS Server Site
-
-```bash
-cd /opt/esri/arcgis/server/tools/createsite
-sudo -u arcgis ./createsite.sh \
-  -u siteadmin -p "YourSecurePassword123!" \
-  -d /opt/esri/arcgis/server/usr/directories \
-  -c /opt/esri/arcgis/server/usr/config-store
-```
-
-#### 🔌 Configure Web Adaptors
-
-```bash
-# Find the tools directory (versioned path)
-WA_TOOLS=$(find /opt/esri -path "*/webadaptor*/java/tools" -type d | head -1)
-cd "$WA_TOOLS"
-
-# Portal
-sudo -u arcgis ./configurewebadaptor.sh \
-  -m portal -w https://YOUR_DOMAIN/portal/webadaptor \
-  -g https://localhost:7443 -u siteadmin -p "YourSecurePassword123!"
-
-# Server
-sudo -u arcgis ./configurewebadaptor.sh \
-  -m server -w https://YOUR_DOMAIN/server/webadaptor \
-  -g https://localhost:6443 -u siteadmin -p "YourSecurePassword123!" -a true
-```
-
-#### 💾 Register Data Stores
-
-```bash
-cd /opt/esri/arcgis/datastore/tools
-
-# Relational
-sudo -u arcgis ./configuredatastore.sh \
-  https://localhost:6443/arcgis/admin siteadmin "YourSecurePassword123!" \
-  /opt/esri/arcgis/datastore/usr/arcgisdatastore --stores relational
-
-# Object (required for 12.0)
-sudo -u arcgis ./configuredatastore.sh \
-  https://localhost:6443/arcgis/admin siteadmin "YourSecurePassword123!" \
-  /opt/esri/arcgis/datastore/usr/arcgisdatastore --stores object
-```
-
-#### 🔗 Federate Server with Portal
-
-1. Log in to Portal: `https://YOUR_DOMAIN/portal/home`
-2. Go to **Organization** → **Settings** → **Servers**
-3. Click **Add Server**:
-   - **Server URL**: `https://YOUR_DOMAIN/server`
-   - **Admin URL**: `https://YOUR_DOMAIN:6443/arcgis`
-4. Set as **Hosting Server**
 
 </details>
 
----
+<details>
+<summary>🧪 <strong>Testing with Staging Certificates</strong></summary>
 
-## ✅ Verify Installation
+To avoid Let's Encrypt rate limits during testing:
 
-| Check | URL | Expected |
-|-------|-----|----------|
-| 🏠 Portal Home | `https://YOUR_DOMAIN/portal/home` | Sign-in page |
-| 💚 Portal Health | `https://YOUR_DOMAIN:7443/arcgis/portaladmin/healthCheck` | `{"status":"success"}` |
-| 🗺️ Server Services | `https://YOUR_DOMAIN/server/rest/services` | Services directory |
-| 💚 Server Health | `https://YOUR_DOMAIN:6443/arcgis/admin/healthCheck` | `{"status":"success"}` |
+```bash
+# In .env
+LETSENCRYPT_STAGING=true
+```
 
----
+> ⚠️ **Note:** Staging certificates are not trusted by browsers.
 
-## 🔄 Auto-Renew Certificates
+</details>
 
-Certbot renews automatically via system timers. NGINX reloads safely on renewal. No action needed.
+<br/>
 
----
+## 🔧 Post-Installation
 
-## 💡 Why Linux + VM?
+### Verify Installation
 
-ArcGIS Enterprise is **stateful**, **host-bound**, and **not container-friendly**.
-Linux VMs provide the best stability, cost, and automation balance.
+```bash
+sudo ./install.sh --verify
+```
 
----
+<details>
+<summary>🎛️ <strong>Service Management</strong></summary>
 
-## 📄 License
+```bash
+# As the arcgis user
+sudo -u arcgis /opt/esri/arcgis/portal/tools/startportal.sh
+sudo -u arcgis /opt/esri/arcgis/portal/tools/stopportal.sh
 
-This repository contains **no Esri software**.
-You must comply with [Esri licensing terms](https://www.esri.com/legal/licensing-translations).
+sudo -u arcgis /opt/esri/arcgis/server/tools/startserver.sh
+sudo -u arcgis /opt/esri/arcgis/server/tools/stopserver.sh
+```
 
-MIT License for scripts and documentation.
+</details>
+
+<details>
+<summary>❤️ <strong>Health Checks</strong></summary>
+
+```bash
+# Portal health
+curl -sk "https://localhost:7443/arcgis/portaladmin/healthCheck?f=json"
+
+# Server health  
+curl -sk "https://localhost:6443/arcgis/admin/healthCheck?f=json"
+```
+
+</details>
+
+<br/>
+
+## 📁 Directory Structure
+
+<details>
+<summary><strong>View Installation Layout</strong></summary>
+
+```
+/opt/esri/
+├── 📂 arcgis/              # ArcGIS Enterprise installation
+│   ├── 📂 portal/          # Portal for ArcGIS
+│   ├── 📂 server/          # ArcGIS Server
+│   ├── 📂 datastore/       # ArcGIS Data Store
+│   └── 📂 webadaptor/      # Web Adaptor
+├── 📂 data/
+│   ├── 📂 config-store/    # Server configuration store
+│   ├── 📂 server-dirs/     # Server directories
+│   └── 📂 portal-content/  # Portal content
+├── 📂 licenses/            # License files
+├── 📂 installers/          # Installation media
+├── 📂 ssl/                 # SSL certificates (PKCS12)
+├── 📂 scripts/             # Utility scripts
+└── 📂 builder/             # Enterprise Builder (temporary)
+```
+
+</details>
+
+<br/>
+
+## 🔥 Troubleshooting
+
+<details>
+<summary>❌ <strong>Installation Fails</strong></summary>
+
+1. Check the log file: `cat install.log`
+2. Verify license files are valid and not expired
+3. Ensure DNS is properly configured
+4. Verify ports 80/443 are accessible from the internet
+
+</details>
+
+<details>
+<summary>🔐 <strong>SSL Certificate Issues</strong></summary>
+
+```bash
+# Check certbot status
+sudo certbot certificates
+
+# Test renewal
+sudo certbot renew --dry-run
+
+# Check for errors
+sudo journalctl -u certbot.timer
+```
+
+</details>
+
+<details>
+<summary>⚠️ <strong>ArcGIS Services Won't Start</strong></summary>
+
+```bash
+# Check logs
+sudo tail -f /opt/esri/arcgis/portal/logs/*.log
+sudo tail -f /opt/esri/arcgis/server/logs/*.log
+
+# Check system limits
+ulimit -a
+cat /etc/security/limits.d/99-arcgis.conf
+```
+
+</details>
+
+<details>
+<summary>🔌 <strong>Port Already in Use</strong></summary>
+
+If port 80 is in use (blocking Let's Encrypt):
+
+```bash
+# Find what's using port 80
+sudo lsof -i :80
+
+# Stop the service temporarily
+sudo systemctl stop nginx  # or apache2
+```
+
+</details>
+
+<br/>
+
+## 🛡️ Security Notes
+
+> ⚠️ **Important Security Practices**
+
+| Practice | Description |
+|:---------|:------------|
+| 🚫 | **Never commit** the `.env` file to version control |
+| 🔑 | **Use strong passwords** — minimum 8 chars, mixed case, numbers, special chars |
+| 🔒 | **Restrict admin ports** (6443, 7443) to trusted IPs via Azure NSG |
+| 📦 | **Regular updates** — Keep the OS and ArcGIS patched |
+
+<br/>
+
+## 📚 File Reference
+
+| File | Purpose |
+|:-----|:--------|
+| 📜 `install.sh` | Main installation script |
+| 📜 `preflight.sh` | Pre-installation validation |
+| 📄 `.env.example` | Configuration template *(copy to .env)* |
+| 🔒 `.env` | Your configuration *(gitignored)* |
+| 📜 `scripts/ssl-renewal-hook.sh` | Let's Encrypt renewal hook |
+| 📄 `templates/enterprise-builder.properties.template` | Properties file template |
+
+<br/>
+
+## 📖 Resources
+
+<p align="center">
+  <a href="https://enterprise.arcgis.com/en/documentation/"><img src="https://img.shields.io/badge/Esri-ArcGIS_Enterprise_Docs-0079C1?style=for-the-badge&logo=esri" alt="ArcGIS Enterprise Documentation"/></a>
+  <a href="https://enterprise.arcgis.com/en/enterprise/latest/install/linux/arcgis-enterprise-builder.htm"><img src="https://img.shields.io/badge/Esri-Enterprise_Builder_Guide-0079C1?style=for-the-badge&logo=esri" alt="Enterprise Builder Guide"/></a>
+  <a href="https://letsencrypt.org/docs/"><img src="https://img.shields.io/badge/Let's_Encrypt-Documentation-003A70?style=for-the-badge&logo=letsencrypt" alt="Let's Encrypt Documentation"/></a>
+</p>
 
 ---
 
 <p align="center">
-  Made with ❤️ by <a href="https://github.com/ElevateGeo">ElevateGeo</a>
+  <sub>This bootstrap script is provided as-is. ArcGIS Enterprise requires valid Esri licenses.</sub>
+</p>
+
+<p align="center">
+  Made with ☕ for the GIS community
 </p>
