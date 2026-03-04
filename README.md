@@ -91,7 +91,7 @@ gis.example.com  →  <your-public-ip>
 ### Step 1️⃣ — Clone Repository
 
 ```bash
-git clone <this-repo> ~/arcgis-enterprise-linux-bootstrap
+git clone https://github.com/ElevateGeo/arcgis-enterprise-linux-bootstrap.git
 cd ~/arcgis-enterprise-linux-bootstrap
 ```
 
