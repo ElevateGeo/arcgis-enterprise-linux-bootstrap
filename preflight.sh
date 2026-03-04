@@ -85,8 +85,23 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     source "${SCRIPT_DIR}/.env"
     set +a
     
+    # Auto-detect FQDN if not set
+    if [[ -z "${ARCGIS_FQDN:-}" ]]; then
+        ARCGIS_FQDN=$(hostname -f 2>/dev/null)
+        if [[ -n "$ARCGIS_FQDN" ]]; then
+            if [[ "$ARCGIS_FQDN" =~ \.(internal|local|cloudapp|compute|amazonaws|googleusercontent)\. ]]; then
+                check_warn "ARCGIS_FQDN auto-detected: ${ARCGIS_FQDN} (looks like internal hostname)"
+            else
+                check_pass "ARCGIS_FQDN auto-detected: ${ARCGIS_FQDN}"
+            fi
+        else
+            check_fail "ARCGIS_FQDN not set and could not auto-detect"
+        fi
+    else
+        check_pass "ARCGIS_FQDN: ${ARCGIS_FQDN}"
+    fi
+    
     # Check required variables
-    [[ -n "${ARCGIS_FQDN:-}" ]] && check_pass "ARCGIS_FQDN: ${ARCGIS_FQDN}" || check_fail "ARCGIS_FQDN not set"
     [[ -n "${ARCGIS_ADMIN_USER:-}" ]] && check_pass "ARCGIS_ADMIN_USER: ${ARCGIS_ADMIN_USER}" || check_fail "ARCGIS_ADMIN_USER not set"
     [[ -n "${ARCGIS_ADMIN_PASSWORD:-}" ]] && check_pass "ARCGIS_ADMIN_PASSWORD: (set)" || check_fail "ARCGIS_ADMIN_PASSWORD not set"
     [[ -n "${LETSENCRYPT_EMAIL:-}" ]] && check_pass "LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}" || check_fail "LETSENCRYPT_EMAIL not set"
@@ -109,24 +124,31 @@ echo ""
 echo "Checking License Files..."
 # -----------------------------------------------------------------------------
 
-if [[ -n "${ARCGIS_SERVER_LICENSE:-}" ]]; then
-    if [[ -f "$ARCGIS_SERVER_LICENSE" ]]; then
-        check_pass "Server license: $ARCGIS_SERVER_LICENSE"
-    else
-        check_fail "Server license not found: $ARCGIS_SERVER_LICENSE"
-    fi
+LICENSE_DIR="${ARCGIS_LICENSE_DIR:-/opt/esri/licenses}"
+INSTALLER_DIR="${ARCGIS_INSTALLER_DIR:-/opt/esri/installers}"
+
+# Auto-discover or use configured Server license
+if [[ -z "${ARCGIS_SERVER_LICENSE:-}" ]]; then
+    ARCGIS_SERVER_LICENSE=$(find "$LICENSE_DIR" -maxdepth 1 -name "*.prvc" -type f 2>/dev/null | head -1)
+fi
+if [[ -n "$ARCGIS_SERVER_LICENSE" ]] && [[ -f "$ARCGIS_SERVER_LICENSE" ]]; then
+    check_pass "Server license: $ARCGIS_SERVER_LICENSE"
+elif [[ -n "$ARCGIS_SERVER_LICENSE" ]]; then
+    check_fail "Server license not found: $ARCGIS_SERVER_LICENSE"
 else
-    check_fail "ARCGIS_SERVER_LICENSE not configured"
+    check_fail "No .prvc file found in $LICENSE_DIR"
 fi
 
-if [[ -n "${ARCGIS_PORTAL_LICENSE:-}" ]]; then
-    if [[ -f "$ARCGIS_PORTAL_LICENSE" ]]; then
-        check_pass "Portal license: $ARCGIS_PORTAL_LICENSE"
-    else
-        check_fail "Portal license not found: $ARCGIS_PORTAL_LICENSE"
-    fi
+# Auto-discover or use configured Portal license
+if [[ -z "${ARCGIS_PORTAL_LICENSE:-}" ]]; then
+    ARCGIS_PORTAL_LICENSE=$(find "$LICENSE_DIR" -maxdepth 1 -name "*Portal*.json" -type f 2>/dev/null | head -1)
+fi
+if [[ -n "$ARCGIS_PORTAL_LICENSE" ]] && [[ -f "$ARCGIS_PORTAL_LICENSE" ]]; then
+    check_pass "Portal license: $ARCGIS_PORTAL_LICENSE"
+elif [[ -n "$ARCGIS_PORTAL_LICENSE" ]]; then
+    check_fail "Portal license not found: $ARCGIS_PORTAL_LICENSE"
 else
-    check_fail "ARCGIS_PORTAL_LICENSE not configured"
+    check_fail "No *Portal*.json file found in $LICENSE_DIR"
 fi
 
 echo ""
@@ -135,15 +157,17 @@ echo ""
 echo "Checking Installer..."
 # -----------------------------------------------------------------------------
 
-if [[ -n "${ARCGIS_INSTALLER_TAR:-}" ]]; then
-    if [[ -f "$ARCGIS_INSTALLER_TAR" ]]; then
-        SIZE=$(du -h "$ARCGIS_INSTALLER_TAR" | cut -f1)
-        check_pass "Installer tarball: $ARCGIS_INSTALLER_TAR ($SIZE)"
-    else
-        check_fail "Installer not found: $ARCGIS_INSTALLER_TAR"
-    fi
+# Auto-discover or use configured installer
+if [[ -z "${ARCGIS_INSTALLER_TAR:-}" ]]; then
+    ARCGIS_INSTALLER_TAR=$(find "$INSTALLER_DIR" -maxdepth 1 -name "ArcGIS_Enterprise_Builder_Linux*.tar.gz" -type f 2>/dev/null | head -1)
+fi
+if [[ -n "$ARCGIS_INSTALLER_TAR" ]] && [[ -f "$ARCGIS_INSTALLER_TAR" ]]; then
+    SIZE=$(du -h "$ARCGIS_INSTALLER_TAR" | cut -f1)
+    check_pass "Installer: $ARCGIS_INSTALLER_TAR ($SIZE)"
+elif [[ -n "$ARCGIS_INSTALLER_TAR" ]]; then
+    check_fail "Installer not found: $ARCGIS_INSTALLER_TAR"
 else
-    check_fail "ARCGIS_INSTALLER_TAR not configured"
+    check_fail "No ArcGIS_Enterprise_Builder_Linux*.tar.gz found in $INSTALLER_DIR"
 fi
 
 echo ""
@@ -152,20 +176,20 @@ echo ""
 echo "Checking Network..."
 # -----------------------------------------------------------------------------
 
-# Check DNS resolution
+# Check DNS resolution (external)
 if [[ -n "${ARCGIS_FQDN:-}" ]]; then
     RESOLVED_IP=$(dig +short "$ARCGIS_FQDN" 2>/dev/null | head -1)
     if [[ -n "$RESOLVED_IP" ]]; then
-        check_pass "DNS resolves: ${ARCGIS_FQDN} → ${RESOLVED_IP}"
-        
-        # Check if it matches our expected IP
-        if [[ -n "${ARCGIS_PUBLIC_IP:-}" ]] && [[ "$RESOLVED_IP" == "$ARCGIS_PUBLIC_IP" ]]; then
-            check_pass "DNS matches configured public IP"
-        elif [[ -n "${ARCGIS_PUBLIC_IP:-}" ]]; then
-            check_warn "DNS resolves to ${RESOLVED_IP}, expected ${ARCGIS_PUBLIC_IP}"
-        fi
+        check_pass "External DNS resolves: ${ARCGIS_FQDN} → ${RESOLVED_IP}"
     else
         check_fail "DNS does not resolve: ${ARCGIS_FQDN}"
+    fi
+    
+    # Check hosts file for local resolution (important for ArcGIS internal communication)
+    if grep -q "^127\.0\.0\.1.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
+        check_pass "Hosts file: ${ARCGIS_FQDN} → 127.0.0.1 (local)"
+    else
+        check_warn "Hosts file missing local entry for ${ARCGIS_FQDN} (will be added during install)"
     fi
 fi
 

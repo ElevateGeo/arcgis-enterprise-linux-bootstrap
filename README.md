@@ -32,7 +32,8 @@ Single-command installation of ArcGIS Enterprise on Linux following Esri's recom
 | Feature | Description |
 |:-------:|-------------|
 | 🚀 | **One Command Install** — Run `sudo ./install.sh` and walk away |
-| 🔐 | **Let's Encrypt SSL** — Automatic certificate provisioning and renewal |
+| 🔍 | **Auto-Discovery** — Automatically finds FQDN, license files, and installer |
+| �🔐 | **Let's Encrypt SSL** — Automatic certificate provisioning and renewal |
 | 🔒 | **Git-Safe Configuration** — Sensitive values in `.env` (gitignored) |
 | 📋 | **Esri Best Practices** — Follows single-machine deployment guidelines |
 | 🔄 | **Auto-Renewal Hooks** — Certificates automatically updated in ArcGIS when renewed |
@@ -72,15 +73,21 @@ Single-command installation of ArcGIS Enterprise on Linux following Esri's recom
 </details>
 
 <details>
-<summary><strong>🌐 DNS Configuration</strong></summary>
+<summary><strong>🌐 DNS & Hostname Configuration</strong></summary>
 
 <br/>
 
-Ensure your domain points to the VM's public IP before running the installer *(Let's Encrypt requires this for certificate verification)*.
-
+**External DNS**: Ensure your domain points to the VM's public IP *(required for Let's Encrypt)*:
 ```
 gis.example.com  →  <your-public-ip>
 ```
+
+**Hosts File**: The install script automatically adds a local hosts entry so ArcGIS components can communicate internally without hairpin NAT:
+```
+127.0.0.1  gis.example.com
+```
+
+> 💡 If your VM's `hostname -f` already returns your public domain (e.g., `gis.example.com`), everything is auto-configured.
 
 </details>
 
@@ -118,25 +125,19 @@ nano .env
 <summary>📝 <strong>Example Configuration</strong></summary>
 
 ```bash
-# Domain & Network
-ARCGIS_FQDN=gis.example.com
-ARCGIS_PUBLIC_IP=<your-public-ip>
-ARCGIS_PRIVATE_IP=<your-private-ip>
-
 # Admin Credentials (USE STRONG PASSWORD!)
 ARCGIS_ADMIN_USER=admin
 ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
 ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
 
-# License Files
-ARCGIS_SERVER_LICENSE=/opt/esri/licenses/your_server_license.prvc
-ARCGIS_PORTAL_LICENSE=/opt/esri/licenses/your_portal_license.json
-
-# Installer
-ARCGIS_INSTALLER_TAR=/opt/esri/installers/ArcGIS_Enterprise_Builder_Linux_120_XXXXXX.tar.gz
-
 # Let's Encrypt
 LETSENCRYPT_EMAIL=admin@yourdomain.com
+
+# Everything else is AUTO-DISCOVERED:
+#   - FQDN: from hostname -f (override: ARCGIS_FQDN=gis.example.com)
+#   - Server license: *.prvc in /opt/esri/licenses/
+#   - Portal license: *Portal*.json in /opt/esri/licenses/
+#   - Installer: ArcGIS_Enterprise_Builder_Linux*.tar.gz in /opt/esri/installers/
 ```
 
 </details>

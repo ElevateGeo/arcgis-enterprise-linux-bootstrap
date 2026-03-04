@@ -88,6 +88,81 @@ load_env() {
     set +a
 }
 
+# =============================================================================
+# Auto-Discovery Functions
+# =============================================================================
+auto_discover_fqdn() {
+    if [[ -n "${ARCGIS_FQDN:-}" ]]; then
+        log "Using configured FQDN: $ARCGIS_FQDN"
+        return
+    fi
+    
+    log "Auto-detecting FQDN..."
+    
+    # Try hostname -f first
+    local detected_fqdn=$(hostname -f 2>/dev/null)
+    
+    if [[ -z "$detected_fqdn" ]]; then
+        detected_fqdn=$(hostname 2>/dev/null)
+    fi
+    
+    # Warn if it looks like a cloud internal hostname
+    if [[ "$detected_fqdn" =~ \.(internal|local|cloudapp|compute|amazonaws|googleusercontent)\. ]]; then
+        log_warn "Detected FQDN '$detected_fqdn' appears to be an internal cloud hostname"
+        log_warn "For production, set ARCGIS_FQDN in .env to your public domain (e.g., gis.example.com)"
+        log_warn "Proceeding with detected hostname..."
+    fi
+    
+    if [[ -n "$detected_fqdn" ]]; then
+        ARCGIS_FQDN="$detected_fqdn"
+        export ARCGIS_FQDN
+        log "  Auto-detected FQDN: $ARCGIS_FQDN"
+    fi
+}
+
+auto_discover_files() {
+    log "Auto-discovering license files and installer..."
+    
+    local license_dir="${ARCGIS_LICENSE_DIR:-/opt/esri/licenses}"
+    local installer_dir="${ARCGIS_INSTALLER_DIR:-/opt/esri/installers}"
+    
+    # Auto-discover Server license (.prvc file)
+    if [[ -z "${ARCGIS_SERVER_LICENSE:-}" ]]; then
+        local server_license=$(find "$license_dir" -maxdepth 1 -name "*.prvc" -type f 2>/dev/null | head -1)
+        if [[ -n "$server_license" ]]; then
+            ARCGIS_SERVER_LICENSE="$server_license"
+            log "  Found Server license: $server_license"
+        fi
+    else
+        log "  Using configured Server license: $ARCGIS_SERVER_LICENSE"
+    fi
+    
+    # Auto-discover Portal license (Portal*.json or *Portal*.json)
+    if [[ -z "${ARCGIS_PORTAL_LICENSE:-}" ]]; then
+        local portal_license=$(find "$license_dir" -maxdepth 1 -name "*Portal*.json" -type f 2>/dev/null | head -1)
+        if [[ -n "$portal_license" ]]; then
+            ARCGIS_PORTAL_LICENSE="$portal_license"
+            log "  Found Portal license: $portal_license"
+        fi
+    else
+        log "  Using configured Portal license: $ARCGIS_PORTAL_LICENSE"
+    fi
+    
+    # Auto-discover Enterprise Builder installer tarball
+    if [[ -z "${ARCGIS_INSTALLER_TAR:-}" ]]; then
+        local installer=$(find "$installer_dir" -maxdepth 1 -name "ArcGIS_Enterprise_Builder_Linux*.tar.gz" -type f 2>/dev/null | head -1)
+        if [[ -n "$installer" ]]; then
+            ARCGIS_INSTALLER_TAR="$installer"
+            log "  Found installer: $installer"
+        fi
+    else
+        log "  Using configured installer: $ARCGIS_INSTALLER_TAR"
+    fi
+    
+    # Export for subprocesses
+    export ARCGIS_SERVER_LICENSE ARCGIS_PORTAL_LICENSE ARCGIS_INSTALLER_TAR
+}
+
 validate_config() {
     log "Validating configuration..."
     
@@ -96,9 +171,6 @@ validate_config() {
         "ARCGIS_ADMIN_USER"
         "ARCGIS_ADMIN_PASSWORD"
         "ARCGIS_ADMIN_EMAIL"
-        "ARCGIS_SERVER_LICENSE"
-        "ARCGIS_PORTAL_LICENSE"
-        "ARCGIS_INSTALLER_TAR"
         "ARCGIS_RUN_AS_USER"
         "LETSENCRYPT_EMAIL"
     )
@@ -118,14 +190,27 @@ validate_config() {
         exit 1
     fi
     
-    # Validate files exist
+    # Validate auto-discovered/configured files exist
+    if [[ -z "${ARCGIS_SERVER_LICENSE:-}" ]]; then
+        log_error "Server license not found. Place a .prvc file in /opt/esri/licenses/ or set ARCGIS_SERVER_LICENSE in .env"
+        exit 1
+    fi
     if [[ ! -f "$ARCGIS_SERVER_LICENSE" ]]; then
         log_error "Server license file not found: $ARCGIS_SERVER_LICENSE"
         exit 1
     fi
     
+    if [[ -z "${ARCGIS_PORTAL_LICENSE:-}" ]]; then
+        log_error "Portal license not found. Place a *Portal*.json file in /opt/esri/licenses/ or set ARCGIS_PORTAL_LICENSE in .env"
+        exit 1
+    fi
     if [[ ! -f "$ARCGIS_PORTAL_LICENSE" ]]; then
         log_error "Portal license file not found: $ARCGIS_PORTAL_LICENSE"
+        exit 1
+    fi
+    
+    if [[ -z "${ARCGIS_INSTALLER_TAR:-}" ]]; then
+        log_error "Installer not found. Place ArcGIS_Enterprise_Builder_Linux*.tar.gz in /opt/esri/installers/ or set ARCGIS_INSTALLER_TAR in .env"
         exit 1
     fi
     
@@ -194,6 +279,37 @@ EOF
     fi
     
     log "System limits configured"
+}
+
+configure_hosts_file() {
+    log_section "Configuring Hosts File"
+    
+    # ArcGIS components communicate with each other using the FQDN.
+    # The machine must resolve its own FQDN locally to avoid hairpin NAT
+    # (traffic going out to internet and back).
+    
+    local hosts_entry="127.0.0.1 ${ARCGIS_FQDN}"
+    
+    if grep -q "^127\.0\.0\.1.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
+        log "Hosts file already configured for ${ARCGIS_FQDN}"
+    elif grep -q "${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
+        # FQDN exists but not pointing to 127.0.0.1 - update it
+        log_warn "Updating existing hosts entry for ${ARCGIS_FQDN}"
+        sed -i "/${ARCGIS_FQDN}/d" /etc/hosts
+        echo "$hosts_entry" >> /etc/hosts
+        log "Updated: $hosts_entry"
+    else
+        # Add new entry
+        log "Adding hosts entry: $hosts_entry"
+        echo "$hosts_entry" >> /etc/hosts
+    fi
+    
+    # Verify the entry
+    if getent hosts "$ARCGIS_FQDN" | grep -q "127.0.0.1"; then
+        log "Verified: ${ARCGIS_FQDN} resolves to 127.0.0.1 locally"
+    else
+        log_warn "Could not verify hosts resolution. Check /etc/hosts manually."
+    fi
 }
 
 create_arcgis_user() {
@@ -680,11 +796,14 @@ main() {
     # Pre-flight checks
     check_root
     load_env
+    auto_discover_fqdn
+    auto_discover_files
     validate_config
     
     # System preparation
     install_system_dependencies
     configure_system_limits
+    configure_hosts_file
     create_arcgis_user
     create_directories
     
