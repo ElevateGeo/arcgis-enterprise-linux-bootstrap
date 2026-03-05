@@ -1383,8 +1383,7 @@ configure_base_deployment() {
     # -fn: first name, -ln: last name, -u: username, -p: password, -e: email
     # -qi: question index (1-14), -qa: question answer
     # -ws: server web adaptor URL, -wp: portal web adaptor URL
-    # -d: content directory
-    # Note: Portal license is applied during Phase 1 software installation, NOT here
+    # -d: content directory, -lf: portal license file, -ut: user type (optional)
     
     local content_dir="${ARCGIS_INSTALL_DIR}/portal/usr/arcgisportal/content"
     local server_wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_SERVER_CONTEXT}"
@@ -1405,6 +1404,7 @@ configure_base_deployment() {
         -ws "$server_wa_url" \
         -wp "$portal_wa_url" \
         -d "$content_dir" \
+        -lf "$ARCGIS_PORTAL_LICENSE" \
         2>&1 | tee -a "$LOG_FILE"
     
     local config_exit_code=${PIPESTATUS[0]}
