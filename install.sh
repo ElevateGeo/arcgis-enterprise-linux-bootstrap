@@ -942,12 +942,14 @@ deploy_web_adaptor_wars() {
     # Deploy two instances of Web Adaptor: one for Server, one for Portal
     local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
     local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    local need_restart=false
     
     # Deploy Server Web Adaptor
     if [[ ! -d "${tomcat_webapps}/${server_context}" ]]; then
         log "Deploying Server Web Adaptor as /${server_context}"
         cp "$wa_war" "${tomcat_webapps}/${server_context}.war"
         chown tomcat:tomcat "${tomcat_webapps}/${server_context}.war"
+        need_restart=true
     else
         log "Server Web Adaptor already deployed at /${server_context}"
     fi
@@ -957,27 +959,57 @@ deploy_web_adaptor_wars() {
         log "Deploying Portal Web Adaptor as /${portal_context}"
         cp "$wa_war" "${tomcat_webapps}/${portal_context}.war"
         chown tomcat:tomcat "${tomcat_webapps}/${portal_context}.war"
+        need_restart=true
     else
         log "Portal Web Adaptor already deployed at /${portal_context}"
     fi
     
-    # Restart Tomcat to deploy WARs
-    log "Restarting Tomcat to deploy Web Adaptors..."
-    systemctl restart tomcat
-    sleep 10
-    
-    # Wait for WARs to be extracted
-    local max_wait=60
-    local waited=0
-    while [[ ! -d "${tomcat_webapps}/${server_context}" ]] || [[ ! -d "${tomcat_webapps}/${portal_context}" ]]; do
-        if [[ $waited -ge $max_wait ]]; then
-            log_error "Timed out waiting for Web Adaptor WARs to deploy"
-            exit 1
-        fi
+    # Only restart if we deployed new WARs, or if Tomcat isn't listening on 443
+    if [[ "$need_restart" == "true" ]] || ! ss -tln 2>/dev/null | grep -q ":443 "; then
+        log "Restarting Tomcat to deploy Web Adaptors..."
+        systemctl stop tomcat || true
+        sleep 2
+        
+        # Kill any stale processes holding Tomcat ports
+        fuser -k 8005/tcp 2>/dev/null || true
+        fuser -k 80/tcp 2>/dev/null || true
+        fuser -k 443/tcp 2>/dev/null || true
+        sleep 3
+        
+        # Start Tomcat
+        systemctl start tomcat
         sleep 5
-        waited=$((waited + 5))
-        log "  Waiting for WAR deployment... ${waited}s"
-    done
+        
+        # Wait for HTTPS port to be ready
+        local port_wait=0
+        while ! ss -tln 2>/dev/null | grep -q ":443 "; do
+            if [[ $port_wait -ge 30 ]]; then
+                log_warn "Tomcat HTTPS port 443 not listening after 30 seconds"
+                break
+            fi
+            sleep 2
+            port_wait=$((port_wait + 2))
+        done
+        
+        # Wait for WARs to be extracted
+        local max_wait=60
+        local waited=0
+        while [[ ! -d "${tomcat_webapps}/${server_context}" ]] || [[ ! -d "${tomcat_webapps}/${portal_context}" ]]; do
+            if [[ $waited -ge $max_wait ]]; then
+                log_error "Timed out waiting for Web Adaptor WARs to deploy"
+                exit 1
+            fi
+            sleep 5
+            waited=$((waited + 5))
+            log "  Waiting for WAR deployment... ${waited}s"
+        done
+    else
+        log "Tomcat already running with Web Adaptors deployed"
+    fi
+    
+    if ss -tln 2>/dev/null | grep -q ":443 "; then
+        log "Tomcat HTTPS listening on port 443"
+    fi
     
     log "Web Adaptor WAR files deployed successfully"
 }
