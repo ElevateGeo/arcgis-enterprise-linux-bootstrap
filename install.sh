@@ -1027,14 +1027,8 @@ configure_web_adaptor_server() {
     log_section "Configuring Web Adaptor for ArcGIS Server"
     
     local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
-    local wa_config_tool="/opt/tomcat/webapps/${server_context}/WEB-INF/classes/configurewebadaptor.sh"
-    
-    # Check if already configured
-    if [[ -f "/opt/tomcat/webapps/${server_context}/WEB-INF/web.xml" ]]; then
-        if grep -q "configured" "/opt/tomcat/webapps/${server_context}/WEB-INF/web.xml" 2>/dev/null; then
-            log "Server Web Adaptor may already be configured"
-        fi
-    fi
+    local admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
+    local wa_url="https://${ARCGIS_FQDN}/${server_context}"
     
     # Wait for ArcGIS Server to be ready
     local server_url="https://${ARCGIS_FQDN}:6443/arcgis/rest/info?f=json"
@@ -1043,53 +1037,60 @@ configure_web_adaptor_server() {
         exit 1
     fi
     
-    # Find the configuration tool - check deployed WAR first, then Web Adaptor install
-    if [[ ! -f "$wa_config_tool" ]]; then
-        wa_config_tool=$(find "/opt/tomcat/webapps/${server_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
-    fi
+    # Check if already registered via REST API
+    local token_response=$(curl -sk -X POST "${admin_url}/generateToken" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASSWORD}" \
+        -d "client=requestip" \
+        -d "f=json" 2>/dev/null)
     
-    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
-        # Use the standalone configuration tool from Web Adaptor install
-        wa_config_tool=$(find "/opt/esri/webadaptor" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
-    fi
+    local token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
     
-    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
-        log_error "Web Adaptor configuration tool not found"
+    if [[ -z "$token" ]]; then
+        log_error "Could not obtain Server admin token"
         exit 1
     fi
     
-    log "Using config tool: $wa_config_tool"
-    chmod +x "$wa_config_tool"
-    
-    log "Registering Web Adaptor with ArcGIS Server..."
-    log "  Web Adaptor URL: https://${ARCGIS_FQDN}/${server_context}"
-    log "  Server Admin URL: https://${ARCGIS_FQDN}:6443/arcgis"
-    
-    "$wa_config_tool" \
-        -m server \
-        -w "https://${ARCGIS_FQDN}/${server_context}/webadaptor" \
-        -g "https://${ARCGIS_FQDN}:6443" \
-        -u "${ARCGIS_ADMIN_USER}" \
-        -p "${ARCGIS_ADMIN_PASSWORD}" \
-        -a true \
-        2>&1 | tee -a "$LOG_FILE"
-    
-    local exit_code=${PIPESTATUS[0]}
-    if [[ $exit_code -ne 0 ]]; then
-        log_warn "Web Adaptor Server configuration returned exit code: $exit_code"
-        log "Attempting alternative configuration method..."
-        # Try REST API configuration as fallback
-        configure_web_adaptor_via_api "server"
+    # Check existing Web Adaptors
+    local existing=$(curl -sk "${admin_url}/system/webadaptors?token=${token}&f=json" 2>/dev/null)
+    if echo "$existing" | grep -q "\"webAdaptorURL\":\"${wa_url}\""; then
+        log "Server Web Adaptor already registered at ${wa_url}"
+        return 0
     fi
     
-    log "Server Web Adaptor configured"
+    log "Registering Web Adaptor with ArcGIS Server..."
+    log "  Web Adaptor URL: ${wa_url}"
+    log "  Server Admin URL: ${admin_url}"
+    
+    # Get machine IP
+    local machine_ip=$(hostname -I | awk '{print $1}')
+    
+    # Register via REST API (Java tool has SSL/connectivity issues)
+    local register_response=$(curl -sk -X POST "${admin_url}/system/webadaptors/register" \
+        -d "webAdaptorURL=${wa_url}" \
+        -d "machineName=${ARCGIS_FQDN}" \
+        -d "machineIP=${machine_ip}" \
+        -d "isAdminEnabled=true" \
+        -d "httpPort=80" \
+        -d "httpsPort=443" \
+        -d "token=${token}" \
+        -d "f=json" 2>/dev/null)
+    
+    if echo "$register_response" | grep -q '"status":"success"'; then
+        log "Server Web Adaptor registered successfully"
+    else
+        log_error "Failed to register Server Web Adaptor: $register_response"
+        exit 1
+    fi
 }
 
 configure_web_adaptor_portal() {
     log_section "Configuring Web Adaptor for Portal"
     
     local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
-    local wa_config_tool=""
+    local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
+    local sharing_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest"
+    local wa_url="https://${ARCGIS_FQDN}/${portal_context}"
     
     # Wait for Portal to be ready
     local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin/healthCheck?f=json"
@@ -1098,82 +1099,53 @@ configure_web_adaptor_portal() {
         exit 1
     fi
     
-    # Find the configuration tool - check deployed WAR first, then Web Adaptor install
-    wa_config_tool=$(find "/opt/tomcat/webapps/${portal_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
-    
-    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
-        wa_config_tool=$(find "/opt/esri/webadaptor" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
-    fi
-    
-    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
-        log_error "Web Adaptor configuration tool not found"
-        exit 1
-    fi
-    
-    log "Using config tool: $wa_config_tool"
-    chmod +x "$wa_config_tool"
-    
-    log "Registering Web Adaptor with Portal for ArcGIS..."
-    log "  Web Adaptor URL: https://${ARCGIS_FQDN}/${portal_context}"
-    log "  Portal Admin URL: https://${ARCGIS_FQDN}:7443/arcgis"
-    
-    "$wa_config_tool" \
-        -m portal \
-        -w "https://${ARCGIS_FQDN}/${portal_context}/webadaptor" \
-        -g "https://${ARCGIS_FQDN}:7443" \
-        -u "${ARCGIS_ADMIN_USER}" \
-        -p "${ARCGIS_ADMIN_PASSWORD}" \
-        2>&1 | tee -a "$LOG_FILE"
-    
-    local exit_code=${PIPESTATUS[0]}
-    if [[ $exit_code -ne 0 ]]; then
-        log_warn "Web Adaptor Portal configuration returned exit code: $exit_code"
-    fi
-    
-    log "Portal Web Adaptor configured"
-}
-
-configure_web_adaptor_via_api() {
-    local mode="$1"  # "server" or "portal"
-    
-    log "Configuring Web Adaptor via REST API for ${mode}..."
-    
-    if [[ "$mode" == "server" ]]; then
-        local admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
-        local wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
-    else
-        local admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
-        local wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
-    fi
-    
-    # Get token
-    local token_response=$(curl -sk -X POST "${admin_url}/generateToken" \
+    # Portal uses the sharing API for token generation
+    local token_response=$(curl -sk -X POST "${sharing_url}/generateToken" \
         -d "username=${ARCGIS_ADMIN_USER}" \
         -d "password=${ARCGIS_ADMIN_PASSWORD}" \
         -d "client=referer" \
-        -d "referer=${admin_url}" \
+        -d "referer=https://${ARCGIS_FQDN}" \
         -d "f=json" 2>/dev/null)
     
     local token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
     
     if [[ -z "$token" ]]; then
-        log_warn "Could not obtain token for ${mode} API configuration"
-        return 1
+        log_error "Could not obtain Portal admin token"
+        exit 1
     fi
     
-    if [[ "$mode" == "server" ]]; then
-        # Register Web Adaptor with Server
-        curl -sk -X POST "${admin_url}/system/webadaptors/register" \
-            -d "webAdaptorURL=${wa_url}" \
-            -d "machineName=${ARCGIS_FQDN}" \
-            -d "httpPort=80" \
-            -d "httpsPort=443" \
-            -d "isAdminEnabled=true" \
-            -d "token=${token}" \
-            -d "f=json" 2>/dev/null
+    # Check existing Web Adaptors
+    local existing=$(curl -sk -H "Referer: https://${ARCGIS_FQDN}" \
+        "${portal_admin_url}/system/webadaptors?token=${token}&f=json" 2>/dev/null)
+    if echo "$existing" | grep -q "\"webAdaptorURL\":\"${wa_url}\""; then
+        log "Portal Web Adaptor already registered at ${wa_url}"
+        return 0
     fi
     
-    log "API configuration attempted for ${mode}"
+    log "Registering Web Adaptor with Portal for ArcGIS..."
+    log "  Web Adaptor URL: ${wa_url}"
+    log "  Portal Admin URL: ${portal_admin_url}"
+    
+    # Get machine IP
+    local machine_ip=$(hostname -I | awk '{print $1}')
+    
+    # Register via REST API (Java tool has SSL/connectivity issues)
+    local register_response=$(curl -sk -X POST "${portal_admin_url}/system/webadaptors/register" \
+        -H "Referer: https://${ARCGIS_FQDN}" \
+        -d "webAdaptorURL=${wa_url}" \
+        -d "machineName=${ARCGIS_FQDN}" \
+        -d "machineIP=${machine_ip}" \
+        -d "httpPort=80" \
+        -d "httpsPort=443" \
+        -d "token=${token}" \
+        -d "f=json" 2>/dev/null)
+    
+    if echo "$register_response" | grep -q '"status":"success"'; then
+        log "Portal Web Adaptor registered successfully"
+    else
+        log_error "Failed to register Portal Web Adaptor: $register_response"
+        exit 1
+    fi
 }
 
 # =============================================================================
