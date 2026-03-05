@@ -129,6 +129,12 @@ nano .env
 ARCGIS_ADMIN_USER=admin
 ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
 ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
+ARCGIS_ADMIN_FIRSTNAME=Admin
+ARCGIS_ADMIN_LASTNAME=User
+ARCGIS_ADMIN_SECURITY_ANSWER=YourSecretAnswer
+
+# OS User (will be created if doesn't exist)
+ARCGIS_RUN_AS_USER=arcgis
 
 # Let's Encrypt
 LETSENCRYPT_EMAIL=admin@yourdomain.com
