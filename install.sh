@@ -582,54 +582,102 @@ EOF
 }
 
 run_enterprise_builder() {
-    log_section "Running ArcGIS Enterprise Builder"
+    log_section "Phase 1: Installing ArcGIS Enterprise Builder Software"
     
     local builder_dir="/opt/esri/builder"
-    local props_file="${builder_dir}/enterprise.properties"
+    local setup_binary="${builder_dir}/EnterpriseBuilder/Setup"
     
-    # Find the setup script
-    local setup_script=$(find "$builder_dir" -name "Setup.sh" -o -name "setup.sh" | head -1)
-    
-    if [[ -z "$setup_script" ]]; then
-        # Try to find in extracted directory
-        setup_script=$(find "$builder_dir" -name "*.sh" -path "*Builder*" | head -1)
-    fi
-    
-    if [[ -z "$setup_script" ]]; then
-        log_error "Could not find Enterprise Builder setup script"
+    if [[ ! -f "$setup_binary" ]]; then
+        log_error "Setup binary not found at: $setup_binary"
         log "Contents of builder directory:"
-        ls -la "$builder_dir"
+        ls -laR "$builder_dir" | head -50
         exit 1
     fi
     
-    log "Found setup script: $setup_script"
-    chmod +x "$setup_script"
+    chmod +x "$setup_binary"
     
-    log "Starting ArcGIS Enterprise installation..."
-    log "This will take 30-60 minutes. Check $LOG_FILE for details."
+    log "Running Enterprise Builder silent installation..."
+    log "Install directory: $ARCGIS_INSTALL_DIR"
+    log "Server license: $ARCGIS_SERVER_LICENSE"
+    log "This may take 15-30 minutes..."
     
-    # Run the installer
-    cd "$(dirname "$setup_script")"
+    # Run the silent installer as the arcgis user
+    # Per Esri docs: ./Setup -m silent -l yes -s /path/to/server.prvc -d /install/path
+    sudo -u "$ARCGIS_RUN_AS_USER" "$setup_binary" \
+        -m silent \
+        -l yes \
+        -s "$ARCGIS_SERVER_LICENSE" \
+        -d "$ARCGIS_INSTALL_DIR" \
+        2>&1 | tee -a "$LOG_FILE"
     
-    # The Enterprise Builder command-line mode
-    if [[ -f "${builder_dir}/ArcGISEnterpriseBuilder/EnterpriseBuilder.sh" ]]; then
-        sudo -u "$ARCGIS_RUN_AS_USER" "${builder_dir}/ArcGISEnterpriseBuilder/EnterpriseBuilder.sh" \
-            -f "$props_file" \
-            2>&1 | tee -a "$LOG_FILE"
-    else
-        # Alternative: Look for the standard pattern
-        local eb_script=$(find "$builder_dir" -name "EnterpriseBuilder.sh" -o -name "enterprisebuilder.sh" | head -1)
-        if [[ -n "$eb_script" ]]; then
-            chmod +x "$eb_script"
-            sudo -u "$ARCGIS_RUN_AS_USER" "$eb_script" -f "$props_file" 2>&1 | tee -a "$LOG_FILE"
-        else
-            log_warn "Could not find EnterpriseBuilder.sh, attempting alternative installation..."
-            # Run Setup.sh with silent mode
-            sudo -u "$ARCGIS_RUN_AS_USER" "$setup_script" -l yes -a "$props_file" 2>&1 | tee -a "$LOG_FILE"
-        fi
+    local install_exit_code=${PIPESTATUS[0]}
+    
+    if [[ $install_exit_code -ne 0 ]]; then
+        log_error "Enterprise Builder installation failed with exit code: $install_exit_code"
+        log "Check $LOG_FILE for details"
+        exit 1
     fi
     
-    log "ArcGIS Enterprise installation completed"
+    log "Software installation completed successfully"
+}
+
+configure_base_deployment() {
+    log_section "Phase 2: Configuring ArcGIS Enterprise Base Deployment"
+    
+    # The configurebasedeployment tool is installed to the server tools directory
+    local config_tool="${ARCGIS_INSTALL_DIR}/server/tools/configurebasedeployment/configurebasedeployment"
+    
+    if [[ ! -f "$config_tool" ]]; then
+        log_error "configurebasedeployment tool not found at: $config_tool"
+        log "Checking alternative locations..."
+        config_tool=$(find "$ARCGIS_INSTALL_DIR" -name "configurebasedeployment" -type f 2>/dev/null | head -1)
+        if [[ -z "$config_tool" ]]; then
+            log_error "Could not find configurebasedeployment tool"
+            exit 1
+        fi
+        log "Found at: $config_tool"
+    fi
+    
+    chmod +x "$config_tool"
+    
+    log "Configuring base deployment..."
+    log "FQDN: $ARCGIS_FQDN"
+    log "Admin user: $ARCGIS_ADMIN_USER"
+    log "This may take 30-45 minutes..."
+    
+    # Per Esri docs, the configurebasedeployment tool parameters:
+    # -fn: first name, -ln: last name, -u: username, -p: password, -e: email
+    # -qi: question index (1-14), -qa: question answer
+    # -ws: server web adaptor URL, -wp: portal web adaptor URL
+    # -d: content directory, -lf: portal license file, -ut: user type (optional)
+    
+    local content_dir="${ARCGIS_INSTALL_DIR}/usr"
+    local server_wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_SERVER_CONTEXT}"
+    local portal_wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_PORTAL_CONTEXT}"
+    
+    sudo -u "$ARCGIS_RUN_AS_USER" "$config_tool" \
+        -fn "$ARCGIS_ADMIN_FIRSTNAME" \
+        -ln "$ARCGIS_ADMIN_LASTNAME" \
+        -u "$ARCGIS_ADMIN_USER" \
+        -p "$ARCGIS_ADMIN_PASSWORD" \
+        -e "$ARCGIS_ADMIN_EMAIL" \
+        -qi "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" \
+        -qa "$ARCGIS_ADMIN_SECURITY_ANSWER" \
+        -ws "$server_wa_url" \
+        -wp "$portal_wa_url" \
+        -d "$content_dir" \
+        -lf "$ARCGIS_PORTAL_LICENSE" \
+        2>&1 | tee -a "$LOG_FILE"
+    
+    local config_exit_code=${PIPESTATUS[0]}
+    
+    if [[ $config_exit_code -ne 0 ]]; then
+        log_error "Base deployment configuration failed with exit code: $config_exit_code"
+        log "Check $LOG_FILE for details"
+        exit 1
+    fi
+    
+    log "Base deployment configuration completed successfully"
 }
 
 # =============================================================================
@@ -868,10 +916,12 @@ main() {
     # SSL Setup (before ArcGIS so cert is ready)
     setup_ssl_certificate
     
-    # ArcGIS Installation
+    # ArcGIS Installation - Phase 1: Install software
     extract_installer
-    generate_properties_file
     run_enterprise_builder
+    
+    # ArcGIS Installation - Phase 2: Configure base deployment
+    configure_base_deployment
     
     # Post-installation
     import_ssl_certificate
