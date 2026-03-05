@@ -625,14 +625,16 @@ configure_base_deployment() {
     log_section "Phase 2: Configuring ArcGIS Enterprise Base Deployment"
     
     # The configurebasedeployment tool is installed to the server tools directory
-    local config_tool="${ARCGIS_INSTALL_DIR}/server/tools/configurebasedeployment/configurebasedeployment"
+    local config_tool="${ARCGIS_INSTALL_DIR}/server/tools/configurebasedeployment/configurebasedeployment.sh"
     
     if [[ ! -f "$config_tool" ]]; then
-        log_error "configurebasedeployment tool not found at: $config_tool"
-        log "Checking alternative locations..."
-        config_tool=$(find "$ARCGIS_INSTALL_DIR" -name "configurebasedeployment" -type f 2>/dev/null | head -1)
+        log_warn "configurebasedeployment.sh not found at expected location: $config_tool"
+        log "Searching for configurebasedeployment..."
+        config_tool=$(find "$ARCGIS_INSTALL_DIR" -name "configurebasedeployment.sh" -type f 2>/dev/null | head -1)
         if [[ -z "$config_tool" ]]; then
-            log_error "Could not find configurebasedeployment tool"
+            log_error "Could not find configurebasedeployment.sh tool"
+            log "You may need to run configuration manually via the browser at:"
+            log "  https://${ARCGIS_FQDN}:6443/arcgis/enterprise"
             exit 1
         fi
         log "Found at: $config_tool"
