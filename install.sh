@@ -500,12 +500,445 @@ HOOK
 }
 
 # =============================================================================
+# Tomcat Installation and Configuration
+# =============================================================================
+install_tomcat() {
+    log_section "Installing Apache Tomcat"
+    
+    # Check if Tomcat is already installed
+    if [[ -d "/opt/tomcat" ]] && [[ -f "/opt/tomcat/bin/catalina.sh" ]]; then
+        log "Tomcat already installed at /opt/tomcat"
+        return 0
+    fi
+    
+    local tomcat_version="10.1.34"
+    local tomcat_url="https://dlcdn.apache.org/tomcat/tomcat-10/v${tomcat_version}/bin/apache-tomcat-${tomcat_version}.tar.gz"
+    local tomcat_dir="/opt/tomcat"
+    local download_dir="/tmp"
+    
+    log "Installing OpenJDK 17..."
+    apt-get install -y -qq openjdk-17-jdk
+    
+    # Set JAVA_HOME
+    export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
+    echo "JAVA_HOME=${JAVA_HOME}" > /etc/environment
+    
+    log "Downloading Tomcat ${tomcat_version}..."
+    wget -q -O "${download_dir}/tomcat.tar.gz" "$tomcat_url" || {
+        # Fallback to archive if latest not available
+        tomcat_url="https://archive.apache.org/dist/tomcat/tomcat-10/v${tomcat_version}/bin/apache-tomcat-${tomcat_version}.tar.gz"
+        wget -q -O "${download_dir}/tomcat.tar.gz" "$tomcat_url"
+    }
+    
+    log "Extracting Tomcat..."
+    mkdir -p "$tomcat_dir"
+    tar -xzf "${download_dir}/tomcat.tar.gz" -C "$tomcat_dir" --strip-components=1
+    rm -f "${download_dir}/tomcat.tar.gz"
+    
+    # Create tomcat user if not exists
+    if ! id "tomcat" &>/dev/null; then
+        useradd -r -M -U -d "$tomcat_dir" -s /bin/false tomcat
+    fi
+    
+    # Set ownership
+    chown -R tomcat:tomcat "$tomcat_dir"
+    chmod +x ${tomcat_dir}/bin/*.sh
+    
+    log "Tomcat installed to $tomcat_dir"
+}
+
+configure_tomcat_ssl() {
+    log_section "Configuring Tomcat SSL"
+    
+    local tomcat_dir="/opt/tomcat"
+    local cert_dir="/etc/letsencrypt/live/${ARCGIS_FQDN}"
+    local keystore_file="${tomcat_dir}/conf/keystore.p12"
+    local keystore_password="${ARCGIS_ADMIN_PASSWORD}"
+    
+    # Create PKCS12 keystore for Tomcat
+    log "Creating Tomcat SSL keystore..."
+    openssl pkcs12 -export \
+        -in "${cert_dir}/fullchain.pem" \
+        -inkey "${cert_dir}/privkey.pem" \
+        -out "$keystore_file" \
+        -name tomcat \
+        -password "pass:${keystore_password}"
+    
+    chown tomcat:tomcat "$keystore_file"
+    chmod 640 "$keystore_file"
+    
+    # Backup original server.xml
+    if [[ ! -f "${tomcat_dir}/conf/server.xml.orig" ]]; then
+        cp "${tomcat_dir}/conf/server.xml" "${tomcat_dir}/conf/server.xml.orig"
+    fi
+    
+    # Configure server.xml with SSL connector
+    log "Configuring Tomcat server.xml..."
+    cat > "${tomcat_dir}/conf/server.xml" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<Server port="8005" shutdown="SHUTDOWN">
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
+  <Listener className="org.apache.catalina.core.AprLifecycleListener" SSLEngine="on" />
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+  <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+
+  <GlobalNamingResources>
+    <Resource name="UserDatabase" auth="Container"
+              type="org.apache.catalina.UserDatabase"
+              description="User database that can be updated and saved"
+              factory="org.apache.catalina.users.MemoryUserDatabaseFactory"
+              pathname="conf/tomcat-users.xml" />
+  </GlobalNamingResources>
+
+  <Service name="Catalina">
+    <!-- HTTP connector - redirect to HTTPS -->
+    <Connector port="80" protocol="HTTP/1.1"
+               connectionTimeout="20000"
+               redirectPort="443" />
+
+    <!-- HTTPS connector -->
+    <Connector port="443" protocol="org.apache.coyote.http11.Http11NioProtocol"
+               maxThreads="150" SSLEnabled="true"
+               scheme="https" secure="true">
+        <SSLHostConfig>
+            <Certificate certificateKeystoreFile="conf/keystore.p12"
+                         certificateKeystorePassword="${keystore_password}"
+                         certificateKeystoreType="PKCS12"
+                         certificateKeyAlias="tomcat" />
+        </SSLHostConfig>
+    </Connector>
+
+    <Engine name="Catalina" defaultHost="localhost">
+      <Realm className="org.apache.catalina.realm.LockOutRealm">
+        <Realm className="org.apache.catalina.realm.UserDatabaseRealm"
+               resourceName="UserDatabase"/>
+      </Realm>
+
+      <Host name="localhost" appBase="webapps"
+            unpackWARs="true" autoDeploy="true">
+        <Valve className="org.apache.catalina.valves.AccessLogValve" directory="logs"
+               prefix="localhost_access_log" suffix=".txt"
+               pattern="%h %l %u %t &quot;%r&quot; %s %b" />
+      </Host>
+    </Engine>
+  </Service>
+</Server>
+EOF
+    
+    chown tomcat:tomcat "${tomcat_dir}/conf/server.xml"
+    
+    log "Tomcat SSL configured"
+}
+
+create_tomcat_service() {
+    log "Creating Tomcat systemd service..."
+    
+    local java_home=$(dirname $(dirname $(readlink -f $(which java))))
+    
+    cat > /etc/systemd/system/tomcat.service << EOF
+[Unit]
+Description=Apache Tomcat Web Application Container
+After=network.target
+
+[Service]
+Type=forking
+
+Environment=JAVA_HOME=${java_home}
+Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid
+Environment=CATALINA_HOME=/opt/tomcat
+Environment=CATALINA_BASE=/opt/tomcat
+Environment='CATALINA_OPTS=-Xms512M -Xmx2048M -server -XX:+UseParallelGC'
+Environment='JAVA_OPTS=-Djava.awt.headless=true -Djava.security.egd=file:/dev/./urandom'
+
+ExecStart=/opt/tomcat/bin/startup.sh
+ExecStop=/opt/tomcat/bin/shutdown.sh
+
+User=tomcat
+Group=tomcat
+UMask=0007
+RestartSec=10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable tomcat
+    
+    log "Tomcat service created"
+}
+
+start_tomcat() {
+    log "Starting Tomcat..."
+    
+    systemctl start tomcat
+    sleep 5
+    
+    if systemctl is-active --quiet tomcat; then
+        log "Tomcat started successfully"
+    else
+        log_error "Tomcat failed to start"
+        journalctl -u tomcat --no-pager -n 20
+        exit 1
+    fi
+}
+
+# =============================================================================
+# Web Adaptor Installation
+# =============================================================================
+install_web_adaptor() {
+    log_section "Installing ArcGIS Web Adaptor"
+    
+    local wa_installer_dir="/opt/esri/installers/WebAdaptor"
+    local wa_setup="${wa_installer_dir}/WebAdaptor/Setup"
+    local wa_install_dir="/opt/esri/webadaptor"
+    
+    # Check if Web Adaptor is already installed
+    if [[ -d "${wa_install_dir}/java" ]]; then
+        log "Web Adaptor already installed at ${wa_install_dir}"
+        return 0
+    fi
+    
+    # Check for Web Adaptor installer
+    if [[ ! -f "$wa_setup" ]]; then
+        # Try to find it elsewhere
+        wa_setup=$(find /opt/esri -path "*/WebAdaptor/Setup" -type f 2>/dev/null | head -1)
+        if [[ -z "$wa_setup" ]]; then
+            log_error "Web Adaptor installer not found!"
+            log_error "Please place the Web Adaptor installer in /opt/esri/installers/WebAdaptor/"
+            exit 1
+        fi
+    fi
+    
+    log "Installing Web Adaptor from: $wa_setup"
+    chmod +x "$wa_setup"
+    
+    # Install Web Adaptor silently
+    sudo -u "$ARCGIS_RUN_AS_USER" "$wa_setup" -m silent -l yes -d "$wa_install_dir" \
+        2>&1 | tee -a "$LOG_FILE"
+    
+    log "Web Adaptor installed to $wa_install_dir"
+}
+
+deploy_web_adaptor_wars() {
+    log_section "Deploying Web Adaptor WAR Files to Tomcat"
+    
+    local wa_install_dir="/opt/esri/webadaptor"
+    local tomcat_webapps="/opt/tomcat/webapps"
+    local wa_war="${wa_install_dir}/java/arcgis.war"
+    
+    if [[ ! -f "$wa_war" ]]; then
+        log_error "Web Adaptor WAR file not found at: $wa_war"
+        exit 1
+    fi
+    
+    # Deploy two instances of Web Adaptor: one for Server, one for Portal
+    local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    
+    # Deploy Server Web Adaptor
+    if [[ ! -d "${tomcat_webapps}/${server_context}" ]]; then
+        log "Deploying Server Web Adaptor as /${server_context}"
+        cp "$wa_war" "${tomcat_webapps}/${server_context}.war"
+        chown tomcat:tomcat "${tomcat_webapps}/${server_context}.war"
+    else
+        log "Server Web Adaptor already deployed at /${server_context}"
+    fi
+    
+    # Deploy Portal Web Adaptor
+    if [[ ! -d "${tomcat_webapps}/${portal_context}" ]]; then
+        log "Deploying Portal Web Adaptor as /${portal_context}"
+        cp "$wa_war" "${tomcat_webapps}/${portal_context}.war"
+        chown tomcat:tomcat "${tomcat_webapps}/${portal_context}.war"
+    else
+        log "Portal Web Adaptor already deployed at /${portal_context}"
+    fi
+    
+    # Restart Tomcat to deploy WARs
+    log "Restarting Tomcat to deploy Web Adaptors..."
+    systemctl restart tomcat
+    sleep 10
+    
+    # Wait for WARs to be extracted
+    local max_wait=60
+    local waited=0
+    while [[ ! -d "${tomcat_webapps}/${server_context}" ]] || [[ ! -d "${tomcat_webapps}/${portal_context}" ]]; do
+        if [[ $waited -ge $max_wait ]]; then
+            log_error "Timed out waiting for Web Adaptor WARs to deploy"
+            exit 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        log "  Waiting for WAR deployment... ${waited}s"
+    done
+    
+    log "Web Adaptor WAR files deployed successfully"
+}
+
+configure_web_adaptor_server() {
+    log_section "Configuring Web Adaptor for ArcGIS Server"
+    
+    local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    local wa_config_tool="/opt/tomcat/webapps/${server_context}/WEB-INF/classes/configurewebadaptor.sh"
+    
+    # Check if already configured
+    if [[ -f "/opt/tomcat/webapps/${server_context}/WEB-INF/web.xml" ]]; then
+        if grep -q "configured" "/opt/tomcat/webapps/${server_context}/WEB-INF/web.xml" 2>/dev/null; then
+            log "Server Web Adaptor may already be configured"
+        fi
+    fi
+    
+    # Wait for ArcGIS Server to be ready
+    local server_url="https://${ARCGIS_FQDN}:6443/arcgis/rest/info?f=json"
+    if ! wait_for_service "$server_url" "ArcGIS Server" 30 10; then
+        log_error "ArcGIS Server not responding. Cannot configure Web Adaptor."
+        exit 1
+    fi
+    
+    # Find the configuration tool
+    if [[ ! -f "$wa_config_tool" ]]; then
+        wa_config_tool=$(find "/opt/tomcat/webapps/${server_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
+    fi
+    
+    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
+        # Use the standalone configuration tool from Web Adaptor install
+        wa_config_tool="/opt/esri/webadaptor/java/tools/configurewebadaptor.sh"
+    fi
+    
+    if [[ ! -f "$wa_config_tool" ]]; then
+        log_error "Web Adaptor configuration tool not found"
+        exit 1
+    fi
+    
+    chmod +x "$wa_config_tool"
+    
+    log "Registering Web Adaptor with ArcGIS Server..."
+    log "  Web Adaptor URL: https://${ARCGIS_FQDN}/${server_context}"
+    log "  Server Admin URL: https://${ARCGIS_FQDN}:6443/arcgis"
+    
+    "$wa_config_tool" \
+        -m server \
+        -w "https://${ARCGIS_FQDN}/${server_context}/webadaptor" \
+        -g "https://${ARCGIS_FQDN}:6443" \
+        -u "${ARCGIS_ADMIN_USER}" \
+        -p "${ARCGIS_ADMIN_PASSWORD}" \
+        -a true \
+        2>&1 | tee -a "$LOG_FILE"
+    
+    local exit_code=${PIPESTATUS[0]}
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Web Adaptor Server configuration returned exit code: $exit_code"
+        log "Attempting alternative configuration method..."
+        # Try REST API configuration as fallback
+        configure_web_adaptor_via_api "server"
+    fi
+    
+    log "Server Web Adaptor configured"
+}
+
+configure_web_adaptor_portal() {
+    log_section "Configuring Web Adaptor for Portal"
+    
+    local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    local wa_config_tool="/opt/esri/webadaptor/java/tools/configurewebadaptor.sh"
+    
+    # Wait for Portal to be ready
+    local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin/healthCheck?f=json"
+    if ! wait_for_service "$portal_url" "Portal for ArcGIS" 30 10; then
+        log_error "Portal not responding. Cannot configure Web Adaptor."
+        exit 1
+    fi
+    
+    if [[ ! -f "$wa_config_tool" ]]; then
+        wa_config_tool=$(find "/opt/tomcat/webapps/${portal_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
+    fi
+    
+    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
+        log_error "Web Adaptor configuration tool not found"
+        exit 1
+    fi
+    
+    chmod +x "$wa_config_tool"
+    
+    log "Registering Web Adaptor with Portal for ArcGIS..."
+    log "  Web Adaptor URL: https://${ARCGIS_FQDN}/${portal_context}"
+    log "  Portal Admin URL: https://${ARCGIS_FQDN}:7443/arcgis"
+    
+    "$wa_config_tool" \
+        -m portal \
+        -w "https://${ARCGIS_FQDN}/${portal_context}/webadaptor" \
+        -g "https://${ARCGIS_FQDN}:7443" \
+        -u "${ARCGIS_ADMIN_USER}" \
+        -p "${ARCGIS_ADMIN_PASSWORD}" \
+        2>&1 | tee -a "$LOG_FILE"
+    
+    local exit_code=${PIPESTATUS[0]}
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Web Adaptor Portal configuration returned exit code: $exit_code"
+    fi
+    
+    log "Portal Web Adaptor configured"
+}
+
+configure_web_adaptor_via_api() {
+    local mode="$1"  # "server" or "portal"
+    
+    log "Configuring Web Adaptor via REST API for ${mode}..."
+    
+    if [[ "$mode" == "server" ]]; then
+        local admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
+        local wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    else
+        local admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
+        local wa_url="https://${ARCGIS_FQDN}/${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    fi
+    
+    # Get token
+    local token_response=$(curl -sk -X POST "${admin_url}/generateToken" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASSWORD}" \
+        -d "client=referer" \
+        -d "referer=${admin_url}" \
+        -d "f=json" 2>/dev/null)
+    
+    local token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    
+    if [[ -z "$token" ]]; then
+        log_warn "Could not obtain token for ${mode} API configuration"
+        return 1
+    fi
+    
+    if [[ "$mode" == "server" ]]; then
+        # Register Web Adaptor with Server
+        curl -sk -X POST "${admin_url}/system/webadaptors/register" \
+            -d "webAdaptorURL=${wa_url}" \
+            -d "machineName=${ARCGIS_FQDN}" \
+            -d "httpPort=80" \
+            -d "httpsPort=443" \
+            -d "isAdminEnabled=true" \
+            -d "token=${token}" \
+            -d "f=json" 2>/dev/null
+    fi
+    
+    log "API configuration attempted for ${mode}"
+}
+
+# =============================================================================
 # ArcGIS Enterprise Builder Installation
 # =============================================================================
 extract_installer() {
     log_section "Extracting ArcGIS Enterprise Builder"
     
     local extract_dir="/opt/esri/builder"
+    local setup_binary="${extract_dir}/EnterpriseBuilder/Setup"
+    
+    # Check if already extracted
+    if [[ -f "$setup_binary" ]]; then
+        log "Installer already extracted at: $extract_dir"
+        return 0
+    fi
     
     log "Extracting installer tarball..."
     tar -xzf "$ARCGIS_INSTALLER_TAR" -C "$extract_dir"
@@ -587,6 +1020,12 @@ run_enterprise_builder() {
     local builder_dir="/opt/esri/builder"
     local setup_binary="${builder_dir}/EnterpriseBuilder/Setup"
     
+    # Check if already installed
+    if [[ -f "${ARCGIS_INSTALL_DIR}/server/startserver.sh" ]]; then
+        log "ArcGIS Enterprise software already installed at ${ARCGIS_INSTALL_DIR}"
+        return 0
+    fi
+    
     if [[ ! -f "$setup_binary" ]]; then
         log_error "Setup binary not found at: $setup_binary"
         log "Contents of builder directory:"
@@ -623,6 +1062,13 @@ run_enterprise_builder() {
 
 configure_base_deployment() {
     log_section "Phase 2: Configuring ArcGIS Enterprise Base Deployment"
+    
+    # Check if already configured by testing if Portal site exists
+    local portal_check=$(curl -sk "https://${ARCGIS_FQDN}:7443/arcgis/portaladmin/healthCheck?f=json" 2>/dev/null)
+    if echo "$portal_check" | grep -q '"status"'; then
+        log "Base deployment already configured (Portal responding)"
+        return 0
+    fi
     
     # The configurebasedeployment tool is installed to the server tools directory
     local config_tool="${ARCGIS_INSTALL_DIR}/server/tools/configurebasedeployment/configurebasedeployment.sh"
@@ -965,15 +1411,30 @@ main() {
     create_arcgis_user
     create_directories
     
-    # SSL Setup (before ArcGIS so cert is ready)
+    # SSL Setup (before Tomcat so cert is ready)
     setup_ssl_certificate
+    
+    # Tomcat Installation and SSL Configuration
+    install_tomcat
+    configure_tomcat_ssl
+    create_tomcat_service
+    start_tomcat
     
     # ArcGIS Installation - Phase 1: Install software
     extract_installer
     run_enterprise_builder
     
+    # Web Adaptor Installation
+    install_web_adaptor
+    deploy_web_adaptor_wars
+    
     # ArcGIS Installation - Phase 2: Configure base deployment
+    # This requires Web Adaptors to be reachable
     configure_base_deployment
+    
+    # Register Web Adaptors with ArcGIS components
+    configure_web_adaptor_server
+    configure_web_adaptor_portal
     
     # Post-installation
     import_ssl_certificate

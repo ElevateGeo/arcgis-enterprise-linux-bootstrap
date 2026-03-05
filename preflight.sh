@@ -189,7 +189,7 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-echo "Checking Installer..."
+echo "Checking Installers..."
 # -----------------------------------------------------------------------------
 
 # Auto-discover or use configured installer
@@ -198,11 +198,27 @@ if [[ -z "${ARCGIS_INSTALLER_TAR:-}" ]]; then
 fi
 if [[ -n "$ARCGIS_INSTALLER_TAR" ]] && [[ -f "$ARCGIS_INSTALLER_TAR" ]]; then
     SIZE=$(du -h "$ARCGIS_INSTALLER_TAR" | cut -f1)
-    check_pass "Installer: $ARCGIS_INSTALLER_TAR ($SIZE)"
+    check_pass "Enterprise Builder: $ARCGIS_INSTALLER_TAR ($SIZE)"
 elif [[ -n "$ARCGIS_INSTALLER_TAR" ]]; then
-    check_fail "Installer not found: $ARCGIS_INSTALLER_TAR"
+    check_fail "Enterprise Builder not found: $ARCGIS_INSTALLER_TAR"
 else
     check_fail "No ArcGIS_Enterprise_Builder_Linux*.tar.gz found in $INSTALLER_DIR"
+fi
+
+# Check for Web Adaptor installer
+WA_SETUP=$(find "$INSTALLER_DIR" -path "*/WebAdaptor/Setup" -type f 2>/dev/null | head -1)
+if [[ -n "$WA_SETUP" ]] && [[ -f "$WA_SETUP" ]]; then
+    check_pass "Web Adaptor installer: $WA_SETUP"
+else
+    # Check if tarball exists but not extracted
+    WA_TAR=$(find "$INSTALLER_DIR" -maxdepth 1 -name "ArcGIS_Web_Adaptor_Java_Linux*.tar.gz" -type f 2>/dev/null | head -1)
+    if [[ -n "$WA_TAR" ]]; then
+        check_warn "Web Adaptor tarball found but not extracted: $WA_TAR"
+        check_warn "  Run: cd $INSTALLER_DIR && sudo tar -xzf $(basename $WA_TAR)"
+    else
+        check_fail "No Web Adaptor installer found in $INSTALLER_DIR"
+        check_fail "  Download Web Adaptor (Java) from my.esri.com and extract to $INSTALLER_DIR"
+    fi
 fi
 
 echo ""

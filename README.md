@@ -67,8 +67,11 @@ Single-command installation of ArcGIS Enterprise on Linux following Esri's recom
 - ArcGIS Server license (`.prvc` or `.json`)
 - Portal for ArcGIS license (`.json`)
 
-**Installer:**
+**Installers:**
 - ArcGIS Enterprise Builder for Linux tarball
+- ArcGIS Web Adaptor (Java) for Linux
+
+> 📁 Place installers in `/opt/esri/installers/` — the script auto-discovers them.
 
 </details>
 
@@ -102,7 +105,7 @@ git clone https://github.com/ElevateGeo/arcgis-enterprise-linux-bootstrap.git ~/
 cd ~/arcgis-enterprise-linux-bootstrap
 ```
 
-### Step 2️⃣ — Upload Licenses & Installer
+### Step 2️⃣ — Upload Licenses & Installers
 
 ```bash
 # Create directories
@@ -111,7 +114,12 @@ sudo mkdir -p /opt/esri/installers
 
 # Upload your files (example using scp from local machine)
 scp ArcGIS_Enterprise_Builder_Linux_*.tar.gz user@vm:/opt/esri/installers/
+scp ArcGIS_Web_Adaptor_Java_Linux_*.tar.gz user@vm:/opt/esri/installers/
 scp *.prvc *.json user@vm:/opt/esri/licenses/
+
+# Extract Web Adaptor installer (script expects this structure)
+cd /opt/esri/installers
+sudo tar -xzf ArcGIS_Web_Adaptor_Java_Linux_*.tar.gz
 ```
 
 ### Step 3️⃣ — Configure
@@ -192,12 +200,16 @@ The installer deploys a **complete ArcGIS Enterprise base deployment**:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    ArcGIS Enterprise                         │
+│                    ArcGIS Enterprise                        │
 ├─────────────────┬─────────────────┬─────────────────────────┤
 │  Portal for     │  ArcGIS Server  │  ArcGIS Data Store      │
-│  ArcGIS         │                 │  (Relational + Tile)    │
+│  ArcGIS (:7443) │  (:6443)        │  (Relational + Tile)    │
 ├─────────────────┴─────────────────┴─────────────────────────┤
-│              Web Adaptor (Tomcat)                           │
+│              Web Adaptors (/server, /portal)                │
+├─────────────────────────────────────────────────────────────┤
+│              Apache Tomcat 10 (:443 HTTPS)                  │
+├─────────────────────────────────────────────────────────────┤
+│              Let's Encrypt SSL Certificate                  │
 ├─────────────────────────────────────────────────────────────┤
 │              Let's Encrypt SSL Certificate                  │
 └─────────────────────────────────────────────────────────────┘
