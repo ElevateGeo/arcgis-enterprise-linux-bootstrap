@@ -368,32 +368,41 @@ create_directories() {
 setup_ssl_certificate() {
     log_section "Setting up SSL Certificate (Let's Encrypt)"
     
+    local cert_dir="/etc/letsencrypt/live/${ARCGIS_FQDN}"
     local staging_flag=""
+    
     if [[ "${LETSENCRYPT_STAGING:-false}" == "true" ]]; then
         log_warn "Using Let's Encrypt STAGING server (certificates will NOT be trusted)"
         staging_flag="--staging"
     fi
     
-    log "Obtaining SSL certificate for ${ARCGIS_FQDN}..."
+    # Check if certificate already exists and is valid
+    if [[ -f "${cert_dir}/fullchain.pem" ]]; then
+        local expiry=$(openssl x509 -enddate -noout -in "${cert_dir}/fullchain.pem" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$expiry" ]]; then
+            log "Existing certificate found (expires: $expiry)"
+            # Certbot will check if renewal is needed
+        fi
+    fi
+    
+    log "Checking/obtaining SSL certificate for ${ARCGIS_FQDN}..."
     
     # Check if Cloudflare API token is available for DNS challenge
     if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-        log "Using Cloudflare DNS challenge (CLOUDFLARE_API_TOKEN detected)"
+        log "Using Cloudflare DNS challenge"
         setup_ssl_cloudflare "$staging_flag"
     else
         log "Using HTTP-01 challenge (standalone mode)"
         setup_ssl_http01 "$staging_flag"
     fi
     
-    log "SSL certificate obtained successfully"
-    
     # Set up certificate paths
     CERT_PATH="/etc/letsencrypt/live/${ARCGIS_FQDN}"
     
-    # Create PKCS12 keystore for ArcGIS
+    # Create PKCS12 keystore for ArcGIS (only if needed)
     create_arcgis_keystore
     
-    # Install renewal hook
+    # Install renewal hook (idempotent)
     install_renewal_hook
 }
 
@@ -446,12 +455,24 @@ EOF
 }
 
 create_arcgis_keystore() {
-    log "Creating PKCS12 keystore for ArcGIS..."
-    
     local cert_dir="/etc/letsencrypt/live/${ARCGIS_FQDN}"
     local keystore_dir="/opt/esri/ssl"
     local keystore_file="${keystore_dir}/arcgis.pfx"
     local keystore_password="${ARCGIS_ADMIN_PASSWORD}"
+    
+    # Check if keystore already exists and is up-to-date
+    if [[ -f "$keystore_file" ]]; then
+        local cert_time=$(stat -c %Y "${cert_dir}/fullchain.pem" 2>/dev/null || echo 0)
+        local keystore_time=$(stat -c %Y "$keystore_file" 2>/dev/null || echo 0)
+        
+        if [[ $keystore_time -ge $cert_time ]]; then
+            log "PKCS12 keystore already up-to-date: $keystore_file"
+            return 0
+        fi
+        log "Certificate newer than keystore, regenerating..."
+    fi
+    
+    log "Creating PKCS12 keystore for ArcGIS..."
     
     # Create PKCS12 file from Let's Encrypt certificates
     openssl pkcs12 -export \
@@ -474,6 +495,14 @@ create_arcgis_keystore() {
 }
 
 install_renewal_hook() {
+    local hook_file="/etc/letsencrypt/renewal-hooks/deploy/arcgis-ssl-update.sh"
+    
+    # Check if already installed
+    if [[ -f "$hook_file" ]] && [[ -f "/opt/esri/scripts/ssl-renewal-hook.sh" ]]; then
+        log "Certificate renewal hook already installed"
+        return 0
+    fi
+    
     log "Installing certificate renewal hook..."
     
     # Copy renewal script
@@ -544,32 +573,82 @@ install_tomcat() {
     chown -R tomcat:tomcat "$tomcat_dir"
     chmod +x ${tomcat_dir}/bin/*.sh
     
+    # Allow Java to bind to privileged ports (80, 443) as non-root
+    configure_java_privileged_ports
+    
     log "Tomcat installed to $tomcat_dir"
+}
+
+configure_java_privileged_ports() {
+    # Find the Java binary
+    local java_bin=$(readlink -f $(which java))
+    
+    if [[ -z "$java_bin" ]] || [[ ! -f "$java_bin" ]]; then
+        log_warn "Could not find Java binary to set capabilities"
+        return 1
+    fi
+    
+    # Check if capability is already set
+    if getcap "$java_bin" 2>/dev/null | grep -q 'cap_net_bind_service'; then
+        log "Java already has cap_net_bind_service capability"
+        return 0
+    fi
+    
+    log "Configuring Java to bind to privileged ports..."
+    
+    # Install libcap2-bin if not present
+    apt-get install -y -qq libcap2-bin 2>/dev/null || true
+    
+    # Grant capability to bind to privileged ports
+    setcap 'cap_net_bind_service=+ep' "$java_bin"
+    log "Granted cap_net_bind_service to: $java_bin"
 }
 
 configure_tomcat_ssl() {
     log_section "Configuring Tomcat SSL"
+    
+    # Ensure Java can bind to privileged ports (needed even if Tomcat already installed)
+    configure_java_privileged_ports
     
     local tomcat_dir="/opt/tomcat"
     local cert_dir="/etc/letsencrypt/live/${ARCGIS_FQDN}"
     local keystore_file="${tomcat_dir}/conf/keystore.p12"
     local keystore_password="${ARCGIS_ADMIN_PASSWORD}"
     
-    # Create PKCS12 keystore for Tomcat
-    log "Creating Tomcat SSL keystore..."
-    openssl pkcs12 -export \
-        -in "${cert_dir}/fullchain.pem" \
-        -inkey "${cert_dir}/privkey.pem" \
-        -out "$keystore_file" \
-        -name tomcat \
-        -password "pass:${keystore_password}"
+    # Check if Tomcat keystore already exists and is up-to-date
+    local needs_keystore=true
+    if [[ -f "$keystore_file" ]]; then
+        local cert_time=$(stat -c %Y "${cert_dir}/fullchain.pem" 2>/dev/null || echo 0)
+        local keystore_time=$(stat -c %Y "$keystore_file" 2>/dev/null || echo 0)
+        
+        if [[ $keystore_time -ge $cert_time ]]; then
+            log "Tomcat SSL keystore already up-to-date"
+            needs_keystore=false
+        fi
+    fi
     
-    chown tomcat:tomcat "$keystore_file"
-    chmod 640 "$keystore_file"
+    if [[ "$needs_keystore" == "true" ]]; then
+        log "Creating Tomcat SSL keystore..."
+        openssl pkcs12 -export \
+            -in "${cert_dir}/fullchain.pem" \
+            -inkey "${cert_dir}/privkey.pem" \
+            -out "$keystore_file" \
+            -name tomcat \
+            -password "pass:${keystore_password}"
+        
+        chown tomcat:tomcat "$keystore_file"
+        chmod 640 "$keystore_file"
+    fi
     
     # Backup original server.xml
     if [[ ! -f "${tomcat_dir}/conf/server.xml.orig" ]]; then
         cp "${tomcat_dir}/conf/server.xml" "${tomcat_dir}/conf/server.xml.orig"
+    fi
+    
+    # Check if server.xml already configured for our ports
+    if grep -q 'Connector port="443"' "${tomcat_dir}/conf/server.xml" 2>/dev/null; then
+        log "Tomcat server.xml already configured"
+        return 0
     fi
     
     # Configure server.xml with SSL connector
@@ -632,6 +711,12 @@ EOF
 }
 
 create_tomcat_service() {
+    # Check if service already exists and is properly configured
+    if [[ -f "/etc/systemd/system/tomcat.service" ]] && systemctl is-enabled tomcat &>/dev/null; then
+        log "Tomcat systemd service already configured"
+        return 0
+    fi
+    
     log "Creating Tomcat systemd service..."
     
     local java_home=$(dirname $(dirname $(readlink -f $(which java))))
