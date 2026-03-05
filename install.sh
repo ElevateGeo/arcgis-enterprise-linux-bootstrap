@@ -683,20 +683,48 @@ configure_base_deployment() {
 # =============================================================================
 # Post-Installation Configuration
 # =============================================================================
+wait_for_service() {
+    local url="$1"
+    local service_name="$2"
+    local max_attempts="${3:-30}"
+    local wait_seconds="${4:-10}"
+    
+    log "Waiting for $service_name to be ready..."
+    
+    for ((i=1; i<=max_attempts; i++)); do
+        if curl -sk --connect-timeout 5 "$url" > /dev/null 2>&1; then
+            log "  $service_name is ready"
+            return 0
+        fi
+        log "  Attempt $i/$max_attempts - $service_name not ready yet, waiting ${wait_seconds}s..."
+        sleep "$wait_seconds"
+    done
+    
+    log_warn "$service_name did not become ready after $((max_attempts * wait_seconds)) seconds"
+    return 1
+}
+
 import_ssl_certificate() {
     log_section "Importing SSL Certificate into ArcGIS Enterprise"
     
-    local arcgis_home="${ARCGIS_INSTALL_DIR}"
     local cert_file="/opt/esri/ssl/arcgis.pfx"
     local cert_password="${ARCGIS_ADMIN_PASSWORD}"
     
-    # Wait for services to be ready
-    log "Waiting for ArcGIS services to start..."
-    sleep 30
+    if [[ ! -f "$cert_file" ]]; then
+        log_warn "Certificate file not found: $cert_file"
+        log_warn "SSL certificate import skipped. You may need to import manually."
+        return 1
+    fi
+    
+    # Wait for Portal to be ready (can take several minutes after config)
+    local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
+    if ! wait_for_service "${portal_admin_url}/healthCheck?f=json" "Portal for ArcGIS" 30 10; then
+        log_warn "Portal not responding. SSL certificate import will need to be done manually."
+        return 1
+    fi
     
     # Import certificate to Portal
     log "Importing certificate to Portal for ArcGIS..."
-    local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
     
     # Generate token
     local token_response=$(curl -sk -X POST "${portal_admin_url}/generateToken" \
@@ -704,62 +732,84 @@ import_ssl_certificate() {
         -d "password=${ARCGIS_ADMIN_PASSWORD}" \
         -d "client=referer" \
         -d "referer=${portal_admin_url}" \
-        -d "f=json")
+        -d "f=json" 2>/dev/null)
     
     local token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
     
     if [[ -n "$token" ]]; then
         # Import SSL certificate to Portal
-        curl -sk -X POST "${portal_admin_url}/machines/${ARCGIS_FQDN}/sslCertificates/importExistingServerCertificate" \
+        local import_response=$(curl -sk -X POST "${portal_admin_url}/machines/${ARCGIS_FQDN}/sslCertificates/importExistingServerCertificate" \
             -F "certFile=@${cert_file}" \
             -F "certPassword=${cert_password}" \
             -F "alias=${ARCGIS_FQDN}" \
             -F "token=${token}" \
-            -F "f=json"
+            -F "f=json" 2>/dev/null)
+        
+        if echo "$import_response" | grep -q '"status":"success"\|"success":true'; then
+            log "  Certificate imported to Portal successfully"
+        else
+            log_warn "  Portal certificate import response: $import_response"
+        fi
         
         # Update Portal to use the new certificate
         curl -sk -X POST "${portal_admin_url}/machines/${ARCGIS_FQDN}/sslCertificates/update" \
             -d "webServerCertificateAlias=${ARCGIS_FQDN}" \
             -d "token=${token}" \
-            -d "f=json"
+            -d "f=json" > /dev/null 2>&1
         
-        log "Certificate imported to Portal"
+        log "Certificate configured for Portal"
     else
-        log_warn "Could not get Portal token. Manual certificate import may be required."
+        log_warn "Could not get Portal token. Response: $token_response"
+        log_warn "Manual certificate import may be required."
+    fi
+    
+    # Wait for Server to be ready  
+    local server_admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
+    if ! wait_for_service "${server_admin_url}/healthCheck?f=json" "ArcGIS Server" 20 10; then
+        log_warn "Server not responding. SSL certificate import will need to be done manually."
+        return 1
     fi
     
     # Import certificate to Server
     log "Importing certificate to ArcGIS Server..."
-    local server_admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
     
     token_response=$(curl -sk -X POST "${server_admin_url}/generateToken" \
         -d "username=${ARCGIS_ADMIN_USER}" \
         -d "password=${ARCGIS_ADMIN_PASSWORD}" \
         -d "client=referer" \
         -d "referer=${server_admin_url}" \
-        -d "f=json")
+        -d "f=json" 2>/dev/null)
     
     token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
     
     if [[ -n "$token" ]]; then
         # Import SSL certificate to Server
-        curl -sk -X POST "${server_admin_url}/machines/${ARCGIS_FQDN}/sslCertificates/importExistingServerCertificate" \
+        local import_response=$(curl -sk -X POST "${server_admin_url}/machines/${ARCGIS_FQDN}/sslCertificates/importExistingServerCertificate" \
             -F "certFile=@${cert_file}" \
             -F "certPassword=${cert_password}" \
             -F "alias=${ARCGIS_FQDN}" \
             -F "token=${token}" \
-            -F "f=json"
+            -F "f=json" 2>/dev/null)
+        
+        if echo "$import_response" | grep -q '"status":"success"\|"success":true'; then
+            log "  Certificate imported to Server successfully"
+        else
+            log_warn "  Server certificate import response: $import_response"
+        fi
         
         # Update Server to use the new certificate
         curl -sk -X POST "${server_admin_url}/machines/${ARCGIS_FQDN}/edit" \
             -d "webServerCertificateAlias=${ARCGIS_FQDN}" \
             -d "token=${token}" \
-            -d "f=json"
+            -d "f=json" > /dev/null 2>&1
         
-        log "Certificate imported to Server"
+        log "Certificate configured for Server"
     else
-        log_warn "Could not get Server token. Manual certificate import may be required."
+        log_warn "Could not get Server token. Response: $token_response"
+        log_warn "Manual certificate import may be required."
     fi
+    
+    log "SSL certificate import completed"
 }
 
 configure_firewall() {
