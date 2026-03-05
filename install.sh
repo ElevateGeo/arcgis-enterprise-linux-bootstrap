@@ -1270,6 +1270,82 @@ run_enterprise_builder() {
     log "Software installation completed successfully"
 }
 
+start_arcgis_services() {
+    log_section "Starting ArcGIS Services"
+    
+    local server_start="${ARCGIS_INSTALL_DIR}/server/startserver.sh"
+    local portal_start="${ARCGIS_INSTALL_DIR}/portal/startportal.sh"
+    local datastore_start="${ARCGIS_INSTALL_DIR}/datastore/startdatastore.sh"
+    
+    # Start ArcGIS Server
+    if [[ -f "$server_start" ]]; then
+        log "Starting ArcGIS Server..."
+        chmod +x "$server_start"
+        sudo -u "$ARCGIS_RUN_AS_USER" "$server_start" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        log_warn "Server start script not found: $server_start"
+    fi
+    
+    # Start Portal for ArcGIS
+    if [[ -f "$portal_start" ]]; then
+        log "Starting Portal for ArcGIS..."
+        chmod +x "$portal_start"
+        sudo -u "$ARCGIS_RUN_AS_USER" "$portal_start" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        log_warn "Portal start script not found: $portal_start"
+    fi
+    
+    # Start ArcGIS Data Store
+    if [[ -f "$datastore_start" ]]; then
+        log "Starting ArcGIS Data Store..."
+        chmod +x "$datastore_start"
+        sudo -u "$ARCGIS_RUN_AS_USER" "$datastore_start" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        log_warn "Data Store start script not found: $datastore_start"
+    fi
+    
+    # Wait for services to be ready
+    log "Waiting for services to initialize (this may take a few minutes)..."
+    sleep 30
+    
+    # Check Server
+    local server_url="https://${ARCGIS_FQDN}:6443/arcgis/rest/info?f=json"
+    local max_wait=60
+    local count=0
+    while ! curl -sk --connect-timeout 5 "$server_url" 2>/dev/null | grep -q "currentVersion"; do
+        ((count++))
+        if [[ $count -ge $max_wait ]]; then
+            log_warn "ArcGIS Server not responding after ${max_wait} attempts"
+            break
+        fi
+        log "  Waiting for ArcGIS Server... ($count/$max_wait)"
+        sleep 10
+    done
+    
+    if curl -sk "$server_url" 2>/dev/null | grep -q "currentVersion"; then
+        log "ArcGIS Server is running"
+    fi
+    
+    # Check Portal
+    local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest/info?f=json"
+    count=0
+    while ! curl -sk --connect-timeout 5 "$portal_url" 2>/dev/null | grep -q "currentVersion"; do
+        ((count++))
+        if [[ $count -ge $max_wait ]]; then
+            log_warn "Portal for ArcGIS not responding after ${max_wait} attempts"
+            break
+        fi
+        log "  Waiting for Portal for ArcGIS... ($count/$max_wait)"
+        sleep 10
+    done
+    
+    if curl -sk "$portal_url" 2>/dev/null | grep -q "currentVersion"; then
+        log "Portal for ArcGIS is running"
+    fi
+    
+    log "ArcGIS services startup complete"
+}
+
 configure_base_deployment() {
     log_section "Phase 2: Configuring ArcGIS Enterprise Base Deployment"
     
@@ -1639,12 +1715,15 @@ main() {
     extract_installer
     run_enterprise_builder
     
+    # Start ArcGIS services (required before Phase 2)
+    start_arcgis_services
+    
     # Web Adaptor Installation
     install_web_adaptor
     deploy_web_adaptor_wars
     
     # ArcGIS Installation - Phase 2: Configure base deployment
-    # This requires Web Adaptors to be reachable
+    # This requires ArcGIS services running and Web Adaptors to be reachable
     configure_base_deployment
     
     # Register Web Adaptors with ArcGIS components
