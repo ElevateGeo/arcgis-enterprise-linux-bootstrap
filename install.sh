@@ -369,6 +369,7 @@ setup_ssl_certificate() {
     log_section "Setting up SSL Certificate (Let's Encrypt)"
     
     local cert_dir="/etc/letsencrypt/live/${ARCGIS_FQDN}"
+    local cert_file="${cert_dir}/fullchain.pem"
     local staging_flag=""
     
     if [[ "${LETSENCRYPT_STAGING:-false}" == "true" ]]; then
@@ -376,16 +377,31 @@ setup_ssl_certificate() {
         staging_flag="--staging"
     fi
     
-    # Check if certificate already exists and is valid
-    if [[ -f "${cert_dir}/fullchain.pem" ]]; then
-        local expiry=$(openssl x509 -enddate -noout -in "${cert_dir}/fullchain.pem" 2>/dev/null | cut -d= -f2)
-        if [[ -n "$expiry" ]]; then
-            log "Existing certificate found (expires: $expiry)"
-            # Certbot will check if renewal is needed
+    # Check if certificate already exists and is still valid
+    if [[ -f "$cert_file" ]]; then
+        # Get expiry date and calculate days remaining
+        local expiry_epoch=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+        local expiry_date=$(date -d "$expiry_epoch" +%s 2>/dev/null || echo 0)
+        local now=$(date +%s)
+        local days_remaining=$(( (expiry_date - now) / 86400 ))
+        
+        if [[ $days_remaining -gt 30 ]]; then
+            log "Certificate valid for ${days_remaining} more days - skipping renewal check"
+            log "  Expires: $expiry_epoch"
+            
+            # Still need to ensure keystores and hooks are set up
+            CERT_PATH="$cert_dir"
+            create_arcgis_keystore
+            install_renewal_hook
+            return 0
+        else
+            log "Certificate expires in ${days_remaining} days - will attempt renewal"
         fi
+    else
+        log "No existing certificate found - obtaining new certificate"
     fi
     
-    log "Checking/obtaining SSL certificate for ${ARCGIS_FQDN}..."
+    log "Obtaining SSL certificate for ${ARCGIS_FQDN}..."
     
     # Check if Cloudflare API token is available for DNS challenge
     if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
@@ -893,6 +909,10 @@ install_web_adaptor() {
     
     log "Installing Web Adaptor from: $wa_setup"
     chmod +x "$wa_setup"
+    
+    # Create the install directory (required by installer)
+    mkdir -p "$wa_install_dir"
+    chown "$ARCGIS_RUN_AS_USER:$ARCGIS_RUN_AS_USER" "$wa_install_dir"
     
     # Install Web Adaptor silently
     sudo -u "$ARCGIS_RUN_AS_USER" "$wa_setup" -m silent -l yes -d "$wa_install_dir" \
