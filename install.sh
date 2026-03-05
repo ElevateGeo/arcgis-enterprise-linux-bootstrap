@@ -926,12 +926,18 @@ deploy_web_adaptor_wars() {
     
     local wa_install_dir="/opt/esri/webadaptor"
     local tomcat_webapps="/opt/tomcat/webapps"
-    local wa_war="${wa_install_dir}/java/arcgis.war"
     
-    if [[ ! -f "$wa_war" ]]; then
-        log_error "Web Adaptor WAR file not found at: $wa_war"
+    # Find the WAR file - path varies by version (e.g., arcgis/webadaptor12.0/java/arcgis.war)
+    local wa_war
+    wa_war=$(find "$wa_install_dir" -name "arcgis.war" -type f 2>/dev/null | head -1)
+    
+    if [[ -z "$wa_war" || ! -f "$wa_war" ]]; then
+        log_error "Web Adaptor WAR file not found under: $wa_install_dir"
+        log_error "Run: find $wa_install_dir -name '*.war' to locate it"
         exit 1
     fi
+    
+    log "Found WAR file at: $wa_war"
     
     # Deploy two instances of Web Adaptor: one for Server, one for Portal
     local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
@@ -996,21 +1002,22 @@ configure_web_adaptor_server() {
         exit 1
     fi
     
-    # Find the configuration tool
+    # Find the configuration tool - check deployed WAR first, then Web Adaptor install
     if [[ ! -f "$wa_config_tool" ]]; then
         wa_config_tool=$(find "/opt/tomcat/webapps/${server_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
     fi
     
     if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
         # Use the standalone configuration tool from Web Adaptor install
-        wa_config_tool="/opt/esri/webadaptor/java/tools/configurewebadaptor.sh"
+        wa_config_tool=$(find "/opt/esri/webadaptor" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
     fi
     
-    if [[ ! -f "$wa_config_tool" ]]; then
+    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
         log_error "Web Adaptor configuration tool not found"
         exit 1
     fi
     
+    log "Using config tool: $wa_config_tool"
     chmod +x "$wa_config_tool"
     
     log "Registering Web Adaptor with ArcGIS Server..."
@@ -1041,7 +1048,7 @@ configure_web_adaptor_portal() {
     log_section "Configuring Web Adaptor for Portal"
     
     local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
-    local wa_config_tool="/opt/esri/webadaptor/java/tools/configurewebadaptor.sh"
+    local wa_config_tool=""
     
     # Wait for Portal to be ready
     local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin/healthCheck?f=json"
@@ -1050,8 +1057,11 @@ configure_web_adaptor_portal() {
         exit 1
     fi
     
-    if [[ ! -f "$wa_config_tool" ]]; then
-        wa_config_tool=$(find "/opt/tomcat/webapps/${portal_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
+    # Find the configuration tool - check deployed WAR first, then Web Adaptor install
+    wa_config_tool=$(find "/opt/tomcat/webapps/${portal_context}" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
+    
+    if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
+        wa_config_tool=$(find "/opt/esri/webadaptor" -name "configurewebadaptor.sh" -type f 2>/dev/null | head -1)
     fi
     
     if [[ -z "$wa_config_tool" ]] || [[ ! -f "$wa_config_tool" ]]; then
@@ -1059,6 +1069,7 @@ configure_web_adaptor_portal() {
         exit 1
     fi
     
+    log "Using config tool: $wa_config_tool"
     chmod +x "$wa_config_tool"
     
     log "Registering Web Adaptor with Portal for ArcGIS..."
