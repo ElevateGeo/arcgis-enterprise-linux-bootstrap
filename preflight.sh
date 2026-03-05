@@ -6,7 +6,8 @@
 # Usage: ./preflight.sh
 # =============================================================================
 
-set -euo pipefail
+# Don't use set -e here - we want to continue checking even if some checks fail
+set -o pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,8 +52,10 @@ else
 fi
 
 # Check memory
-MEM_GB=$(free -g | awk '/^Mem:/{print $2}')
-if [[ $MEM_GB -ge 16 ]]; then
+MEM_GB=$(free -g | awk '/^Mem:/{print $2}' || echo "0")
+if [[ -z "$MEM_GB" ]] || [[ ! "$MEM_GB" =~ ^[0-9]+$ ]]; then
+    check_warn "Could not determine memory"
+elif [[ $MEM_GB -ge 16 ]]; then
     check_pass "Memory: ${MEM_GB}GB (≥16GB required)"
 elif [[ $MEM_GB -ge 8 ]]; then
     check_warn "Memory: ${MEM_GB}GB (16GB recommended, may work with 8GB)"
@@ -61,8 +64,10 @@ else
 fi
 
 # Check disk space
-DISK_GB=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
-if [[ $DISK_GB -ge 100 ]]; then
+DISK_GB=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G' || echo "0")
+if [[ -z "$DISK_GB" ]] || [[ ! "$DISK_GB" =~ ^[0-9]+$ ]]; then
+    check_warn "Could not determine free disk space"
+elif [[ $DISK_GB -ge 100 ]]; then
     check_pass "Free disk space: ${DISK_GB}GB (≥100GB recommended)"
 elif [[ $DISK_GB -ge 50 ]]; then
     check_warn "Free disk space: ${DISK_GB}GB (100GB recommended)"
