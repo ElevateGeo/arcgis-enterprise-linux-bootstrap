@@ -104,15 +104,32 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     # Check required variables
     [[ -n "${ARCGIS_ADMIN_USER:-}" ]] && check_pass "ARCGIS_ADMIN_USER: ${ARCGIS_ADMIN_USER}" || check_fail "ARCGIS_ADMIN_USER not set"
     [[ -n "${ARCGIS_ADMIN_PASSWORD:-}" ]] && check_pass "ARCGIS_ADMIN_PASSWORD: (set)" || check_fail "ARCGIS_ADMIN_PASSWORD not set"
+    [[ -n "${ARCGIS_ADMIN_EMAIL:-}" ]] && check_pass "ARCGIS_ADMIN_EMAIL: ${ARCGIS_ADMIN_EMAIL}" || check_fail "ARCGIS_ADMIN_EMAIL not set"
     [[ -n "${LETSENCRYPT_EMAIL:-}" ]] && check_pass "LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}" || check_fail "LETSENCRYPT_EMAIL not set"
+    [[ -n "${ARCGIS_RUN_AS_USER:-}" ]] && check_pass "ARCGIS_RUN_AS_USER: ${ARCGIS_RUN_AS_USER}" || check_fail "ARCGIS_RUN_AS_USER not set"
+    
+    # Check portal admin profile fields (used in properties file)
+    [[ -n "${ARCGIS_ADMIN_FIRSTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_FIRSTNAME: ${ARCGIS_ADMIN_FIRSTNAME}" || check_fail "ARCGIS_ADMIN_FIRSTNAME not set"
+    [[ -n "${ARCGIS_ADMIN_LASTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_LASTNAME: ${ARCGIS_ADMIN_LASTNAME}" || check_fail "ARCGIS_ADMIN_LASTNAME not set"
+    [[ -n "${ARCGIS_ADMIN_SECURITY_ANSWER:-}" ]] && check_pass "ARCGIS_ADMIN_SECURITY_ANSWER: (set)" || check_fail "ARCGIS_ADMIN_SECURITY_ANSWER not set"
     
     # Check password strength
     if [[ -n "${ARCGIS_ADMIN_PASSWORD:-}" ]]; then
-        if [[ ${#ARCGIS_ADMIN_PASSWORD} -ge 8 ]]; then
+        if [[ "$ARCGIS_ADMIN_PASSWORD" == *"CHANGE_ME"* ]]; then
+            check_fail "Password still contains placeholder 'CHANGE_ME'"
+        elif [[ ${#ARCGIS_ADMIN_PASSWORD} -ge 8 ]]; then
             check_pass "Password length: ≥8 characters"
         else
             check_fail "Password too short (minimum 8 characters)"
         fi
+    fi
+    
+    # Check for placeholder email values
+    if [[ "${ARCGIS_ADMIN_EMAIL:-}" == "admin@example.com" ]]; then
+        check_warn "ARCGIS_ADMIN_EMAIL is still example.com (update to real email)"
+    fi
+    if [[ "${LETSENCRYPT_EMAIL:-}" == "admin@example.com" ]]; then
+        check_warn "LETSENCRYPT_EMAIL is still example.com (update to real email)"
     fi
 else
     check_fail ".env file not found - copy from .env.example"
