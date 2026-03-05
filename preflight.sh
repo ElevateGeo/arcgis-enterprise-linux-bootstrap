@@ -116,6 +116,19 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     # Check portal admin profile fields (used in properties file)
     [[ -n "${ARCGIS_ADMIN_FIRSTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_FIRSTNAME: ${ARCGIS_ADMIN_FIRSTNAME}" || check_fail "ARCGIS_ADMIN_FIRSTNAME not set"
     [[ -n "${ARCGIS_ADMIN_LASTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_LASTNAME: ${ARCGIS_ADMIN_LASTNAME}" || check_fail "ARCGIS_ADMIN_LASTNAME not set"
+    
+    # Check security question index (must be 1-14 per Esri docs)
+    if [[ -n "${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX:-}" ]]; then
+        if [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" =~ ^[0-9]+$ ]] && \
+           [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -ge 1 ]] && \
+           [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -le 14 ]]; then
+            check_pass "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX}"
+        else
+            check_fail "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX must be 1-14 (got: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX})"
+        fi
+    else
+        check_fail "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX not set (must be 1-14)"
+    fi
     [[ -n "${ARCGIS_ADMIN_SECURITY_ANSWER:-}" ]] && check_pass "ARCGIS_ADMIN_SECURITY_ANSWER: (set)" || check_fail "ARCGIS_ADMIN_SECURITY_ANSWER not set"
     
     # Check password strength

@@ -131,7 +131,8 @@ ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
 ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
 ARCGIS_ADMIN_FIRSTNAME=Admin
 ARCGIS_ADMIN_LASTNAME=User
-ARCGIS_ADMIN_SECURITY_QUESTION=What is your favorite color?
+# Security question index (1-14, see list below)
+ARCGIS_ADMIN_SECURITY_QUESTION_INDEX=1
 ARCGIS_ADMIN_SECURITY_ANSWER=YourSecretAnswer
 
 # OS User (will be created if doesn't exist, no password needed)
@@ -149,6 +150,24 @@ LETSENCRYPT_EMAIL=admin@yourdomain.com
 #   - Portal license: *Portal*.json in /opt/esri/licenses/
 #   - Installer: ArcGIS_Enterprise_Builder_Linux*.tar.gz in /opt/esri/installers/
 ```
+
+**Security Question Index Reference:**
+| Index | Question |
+|:-----:|:---------|
+| 1 | What city were you born in? |
+| 2 | What was your high school mascot? |
+| 3 | What is your mother's maiden name? |
+| 4 | What was the make of your first car? |
+| 5 | What high school did you go to? |
+| 6 | What is the last name of your best friend? |
+| 7 | What is the middle name of your youngest sibling? |
+| 8 | What is the name of the street on which you grew up? |
+| 9 | What is the name of your favorite fictional character? |
+| 10 | What is the name of your favorite pet? |
+| 11 | What is the name of your favorite restaurant? |
+| 12 | What is the title of your favorite book? |
+| 13 | What is your dream job? |
+| 14 | Where did you go on your first date? |
 
 </details>
 
