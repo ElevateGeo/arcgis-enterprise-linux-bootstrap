@@ -86,6 +86,20 @@ load_env() {
     set -a
     source "$env_file"
     set +a
+    
+    # Set defaults for optional variables
+    ARCGIS_INSTALL_DIR="${ARCGIS_INSTALL_DIR:-/opt/esri/arcgis}"
+    ARCGIS_DATA_DIR="${ARCGIS_DATA_DIR:-/opt/esri/data}"
+    ARCGIS_CONFIG_STORE="${ARCGIS_CONFIG_STORE:-/opt/esri/data/config-store}"
+    ARCGIS_SERVER_DIRS="${ARCGIS_SERVER_DIRS:-/opt/esri/data/server-dirs}"
+    ARCGIS_PORTAL_CONTENT="${ARCGIS_PORTAL_CONTENT:-/opt/esri/data/portal-content}"
+    ARCGIS_RUN_AS_USER="${ARCGIS_RUN_AS_USER:-arcgis}"
+    ARCGIS_ADMIN_SECURITY_QUESTION_INDEX="${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX:-1}"
+    WEB_ADAPTOR_SERVER_CONTEXT="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    WEB_ADAPTOR_PORTAL_CONTEXT="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    
+    export ARCGIS_INSTALL_DIR ARCGIS_DATA_DIR ARCGIS_CONFIG_STORE ARCGIS_SERVER_DIRS ARCGIS_PORTAL_CONTENT
+    export ARCGIS_RUN_AS_USER ARCGIS_ADMIN_SECURITY_QUESTION_INDEX WEB_ADAPTOR_SERVER_CONTEXT WEB_ADAPTOR_PORTAL_CONTEXT
 }
 
 # =============================================================================

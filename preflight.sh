@@ -111,23 +111,23 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     [[ -n "${ARCGIS_ADMIN_PASSWORD:-}" ]] && check_pass "ARCGIS_ADMIN_PASSWORD: (set)" || check_fail "ARCGIS_ADMIN_PASSWORD not set"
     [[ -n "${ARCGIS_ADMIN_EMAIL:-}" ]] && check_pass "ARCGIS_ADMIN_EMAIL: ${ARCGIS_ADMIN_EMAIL}" || check_fail "ARCGIS_ADMIN_EMAIL not set"
     [[ -n "${LETSENCRYPT_EMAIL:-}" ]] && check_pass "LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}" || check_fail "LETSENCRYPT_EMAIL not set"
-    [[ -n "${ARCGIS_RUN_AS_USER:-}" ]] && check_pass "ARCGIS_RUN_AS_USER: ${ARCGIS_RUN_AS_USER}" || check_fail "ARCGIS_RUN_AS_USER not set"
+    
+    # Variables with defaults (show what will be used)
+    ARCGIS_RUN_AS_USER="${ARCGIS_RUN_AS_USER:-arcgis}"
+    check_pass "ARCGIS_RUN_AS_USER: ${ARCGIS_RUN_AS_USER}"
     
     # Check portal admin profile fields (used in properties file)
     [[ -n "${ARCGIS_ADMIN_FIRSTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_FIRSTNAME: ${ARCGIS_ADMIN_FIRSTNAME}" || check_fail "ARCGIS_ADMIN_FIRSTNAME not set"
     [[ -n "${ARCGIS_ADMIN_LASTNAME:-}" ]] && check_pass "ARCGIS_ADMIN_LASTNAME: ${ARCGIS_ADMIN_LASTNAME}" || check_fail "ARCGIS_ADMIN_LASTNAME not set"
     
-    # Check security question index (must be 1-14 per Esri docs)
-    if [[ -n "${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX:-}" ]]; then
-        if [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" =~ ^[0-9]+$ ]] && \
-           [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -ge 1 ]] && \
-           [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -le 14 ]]; then
-            check_pass "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX}"
-        else
-            check_fail "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX must be 1-14 (got: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX})"
-        fi
+    # Check security question index (must be 1-14 per Esri docs, defaults to 1)
+    ARCGIS_ADMIN_SECURITY_QUESTION_INDEX="${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX:-1}"
+    if [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" =~ ^[0-9]+$ ]] && \
+       [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -ge 1 ]] && \
+       [[ "$ARCGIS_ADMIN_SECURITY_QUESTION_INDEX" -le 14 ]]; then
+        check_pass "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX}"
     else
-        check_fail "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX not set (must be 1-14)"
+        check_fail "ARCGIS_ADMIN_SECURITY_QUESTION_INDEX must be 1-14 (got: ${ARCGIS_ADMIN_SECURITY_QUESTION_INDEX})"
     fi
     [[ -n "${ARCGIS_ADMIN_SECURITY_ANSWER:-}" ]] && check_pass "ARCGIS_ADMIN_SECURITY_ANSWER: (set)" || check_fail "ARCGIS_ADMIN_SECURITY_ANSWER not set"
     

@@ -122,33 +122,31 @@ nano .env
 ```
 
 <details>
-<summary>📝 <strong>Example Configuration</strong></summary>
+<summary>📝 <strong>Example Configuration (Minimum Required)</strong></summary>
 
 ```bash
-# Admin Credentials (USE STRONG PASSWORD!)
+# Admin Credentials (REQUIRED - USE STRONG PASSWORD!)
 ARCGIS_ADMIN_USER=admin
 ARCGIS_ADMIN_PASSWORD=YourStr0ng!Password
 ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
 ARCGIS_ADMIN_FIRSTNAME=Admin
 ARCGIS_ADMIN_LASTNAME=User
-# Security question index (1-14, see list below)
-ARCGIS_ADMIN_SECURITY_QUESTION_INDEX=1
 ARCGIS_ADMIN_SECURITY_ANSWER=YourSecretAnswer
 
-# OS User (will be created if doesn't exist, no password needed)
-ARCGIS_RUN_AS_USER=arcgis
-
-# Let's Encrypt
+# Let's Encrypt (REQUIRED)
 LETSENCRYPT_EMAIL=admin@yourdomain.com
 
 # Cloudflare DNS Challenge (OPTIONAL - for DNS-01 validation)
 # CLOUDFLARE_API_TOKEN=your_cloudflare_api_token_here
 
-# Everything else is AUTO-DISCOVERED:
-#   - FQDN: from hostname -f (override: ARCGIS_FQDN=gis.example.com)
-#   - Server license: *.prvc in /opt/esri/licenses/
-#   - Portal license: *Portal*.json in /opt/esri/licenses/
-#   - Installer: ArcGIS_Enterprise_Builder_Linux*.tar.gz in /opt/esri/installers/
+# DEFAULTS (only set if you need to override):
+#   ARCGIS_RUN_AS_USER=arcgis
+#   ARCGIS_ADMIN_SECURITY_QUESTION_INDEX=1  (see list below)
+#   ARCGIS_FQDN=<auto-detected from hostname -f>
+#   ARCGIS_INSTALL_DIR=/opt/esri/arcgis
+#   Server license: auto-discovers *.prvc in /opt/esri/licenses/
+#   Portal license: auto-discovers *Portal*.json in /opt/esri/licenses/
+#   Installer: auto-discovers ArcGIS_Enterprise_Builder_Linux*.tar.gz in /opt/esri/installers/
 ```
 
 **Security Question Index Reference:**
