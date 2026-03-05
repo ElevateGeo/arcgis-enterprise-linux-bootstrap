@@ -636,6 +636,10 @@ create_tomcat_service() {
     
     local java_home=$(dirname $(dirname $(readlink -f $(which java))))
     
+    # Create PID directory
+    mkdir -p /opt/tomcat/temp
+    chown tomcat:tomcat /opt/tomcat/temp
+    
     cat > /etc/systemd/system/tomcat.service << EOF
 [Unit]
 Description=Apache Tomcat Web Application Container
@@ -643,6 +647,7 @@ After=network.target
 
 [Service]
 Type=forking
+PIDFile=/opt/tomcat/temp/tomcat.pid
 
 Environment=JAVA_HOME=${java_home}
 Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid
@@ -658,7 +663,8 @@ User=tomcat
 Group=tomcat
 UMask=0007
 RestartSec=10
-Restart=always
+Restart=on-failure
+TimeoutStartSec=60
 
 [Install]
 WantedBy=multi-user.target
@@ -670,19 +676,107 @@ EOF
     log "Tomcat service created"
 }
 
+check_and_free_ports() {
+    log "Checking ports 80 and 443..."
+    
+    # If Tomcat is already running on these ports, that's fine
+    if systemctl is-active --quiet tomcat 2>/dev/null; then
+        if ss -tlnp | grep ':443 ' | grep -q 'java'; then
+            log "Tomcat is already running on ports 80/443"
+            return 0
+        fi
+    fi
+    
+    local port_80_pid=$(ss -tlnp | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1)
+    local port_443_pid=$(ss -tlnp | grep ':443 ' | grep -oP 'pid=\K[0-9]+' | head -1)
+    
+    if [[ -n "$port_80_pid" ]]; then
+        local process_name=$(ps -p $port_80_pid -o comm= 2>/dev/null)
+        log_warn "Port 80 is in use by $process_name (PID: $port_80_pid)"
+        
+        # Try to stop common services
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            log "Stopping nginx..."
+            systemctl stop nginx
+            systemctl disable nginx 2>/dev/null || true
+        elif systemctl is-active --quiet apache2 2>/dev/null; then
+            log "Stopping apache2..."
+            systemctl stop apache2
+            systemctl disable apache2 2>/dev/null || true
+        fi
+    fi
+    
+    if [[ -n "$port_443_pid" ]]; then
+        local process_name=$(ps -p $port_443_pid -o comm= 2>/dev/null)
+        log_warn "Port 443 is in use by $process_name (PID: $port_443_pid)"
+        
+        # Try to stop common services
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            log "Stopping nginx..."
+            systemctl stop nginx
+            systemctl disable nginx 2>/dev/null || true
+        elif systemctl is-active --quiet apache2 2>/dev/null; then
+            log "Stopping apache2..."
+            systemctl stop apache2
+            systemctl disable apache2 2>/dev/null || true
+        fi
+    fi
+    
+    # Verify ports are free
+    sleep 2
+    if ss -tlnp | grep -qE ':80 |:443 '; then
+        log_error "Ports 80 or 443 are still in use. Please free them manually:"
+        ss -tlnp | grep -E ':80 |:443 '
+        exit 1
+    fi
+    
+    log "Ports 80 and 443 are available"
+}
+
 start_tomcat() {
     log "Starting Tomcat..."
     
-    systemctl start tomcat
-    sleep 5
-    
-    if systemctl is-active --quiet tomcat; then
-        log "Tomcat started successfully"
-    else
-        log_error "Tomcat failed to start"
-        journalctl -u tomcat --no-pager -n 20
-        exit 1
+    # Check if Tomcat is already running properly
+    if systemctl is-active --quiet tomcat && ss -tlnp | grep -q ':443 '; then
+        log "Tomcat is already running (port 443 listening)"
+        return 0
     fi
+    
+    # Stop any existing tomcat first
+    systemctl stop tomcat 2>/dev/null || true
+    sleep 2
+    
+    # Kill any stale Tomcat processes
+    pkill -f 'catalina' 2>/dev/null || true
+    sleep 1
+    
+    # Clean up stale PID file
+    rm -f /opt/tomcat/temp/tomcat.pid
+    
+    systemctl start tomcat
+    
+    # Wait for Tomcat to fully start
+    local max_wait=30
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        sleep 2
+        waited=$((waited + 2))
+        
+        if systemctl is-active --quiet tomcat; then
+            # Also verify port 443 is listening
+            if ss -tlnp | grep -q ':443 '; then
+                log "Tomcat started successfully (port 443 listening)"
+                return 0
+            fi
+        fi
+        log "Waiting for Tomcat... ${waited}s"
+    done
+    
+    log_error "Tomcat failed to start properly"
+    log "Checking Tomcat logs..."
+    tail -50 /opt/tomcat/logs/catalina.out 2>/dev/null || true
+    journalctl -u tomcat --no-pager -n 20
+    exit 1
 }
 
 # =============================================================================
@@ -1415,6 +1509,7 @@ main() {
     setup_ssl_certificate
     
     # Tomcat Installation and SSL Configuration
+    check_and_free_ports
     install_tomcat
     configure_tomcat_ssl
     create_tomcat_service
