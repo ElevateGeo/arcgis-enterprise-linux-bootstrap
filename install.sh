@@ -363,17 +363,16 @@ setup_ssl_certificate() {
         staging_flag="--staging"
     fi
     
-    # Stop any service on port 80 temporarily if needed
     log "Obtaining SSL certificate for ${ARCGIS_FQDN}..."
     
-    certbot certonly \
-        --standalone \
-        --non-interactive \
-        --agree-tos \
-        --email "$LETSENCRYPT_EMAIL" \
-        --domains "$ARCGIS_FQDN" \
-        $staging_flag \
-        --preferred-challenges http
+    # Check if Cloudflare API token is available for DNS challenge
+    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        log "Using Cloudflare DNS challenge (CLOUDFLARE_API_TOKEN detected)"
+        setup_ssl_cloudflare "$staging_flag"
+    else
+        log "Using HTTP-01 challenge (standalone mode)"
+        setup_ssl_http01 "$staging_flag"
+    fi
     
     log "SSL certificate obtained successfully"
     
@@ -385,6 +384,54 @@ setup_ssl_certificate() {
     
     # Install renewal hook
     install_renewal_hook
+}
+
+setup_ssl_http01() {
+    local staging_flag="$1"
+    
+    # HTTP-01 challenge: requires port 80 open to internet
+    certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$LETSENCRYPT_EMAIL" \
+        --domains "$ARCGIS_FQDN" \
+        $staging_flag \
+        --preferred-challenges http
+}
+
+setup_ssl_cloudflare() {
+    local staging_flag="$1"
+    
+    # Install Cloudflare DNS plugin if not present
+    if ! command -v certbot &> /dev/null || ! certbot plugins 2>/dev/null | grep -q "dns-cloudflare"; then
+        log "Installing certbot Cloudflare DNS plugin..."
+        apt-get install -y -qq python3-certbot-dns-cloudflare 2>/dev/null || \
+            pip3 install certbot-dns-cloudflare 2>/dev/null || \
+            snap install certbot-dns-cloudflare 2>/dev/null || true
+    fi
+    
+    # Create Cloudflare credentials file
+    local cf_creds="/etc/letsencrypt/cloudflare.ini"
+    mkdir -p /etc/letsencrypt
+    cat > "$cf_creds" << EOF
+# Cloudflare API token for Let's Encrypt DNS challenge
+dns_cloudflare_api_token = ${CLOUDFLARE_API_TOKEN}
+EOF
+    chmod 600 "$cf_creds"
+    
+    # DNS-01 challenge: uses Cloudflare API to create TXT record
+    certbot certonly \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials "$cf_creds" \
+        --dns-cloudflare-propagation-seconds 30 \
+        --non-interactive \
+        --agree-tos \
+        --email "$LETSENCRYPT_EMAIL" \
+        --domains "$ARCGIS_FQDN" \
+        $staging_flag
+    
+    log "Certificate obtained via Cloudflare DNS challenge"
 }
 
 create_arcgis_keystore() {

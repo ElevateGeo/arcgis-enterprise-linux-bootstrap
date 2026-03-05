@@ -12,6 +12,7 @@
 *.keystore
 .keystore_password
 renewal.conf
+cloudflare.ini
 
 # -----------------------------------------------------------------------------
 # Logs

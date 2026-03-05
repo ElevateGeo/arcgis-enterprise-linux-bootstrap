@@ -207,6 +207,37 @@ The installer deploys a **complete ArcGIS Enterprise base deployment**:
 4. **Auto-Renewal** — Certbot timer automatically renews certificates
 5. **Renewal Hook** — On renewal, script reimports the certificate into ArcGIS
 
+### Challenge Methods
+
+| Method | When Used | Requirements |
+|:-------|:----------|:-------------|
+| **HTTP-01** | Default | Port 80 open, DNS pointing to VM |
+| **DNS-01 (Cloudflare)** | When `CLOUDFLARE_API_TOKEN` is set | Cloudflare API token |
+
+<details>
+<summary>☁️ <strong>Using Cloudflare DNS Challenge</strong></summary>
+
+<br/>
+
+If your domain is managed by Cloudflare, you can use DNS validation instead of HTTP:
+
+**Benefits:**
+- No need for port 80 to be open
+- Works before the VM is publicly accessible
+- Supports wildcard certificates
+
+**Setup:**
+1. Go to [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)
+2. Create a token with **Zone:DNS:Edit** permission for your domain
+3. Add to `.env`:
+   ```bash
+   CLOUDFLARE_API_TOKEN=your_token_here
+   ```
+
+The script auto-detects the token and uses DNS challenge.
+
+</details>
+
 <details>
 <summary>🔧 <strong>Manual Certificate Operations</strong></summary>
 

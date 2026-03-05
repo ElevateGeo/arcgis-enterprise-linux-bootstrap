@@ -193,11 +193,23 @@ if [[ -n "${ARCGIS_FQDN:-}" ]]; then
     fi
 fi
 
-# Check port 80 (needed for Let's Encrypt)
-if ! ss -tlnp | grep -q ':80 '; then
-    check_pass "Port 80 is available"
+# Check SSL challenge method
+echo ""
+echo "SSL Certificate Method:"
+if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    check_pass "Using Cloudflare DNS challenge (CLOUDFLARE_API_TOKEN detected)"
+    # Verify token looks valid (basic format check)
+    if [[ ${#CLOUDFLARE_API_TOKEN} -lt 20 ]]; then
+        check_warn "CLOUDFLARE_API_TOKEN seems too short"
+    fi
 else
-    check_warn "Port 80 is in use (may need to stop existing web server)"
+    check_pass "Using HTTP-01 challenge (standalone mode)"
+    # Check port 80 (needed for HTTP-01)
+    if ! ss -tlnp | grep -q ':80 '; then
+        check_pass "Port 80 is available"
+    else
+        check_warn "Port 80 is in use (may need to stop existing web server)"
+    fi
 fi
 
 # Check external connectivity
@@ -213,7 +225,10 @@ echo ""
 echo "Checking Ports..."
 # -----------------------------------------------------------------------------
 
-ports_to_check=(80 443 6443 7443)
+ports_to_check=(443 6443 7443)
+if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    ports_to_check=(80 443 6443 7443)
+fi
 for port in "${ports_to_check[@]}"; do
     if command -v nc &> /dev/null; then
         if timeout 2 nc -z localhost "$port" 2>/dev/null; then
