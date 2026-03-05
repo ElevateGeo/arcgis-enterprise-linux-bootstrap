@@ -1313,7 +1313,7 @@ start_arcgis_services() {
     local max_wait=60
     local count=0
     while ! curl -sk --connect-timeout 5 "$server_url" 2>/dev/null | grep -q "currentVersion"; do
-        ((count++))
+        count=$((count + 1))
         if [[ $count -ge $max_wait ]]; then
             log_warn "ArcGIS Server not responding after ${max_wait} attempts"
             break
@@ -1330,7 +1330,7 @@ start_arcgis_services() {
     local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest/info?f=json"
     count=0
     while ! curl -sk --connect-timeout 5 "$portal_url" 2>/dev/null | grep -q "currentVersion"; do
-        ((count++))
+        count=$((count + 1))
         if [[ $count -ge $max_wait ]]; then
             log_warn "Portal for ArcGIS not responding after ${max_wait} attempts"
             break
