@@ -1305,42 +1305,42 @@ start_arcgis_services() {
     fi
     
     # Wait for services to be ready
-    log "Waiting for services to initialize (this may take a few minutes)..."
+    # Note: Before configurebasedeployment runs, REST endpoints won't respond with currentVersion
+    # So we just check that ports are listening
+    log "Waiting for services to initialize..."
     sleep 30
     
-    # Check Server
-    local server_url="https://${ARCGIS_FQDN}:6443/arcgis/rest/info?f=json"
-    local max_wait=60
+    # Check Server port
+    local max_wait=30
     local count=0
-    while ! curl -sk --connect-timeout 5 "$server_url" 2>/dev/null | grep -q "currentVersion"; do
+    while ! ss -tln 2>/dev/null | grep -q ":6443 "; do
         count=$((count + 1))
         if [[ $count -ge $max_wait ]]; then
-            log_warn "ArcGIS Server not responding after ${max_wait} attempts"
+            log_warn "ArcGIS Server port 6443 not listening after ${max_wait} attempts"
             break
         fi
-        log "  Waiting for ArcGIS Server... ($count/$max_wait)"
+        log "  Waiting for ArcGIS Server port 6443... ($count/$max_wait)"
         sleep 10
     done
     
-    if curl -sk "$server_url" 2>/dev/null | grep -q "currentVersion"; then
-        log "ArcGIS Server is running"
+    if ss -tln 2>/dev/null | grep -q ":6443 "; then
+        log "ArcGIS Server is listening on port 6443"
     fi
     
-    # Check Portal
-    local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest/info?f=json"
+    # Check Portal port
     count=0
-    while ! curl -sk --connect-timeout 5 "$portal_url" 2>/dev/null | grep -q "currentVersion"; do
+    while ! ss -tln 2>/dev/null | grep -q ":7443 "; do
         count=$((count + 1))
         if [[ $count -ge $max_wait ]]; then
-            log_warn "Portal for ArcGIS not responding after ${max_wait} attempts"
+            log_warn "Portal for ArcGIS port 7443 not listening after ${max_wait} attempts"
             break
         fi
-        log "  Waiting for Portal for ArcGIS... ($count/$max_wait)"
+        log "  Waiting for Portal for ArcGIS port 7443... ($count/$max_wait)"
         sleep 10
     done
     
-    if curl -sk "$portal_url" 2>/dev/null | grep -q "currentVersion"; then
-        log "Portal for ArcGIS is running"
+    if ss -tln 2>/dev/null | grep -q ":7443 "; then
+        log "Portal for ArcGIS is listening on port 7443"
     fi
     
     log "ArcGIS services startup complete"
