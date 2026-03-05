@@ -550,6 +550,15 @@ HOOK
 install_tomcat() {
     log_section "Installing Apache Tomcat"
     
+    # Disable any conflicting pre-installed Tomcat services
+    for svc in tomcat10 tomcat9 tomcat8; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log "Stopping conflicting service: $svc"
+            systemctl stop "$svc" || true
+            systemctl disable "$svc" || true
+        fi
+    done
+    
     # Check if Tomcat is already installed
     if [[ -d "/opt/tomcat" ]] && [[ -f "/opt/tomcat/bin/catalina.sh" ]]; then
         log "Tomcat already installed at /opt/tomcat"
