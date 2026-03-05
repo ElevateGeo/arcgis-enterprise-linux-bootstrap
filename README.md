@@ -133,6 +133,9 @@ ARCGIS_ADMIN_EMAIL=admin@yourdomain.com
 # Let's Encrypt
 LETSENCRYPT_EMAIL=admin@yourdomain.com
 
+# Cloudflare DNS Challenge (OPTIONAL - for DNS-01 validation)
+# CLOUDFLARE_API_TOKEN=your_cloudflare_api_token_here
+
 # Everything else is AUTO-DISCOVERED:
 #   - FQDN: from hostname -f (override: ARCGIS_FQDN=gis.example.com)
 #   - Server license: *.prvc in /opt/esri/licenses/
