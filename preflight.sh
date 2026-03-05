@@ -221,10 +221,13 @@ if [[ -n "${ARCGIS_FQDN:-}" ]]; then
     fi
     
     # Check hosts file for local resolution (important for ArcGIS internal communication)
-    if grep -q "^127\.0\.0\.1.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
-        check_pass "Hosts file: ${ARCGIS_FQDN} → 127.0.0.1 (local)"
+    # Accept either 127.0.0.1 or the machine's own IP
+    HOSTS_ENTRY=$(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null | head -1)
+    if [[ -n "$HOSTS_ENTRY" ]]; then
+        HOSTS_IP=$(echo "$HOSTS_ENTRY" | awk '{print $1}')
+        check_pass "Hosts file: ${ARCGIS_FQDN} → ${HOSTS_IP}"
     else
-        check_warn "Hosts file missing local entry for ${ARCGIS_FQDN} (will be added during install)"
+        check_warn "Hosts file missing entry for ${ARCGIS_FQDN} (will be added during install)"
     fi
 fi
 

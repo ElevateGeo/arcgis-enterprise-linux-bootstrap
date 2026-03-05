@@ -290,23 +290,20 @@ configure_hosts_file() {
     
     local hosts_entry="127.0.0.1 ${ARCGIS_FQDN}"
     
-    if grep -q "^127\.0\.0\.1.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
-        log "Hosts file already configured for ${ARCGIS_FQDN}"
-    elif grep -q "${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
-        # FQDN exists but not pointing to 127.0.0.1 - update it
-        log_warn "Updating existing hosts entry for ${ARCGIS_FQDN}"
-        sed -i "/${ARCGIS_FQDN}/d" /etc/hosts
-        echo "$hosts_entry" >> /etc/hosts
-        log "Updated: $hosts_entry"
+    # Check if FQDN already has any IP mapping in hosts file
+    if grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*${ARCGIS_FQDN}" /etc/hosts 2>/dev/null; then
+        local existing_ip=$(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*${ARCGIS_FQDN}" /etc/hosts | head -1 | awk '{print $1}')
+        log "Hosts file already configured: ${ARCGIS_FQDN} → ${existing_ip}"
     else
         # Add new entry
         log "Adding hosts entry: $hosts_entry"
         echo "$hosts_entry" >> /etc/hosts
     fi
     
-    # Verify the entry
-    if getent hosts "$ARCGIS_FQDN" | grep -q "127.0.0.1"; then
-        log "Verified: ${ARCGIS_FQDN} resolves to 127.0.0.1 locally"
+    # Verify the entry resolves locally
+    local resolved_ip=$(getent hosts "$ARCGIS_FQDN" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$resolved_ip" ]]; then
+        log "Verified: ${ARCGIS_FQDN} resolves to ${resolved_ip} locally"
     else
         log_warn "Could not verify hosts resolution. Check /etc/hosts manually."
     fi
