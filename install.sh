@@ -1029,6 +1029,7 @@ configure_web_adaptor_server() {
     local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
     local admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
     local wa_url="https://${ARCGIS_FQDN}/${server_context}"
+    local tomcat_webapps="/opt/tomcat/webapps"
     
     # Wait for ArcGIS Server to be ready
     local server_url="https://${ARCGIS_FQDN}:6443/arcgis/rest/info?f=json"
@@ -1058,28 +1059,40 @@ configure_web_adaptor_server() {
         return 0
     fi
     
-    log "Registering Web Adaptor with ArcGIS Server..."
+    log "Registering Web Adaptor with ArcGIS Server using arcgis-wareg.jar..."
     log "  Web Adaptor URL: ${wa_url}"
     log "  Server Admin URL: ${admin_url}"
     
-    # Get machine IP
-    local machine_ip=$(hostname -I | awk '{print $1}')
+    # Find the arcgis-wareg.jar registration tool
+    local wareg_jar
+    wareg_jar=$(find "${tomcat_webapps}/${server_context}" -name "arcgis-wareg.jar" -type f 2>/dev/null | head -1)
     
-    # Register via REST API (Java tool has SSL/connectivity issues)
-    local register_response=$(curl -sk -X POST "${admin_url}/system/webadaptors/register" \
-        -d "webAdaptorURL=${wa_url}" \
-        -d "machineName=${ARCGIS_FQDN}" \
-        -d "machineIP=${machine_ip}" \
-        -d "isAdminEnabled=true" \
-        -d "httpPort=80" \
-        -d "httpsPort=443" \
-        -d "token=${token}" \
-        -d "f=json" 2>/dev/null)
+    if [[ -z "$wareg_jar" || ! -f "$wareg_jar" ]]; then
+        log_error "arcgis-wareg.jar not found in Web Adaptor deployment"
+        exit 1
+    fi
     
-    if echo "$register_response" | grep -q '"status":"success"'; then
+    log "  Using: ${wareg_jar}"
+    
+    # Find JRE for running the tool
+    local java_exe
+    java_exe=$(find /opt/esri/arcgis/server -name "java" -path "*/bin/java" -type f 2>/dev/null | head -1)
+    if [[ -z "$java_exe" ]]; then
+        java_exe="java"
+    fi
+    
+    # Register using arcgis-wareg.jar (the official tool)
+    # Note: REST API registration doesn't work properly and causes federation issues
+    if "$java_exe" -jar "$wareg_jar" \
+        -m server \
+        -w "${wa_url}" \
+        -g "https://${ARCGIS_FQDN}:6443" \
+        -u "${ARCGIS_ADMIN_USER}" \
+        -p "${ARCGIS_ADMIN_PASSWORD}" \
+        -a true; then
         log "Server Web Adaptor registered successfully"
     else
-        log_error "Failed to register Server Web Adaptor: $register_response"
+        log_error "Failed to register Server Web Adaptor via arcgis-wareg.jar"
         exit 1
     fi
 }
@@ -1091,6 +1104,7 @@ configure_web_adaptor_portal() {
     local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
     local sharing_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest"
     local wa_url="https://${ARCGIS_FQDN}/${portal_context}"
+    local tomcat_webapps="/opt/tomcat/webapps"
     
     # Wait for Portal to be ready
     local portal_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin/healthCheck?f=json"
@@ -1122,29 +1136,257 @@ configure_web_adaptor_portal() {
         return 0
     fi
     
-    log "Registering Web Adaptor with Portal for ArcGIS..."
+    log "Registering Web Adaptor with Portal for ArcGIS using arcgis-wareg.jar..."
     log "  Web Adaptor URL: ${wa_url}"
     log "  Portal Admin URL: ${portal_admin_url}"
     
-    # Get machine IP
-    local machine_ip=$(hostname -I | awk '{print $1}')
+    # Find the arcgis-wareg.jar registration tool
+    local wareg_jar
+    wareg_jar=$(find "${tomcat_webapps}/${portal_context}" -name "arcgis-wareg.jar" -type f 2>/dev/null | head -1)
     
-    # Register via REST API (Java tool has SSL/connectivity issues)
-    local register_response=$(curl -sk -X POST "${portal_admin_url}/system/webadaptors/register" \
-        -H "Referer: https://${ARCGIS_FQDN}" \
-        -d "webAdaptorURL=${wa_url}" \
-        -d "machineName=${ARCGIS_FQDN}" \
-        -d "machineIP=${machine_ip}" \
-        -d "httpPort=80" \
-        -d "httpsPort=443" \
-        -d "token=${token}" \
-        -d "f=json" 2>/dev/null)
+    if [[ -z "$wareg_jar" || ! -f "$wareg_jar" ]]; then
+        log_error "arcgis-wareg.jar not found in Web Adaptor deployment"
+        exit 1
+    fi
     
-    if echo "$register_response" | grep -q '"status":"success"'; then
+    log "  Using: ${wareg_jar}"
+    
+    # Find JRE for running the tool
+    local java_exe
+    java_exe=$(find /opt/esri/arcgis/portal -name "java" -path "*/bin/java" -type f 2>/dev/null | head -1)
+    if [[ -z "$java_exe" ]]; then
+        java_exe="java"
+    fi
+    
+    # Register using arcgis-wareg.jar (the official tool)
+    # Note: REST API registration doesn't work properly and causes federation issues
+    if "$java_exe" -jar "$wareg_jar" \
+        -m portal \
+        -w "${wa_url}" \
+        -g "https://${ARCGIS_FQDN}:7443" \
+        -u "${ARCGIS_ADMIN_USER}" \
+        -p "${ARCGIS_ADMIN_PASSWORD}"; then
         log "Portal Web Adaptor registered successfully"
     else
-        log_error "Failed to register Portal Web Adaptor: $register_response"
+        log_error "Failed to register Portal Web Adaptor via arcgis-wareg.jar"
         exit 1
+    fi
+}
+
+# =============================================================================
+# Post-Configuration Functions
+# =============================================================================
+
+configure_web_context_urls() {
+    log_section "Configuring WebContextURLs for ArcGIS Components"
+    
+    local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    
+    # Configure Server WebContextURL
+    log "Setting Server WebContextURL..."
+    local server_admin_url="https://${ARCGIS_FQDN}:6443/arcgis/admin"
+    
+    local token_response=$(curl -sk -X POST "${server_admin_url}/generateToken" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASSWORD}" \
+        -d "client=requestip" \
+        -d "f=json" 2>/dev/null)
+    
+    local token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    
+    if [[ -n "$token" ]]; then
+        local response=$(curl -sk -X POST "${server_admin_url}/system/properties/update" \
+            -d "WebContextURL=https://${ARCGIS_FQDN}/${server_context}" \
+            -d "token=${token}" \
+            -d "f=json" 2>/dev/null)
+        
+        if echo "$response" | grep -q '"status":"success"'; then
+            log "  Server WebContextURL set to https://${ARCGIS_FQDN}/${server_context}"
+        else
+            log_warn "  Server WebContextURL update response: $response"
+        fi
+    fi
+    
+    # Configure Portal WebContextURL
+    log "Setting Portal WebContextURL..."
+    local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis/portaladmin"
+    local sharing_url="https://${ARCGIS_FQDN}:7443/arcgis/sharing/rest"
+    
+    token_response=$(curl -sk -X POST "${sharing_url}/generateToken" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASSWORD}" \
+        -d "client=referer" \
+        -d "referer=https://${ARCGIS_FQDN}" \
+        -d "f=json" 2>/dev/null)
+    
+    token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    
+    if [[ -n "$token" ]]; then
+        local response=$(curl -sk -X POST "${portal_admin_url}/system/properties/update" \
+            -H "Referer: https://${ARCGIS_FQDN}" \
+            -d "WebContextURL=https://${ARCGIS_FQDN}/${portal_context}" \
+            -d "token=${token}" \
+            -d "f=json" 2>/dev/null)
+        
+        if echo "$response" | grep -q '"status":"success"'; then
+            log "  Portal WebContextURL set to https://${ARCGIS_FQDN}/${portal_context}"
+        else
+            log_warn "  Portal WebContextURL update response: $response"
+        fi
+    fi
+    
+    log "WebContextURLs configured"
+}
+
+configure_jre_trust_stores() {
+    log_section "Configuring JRE Trust Stores for Cross-Component SSL Trust"
+    
+    # This ensures Server and Portal can trust each other's SSL certificates
+    # Required for federation and secure communication between components
+    
+    local arcgis_install="/opt/esri/arcgis"
+    local ssl_cert="/opt/esri/ssl/arcgis.crt"
+    local keystore_pass="changeit"
+    
+    if [[ ! -f "$ssl_cert" ]]; then
+        log_warn "SSL certificate not found at $ssl_cert - skipping trust store configuration"
+        return 0
+    fi
+    
+    # Find all JRE cacerts files in ArcGIS installation
+    local cacerts_files=$(find "$arcgis_install" -name "cacerts" -path "*/security/*" -type f 2>/dev/null)
+    
+    for cacerts in $cacerts_files; do
+        log "Importing certificate into: $cacerts"
+        
+        # Find keytool in the same JRE
+        local jre_dir=$(dirname "$(dirname "$cacerts")")
+        local keytool="${jre_dir}/bin/keytool"
+        
+        if [[ ! -f "$keytool" ]]; then
+            keytool=$(dirname "$jre_dir")/bin/keytool
+        fi
+        
+        if [[ ! -f "$keytool" ]]; then
+            log_warn "  keytool not found for $cacerts"
+            continue
+        fi
+        
+        # Remove existing if present, then add
+        "$keytool" -delete -alias "arcgis-ssl" -keystore "$cacerts" -storepass "$keystore_pass" 2>/dev/null || true
+        
+        if "$keytool" -importcert -trustcacerts -alias "arcgis-ssl" \
+            -file "$ssl_cert" -keystore "$cacerts" \
+            -storepass "$keystore_pass" -noprompt 2>/dev/null; then
+            log "  Certificate imported successfully"
+        else
+            log_warn "  Failed to import certificate"
+        fi
+    done
+    
+    log "JRE trust stores configured"
+}
+
+configure_tomcat_root_redirect() {
+    log_section "Configuring Tomcat Root Redirect to Portal"
+    
+    local tomcat_root="/opt/tomcat/webapps/ROOT"
+    local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    
+    if [[ ! -d "$tomcat_root" ]]; then
+        log_warn "Tomcat ROOT webapp not found at $tomcat_root"
+        return 0
+    fi
+    
+    # Create a JSP that redirects to Portal
+    cat > "${tomcat_root}/index.jsp" << 'REDIRECT_EOF'
+<%@ page language="java" %>
+<%
+    response.sendRedirect("/portal");
+%>
+REDIRECT_EOF
+    
+    # Update redirect URL if using custom portal context
+    if [[ "$portal_context" != "portal" ]]; then
+        sed -i "s|/portal|/${portal_context}|g" "${tomcat_root}/index.jsp"
+    fi
+    
+    chown tomcat:tomcat "${tomcat_root}/index.jsp"
+    
+    log "Root URL (https://${ARCGIS_FQDN}/) now redirects to /${portal_context}"
+}
+
+federate_server_with_portal() {
+    log_section "Federating ArcGIS Server with Portal"
+    
+    local portal_context="${WEB_ADAPTOR_PORTAL_CONTEXT:-portal}"
+    local server_context="${WEB_ADAPTOR_SERVER_CONTEXT:-server}"
+    local portal_admin_url="https://${ARCGIS_FQDN}:7443/arcgis"
+    local server_admin_url="https://${ARCGIS_FQDN}:6443/arcgis"
+    local server_services_url="https://${ARCGIS_FQDN}/${server_context}"
+    
+    # Check if already federated
+    log "Checking current federation status..."
+    local portal_token
+    portal_token=$(curl -sk -X POST "${portal_admin_url}/sharing/rest/generateToken" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASS}" \
+        -d "client=referer" \
+        -d "referer=https://${ARCGIS_FQDN}" \
+        -d "f=json" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    
+    if [[ -z "$portal_token" ]]; then
+        log "ERROR: Failed to get Portal token for federation check"
+        return 1
+    fi
+    
+    local fed_status
+    fed_status=$(curl -sk "${portal_admin_url}/portaladmin/federation/servers?token=${portal_token}&f=json")
+    
+    if echo "$fed_status" | grep -q "\"url\":\"${server_services_url}\""; then
+        log "Server is already federated with Portal"
+        return 0
+    fi
+    
+    # Federate Server with Portal using REST API
+    # Key parameters: Referer header and privatePortalUrl are required to avoid class cast exception
+    log "Federating Server with Portal via REST API..."
+    log "  Services URL: ${server_services_url}"
+    log "  Admin URL: ${server_admin_url}"
+    
+    local fed_result
+    fed_result=$(curl -sk -X POST "${portal_admin_url}/portaladmin/federation/servers/federate" \
+        -H "Referer: https://${ARCGIS_FQDN}" \
+        -d "url=${server_services_url}" \
+        -d "adminUrl=${server_admin_url}" \
+        -d "username=${ARCGIS_ADMIN_USER}" \
+        -d "password=${ARCGIS_ADMIN_PASS}" \
+        -d "privatePortalUrl=${portal_admin_url}" \
+        -d "token=${portal_token}" \
+        -d "f=json")
+    
+    # Check for errors
+    if echo "$fed_result" | grep -q '"error"'; then
+        local error_msg
+        error_msg=$(echo "$fed_result" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)
+        log "ERROR: Federation failed: ${error_msg}"
+        log "Full response: ${fed_result}"
+        return 1
+    fi
+    
+    # Verify federation succeeded
+    sleep 5
+    fed_status=$(curl -sk "${portal_admin_url}/portaladmin/federation/servers?token=${portal_token}&f=json")
+    
+    if echo "$fed_status" | grep -q "\"url\":\"${server_services_url}\""; then
+        local server_id
+        server_id=$(echo "$fed_status" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        log "Federation successful! Server ID: ${server_id}"
+        log "Server role: FEDERATED_SERVER"
+    else
+        log "WARNING: Federation may have failed. Check Portal > Organization > Settings > Servers"
+        return 1
     fi
 }
 
@@ -1743,12 +1985,23 @@ main() {
     configure_web_adaptor_server
     configure_web_adaptor_portal
     
+    # Configure WebContextURLs (required for proper routing)
+    configure_web_context_urls
+    
+    # Configure Tomcat root redirect to Portal
+    configure_tomcat_root_redirect
+    
     # Post-installation
     import_ssl_certificate
+    configure_jre_trust_stores
     configure_firewall
     
     # Verification
     verify_installation
+    
+    # Federate Server with Portal
+    federate_server_with_portal
+    
     print_summary
 }
 
