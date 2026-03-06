@@ -271,6 +271,101 @@ install_system_dependencies() {
     log "System dependencies installed"
 }
 
+install_database_clients() {
+    log_section "Installing Database Client Libraries"
+    
+    # Per Esri documentation:
+    # - PostgreSQL: Client libraries are built into ArcGIS Server (no installation needed)
+    # - SQL Server: Requires Microsoft ODBC Driver 18+ for SQL Server
+    # - Oracle: Requires Oracle Instant Client (available from My Esri or Oracle)
+    
+    local install_sqlserver="${INSTALL_SQLSERVER_CLIENT:-true}"
+    local install_oracle="${INSTALL_ORACLE_CLIENT:-true}"
+    
+    # PostgreSQL - No action needed
+    log "PostgreSQL: Client libraries are built into ArcGIS Server"
+    
+    # SQL Server ODBC Driver 18
+    if [[ "$install_sqlserver" == "true" ]]; then
+        log "Installing Microsoft ODBC Driver 18 for SQL Server..."
+        
+        # Add Microsoft repository
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg 2>/dev/null || true
+        
+        # Get Ubuntu version
+        local ubuntu_version
+        ubuntu_version=$(grep VERSION_ID /etc/os-release | cut -d'"' -f2)
+        
+        curl -s "https://packages.microsoft.com/config/ubuntu/${ubuntu_version}/prod.list" > /etc/apt/sources.list.d/mssql-release.list 2>/dev/null || true
+        
+        # Install ODBC driver
+        apt-get update -qq
+        ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 unixodbc-dev 2>/dev/null || log_warn "SQL Server ODBC driver installation failed - manual install may be required"
+        
+        # Verify installation
+        if odbcinst -q -d 2>/dev/null | grep -q "SQL Server"; then
+            log "SQL Server ODBC Driver installed successfully"
+        else
+            log_warn "SQL Server ODBC Driver may not be properly configured"
+        fi
+    else
+        log "SQL Server client installation skipped (INSTALL_SQLSERVER_CLIENT=false)"
+    fi
+    
+    # Oracle Instant Client
+    if [[ "$install_oracle" == "true" ]]; then
+        log "Installing Oracle Instant Client 21..."
+        
+        local oracle_home="/opt/oracle/instantclient_21_16"
+        
+        if [[ -d "$oracle_home" ]]; then
+            log "Oracle Instant Client already installed at $oracle_home"
+        else
+            mkdir -p /opt/oracle
+            cd /tmp
+            
+            # Download Oracle Instant Client (Basic package)
+            wget -q --no-check-certificate -O instantclient-basic.zip \
+                "https://download.oracle.com/otn_software/linux/instantclient/2116000/instantclient-basic-linux.x64-21.16.0.0.0dbru.zip" || {
+                log_warn "Failed to download Oracle Instant Client - manual install may be required"
+                return 0
+            }
+            
+            # Extract
+            unzip -o instantclient-basic.zip -d /opt/oracle/ >/dev/null
+            rm -f instantclient-basic.zip
+            
+            # Configure library path
+            echo "$oracle_home" > /etc/ld.so.conf.d/oracle-instantclient.conf
+            ldconfig
+            
+            # Install libaio dependency
+            apt-get install -y -qq libaio1t64 2>/dev/null || apt-get install -y -qq libaio1 2>/dev/null || true
+            
+            log "Oracle Instant Client installed to $oracle_home"
+        fi
+        
+        # Configure environment for ArcGIS user
+        cat > /etc/profile.d/oracle.sh << 'ORACLE_ENV'
+export ORACLE_HOME=/opt/oracle/instantclient_21_16
+export LD_LIBRARY_PATH=$ORACLE_HOME:$LD_LIBRARY_PATH
+export TNS_ADMIN=$ORACLE_HOME/network/admin
+ORACLE_ENV
+        chmod +x /etc/profile.d/oracle.sh
+        
+        # Add to arcgis user's bashrc
+        if [[ -d "/home/${ARCGIS_RUN_AS_USER}" ]]; then
+            sudo -u "$ARCGIS_RUN_AS_USER" bash -c 'grep -q ORACLE_HOME ~/.bashrc 2>/dev/null || echo "source /etc/profile.d/oracle.sh" >> ~/.bashrc'
+        fi
+        
+        log "Oracle environment configured"
+    else
+        log "Oracle client installation skipped (INSTALL_ORACLE_CLIENT=false)"
+    fi
+    
+    log "Database client libraries installation complete"
+}
+
 configure_system_limits() {
     log_section "Configuring System Limits"
     
@@ -1951,6 +2046,7 @@ main() {
     
     # System preparation
     install_system_dependencies
+    install_database_clients
     configure_system_limits
     configure_hosts_file
     create_arcgis_user

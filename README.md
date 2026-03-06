@@ -33,10 +33,13 @@ Single-command installation of ArcGIS Enterprise on Linux following Esri's recom
 |:-------:|-------------|
 | 🚀 | **One Command Install** — Run `sudo ./install.sh` and walk away |
 | 🔍 | **Auto-Discovery** — Automatically finds FQDN, license files, and installer |
-| �🔐 | **Let's Encrypt SSL** — Automatic certificate provisioning and renewal |
+| 🔐 | **Let's Encrypt SSL** — Automatic certificate provisioning and renewal |
+| 🔗 | **Auto-Federation** — Server automatically federated with Portal via REST API |
+| 🗄️ | **Database Clients** — SQL Server ODBC 18 & Oracle Instant Client pre-installed |
 | 🔒 | **Git-Safe Configuration** — Sensitive values in `.env` (gitignored) |
 | 📋 | **Esri Best Practices** — Follows single-machine deployment guidelines |
 | 🔄 | **Auto-Renewal Hooks** — Certificates automatically updated in ArcGIS when renewed |
+| 🏠 | **Root Redirect** — https://domain/ redirects to Portal home |
 | ✅ | **Pre-flight Checks** — Validate your setup before installation |
 
 <br/>
@@ -147,6 +150,10 @@ LETSENCRYPT_EMAIL=admin@yourdomain.com
 # Cloudflare DNS Challenge (OPTIONAL - for DNS-01 validation)
 # CLOUDFLARE_API_TOKEN=your_cloudflare_api_token_here
 
+# Database Clients (OPTIONAL - both default to true)
+# INSTALL_SQLSERVER_CLIENT=true   # Microsoft ODBC Driver 18
+# INSTALL_ORACLE_CLIENT=true      # Oracle Instant Client 21
+
 # DEFAULTS (only set if you need to override):
 #   ARCGIS_RUN_AS_USER=arcgis
 #   ARCGIS_ADMIN_SECURITY_QUESTION_INDEX=1  (see list below)
@@ -205,20 +212,35 @@ The installer deploys a **complete ArcGIS Enterprise base deployment**:
 │  Portal for     │  ArcGIS Server  │  ArcGIS Data Store      │
 │  ArcGIS (:7443) │  (:6443)        │  (Relational + Tile)    │
 ├─────────────────┴─────────────────┴─────────────────────────┤
+│          Server ↔ Portal Federation (Automatic)            │
+├─────────────────────────────────────────────────────────────┤
 │              Web Adaptors (/server, /portal)                │
 ├─────────────────────────────────────────────────────────────┤
 │              Apache Tomcat 10 (:443 HTTPS)                  │
 ├─────────────────────────────────────────────────────────────┤
 │              Let's Encrypt SSL Certificate                  │
 ├─────────────────────────────────────────────────────────────┤
-│              Let's Encrypt SSL Certificate                  │
+│     Database Clients (PostgreSQL, SQL Server, Oracle)       │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### 🗄️ Enterprise Geodatabase Support
+
+The installer automatically configures database client libraries for enterprise geodatabases:
+
+| Database | Client | Notes |
+|:---------|:-------|:------|
+| **PostgreSQL** | Built-in | No additional client needed |
+| **SQL Server** | ODBC Driver 18 | Auto-installed from Microsoft repos |
+| **Oracle** | Instant Client 21 | Auto-downloaded and configured |
+
+> 💡 To skip database client installation, set `INSTALL_SQLSERVER_CLIENT=false` or `INSTALL_ORACLE_CLIENT=false` in `.env`
 
 ### 🌐 Access Points After Installation
 
 | Service | URL |
 |:--------|:----|
+| 🏠 **Root (redirects to Portal)** | `https://<your-fqdn>/` |
 | 🏠 **Portal Home** | `https://<your-fqdn>/portal/home` |
 | ⚙️ **Portal Admin** | `https://<your-fqdn>:7443/arcgis/portaladmin` |
 | 🗺️ **Server REST** | `https://<your-fqdn>/server/rest/services` |
@@ -370,6 +392,12 @@ curl -sk "https://localhost:6443/arcgis/admin/healthCheck?f=json"
 ├── 📂 ssl/                 # SSL certificates (PKCS12)
 ├── 📂 scripts/             # Utility scripts
 └── 📂 builder/             # Enterprise Builder (temporary)
+
+/opt/oracle/
+└── 📂 instantclient_21_16/ # Oracle Instant Client
+
+/opt/tomcat/
+└── 📂 webapps/             # Web Adaptors + ROOT redirect
 ```
 
 </details>
