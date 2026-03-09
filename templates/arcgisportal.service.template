@@ -1,0 +1,21 @@
+[Unit]
+Description=Portal for ArcGIS
+Documentation=https://enterprise.arcgis.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=${ARCGIS_RUN_AS_USER}
+Group=${ARCGIS_RUN_AS_USER}
+Environment="HOME=/home/${ARCGIS_RUN_AS_USER}"
+ExecStart=${ARCGIS_INSTALL_DIR}/portal/startportal.sh
+ExecStop=${ARCGIS_INSTALL_DIR}/portal/stopportal.sh
+TimeoutStartSec=300
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=30
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

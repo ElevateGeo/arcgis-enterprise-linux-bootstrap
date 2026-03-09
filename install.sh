@@ -1696,6 +1696,55 @@ start_arcgis_services() {
     log "ArcGIS services startup complete"
 }
 
+setup_systemd_services() {
+    log_section "Setting Up Systemd Services for Auto-Start"
+    
+    local template_dir="${SCRIPT_DIR}/templates"
+    local systemd_dir="/etc/systemd/system"
+    
+    # Process Portal service (starts first)
+    if [[ -f "${template_dir}/arcgisportal.service.template" ]]; then
+        log "Creating arcgisportal.service..."
+        sed -e "s|\${ARCGIS_RUN_AS_USER}|${ARCGIS_RUN_AS_USER}|g" \
+            -e "s|\${ARCGIS_INSTALL_DIR}|${ARCGIS_INSTALL_DIR}|g" \
+            "${template_dir}/arcgisportal.service.template" > "${systemd_dir}/arcgisportal.service"
+    else
+        log_warn "Portal service template not found"
+    fi
+    
+    # Process Server service (depends on Portal)
+    if [[ -f "${template_dir}/arcgisserver.service.template" ]]; then
+        log "Creating arcgisserver.service..."
+        sed -e "s|\${ARCGIS_RUN_AS_USER}|${ARCGIS_RUN_AS_USER}|g" \
+            -e "s|\${ARCGIS_INSTALL_DIR}|${ARCGIS_INSTALL_DIR}|g" \
+            "${template_dir}/arcgisserver.service.template" > "${systemd_dir}/arcgisserver.service"
+    else
+        log_warn "Server service template not found"
+    fi
+    
+    # Process DataStore service (depends on Server)
+    if [[ -f "${template_dir}/arcgisdatastore.service.template" ]]; then
+        log "Creating arcgisdatastore.service..."
+        sed -e "s|\${ARCGIS_RUN_AS_USER}|${ARCGIS_RUN_AS_USER}|g" \
+            -e "s|\${ARCGIS_INSTALL_DIR}|${ARCGIS_INSTALL_DIR}|g" \
+            "${template_dir}/arcgisdatastore.service.template" > "${systemd_dir}/arcgisdatastore.service"
+    else
+        log_warn "DataStore service template not found"
+    fi
+    
+    # Reload systemd and enable services
+    log "Reloading systemd daemon..."
+    systemctl daemon-reload
+    
+    log "Enabling ArcGIS services for auto-start..."
+    systemctl enable arcgisportal.service 2>/dev/null || log_warn "Could not enable arcgisportal.service"
+    systemctl enable arcgisserver.service 2>/dev/null || log_warn "Could not enable arcgisserver.service"
+    systemctl enable arcgisdatastore.service 2>/dev/null || log_warn "Could not enable arcgisdatastore.service"
+    
+    log "Systemd services configured. Startup order: Portal → Server → DataStore"
+    log "  Use 'systemctl status arcgisportal arcgisserver arcgisdatastore' to check status"
+}
+
 configure_base_deployment() {
     log_section "Phase 2: Configuring ArcGIS Enterprise Base Deployment"
     
@@ -2068,7 +2117,10 @@ main() {
     
     # Start ArcGIS services (required before Phase 2)
     start_arcgis_services
-    
+
+    # Setup systemd services for auto-start on boot
+    setup_systemd_services
+
     # Web Adaptor Installation
     install_web_adaptor
     deploy_web_adaptor_wars

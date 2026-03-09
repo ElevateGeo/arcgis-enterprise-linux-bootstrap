@@ -1,0 +1,22 @@
+[Unit]
+Description=ArcGIS Server
+Documentation=https://enterprise.arcgis.com
+After=network-online.target arcgisportal.service
+Wants=network-online.target
+Requires=arcgisportal.service
+
+[Service]
+Type=forking
+User=${ARCGIS_RUN_AS_USER}
+Group=${ARCGIS_RUN_AS_USER}
+Environment="HOME=/home/${ARCGIS_RUN_AS_USER}"
+ExecStart=${ARCGIS_INSTALL_DIR}/server/startserver.sh
+ExecStop=${ARCGIS_INSTALL_DIR}/server/stopserver.sh
+TimeoutStartSec=300
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=30
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
